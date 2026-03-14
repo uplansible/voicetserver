@@ -21,14 +21,23 @@ pub const RMS_NORM_EPS: f64 = 1e-5;
 pub const ROPE_THETA: f32 = 1_000_000.0;
 pub const SLIDING_WINDOW: usize = 2048; // ~2.7 minutes of tokens at 80ms each
 
-/// Number of delay tokens for the streaming protocol.
+/// Default number of delay tokens for the streaming protocol.
 /// Controls both the prefill padding count and the Ada-RMSNorm conditioning signal.
 /// Higher = more lookahead = better accuracy but more latency.
-/// Valid range: 1–30 (80ms–2400ms). Default 6 = 480ms.
+/// Valid range: 1–30 (80ms–2400ms). Default 4 = 320ms.
+/// Kept as documentation; runtime value comes from StreamConfig.
+#[allow(dead_code)]
 pub const NUM_DELAY_TOKENS: usize = 4;
 
-/// Total prefill length: BOS + LEFT_PAD_TOKENS silence PADs + NUM_DELAY_TOKENS delay PADs.
+/// Default prefill length: BOS + LEFT_PAD_TOKENS silence PADs + NUM_DELAY_TOKENS delay PADs.
+/// Kept as documentation; use `prefill_len()` for runtime computation.
+#[allow(dead_code)]
 pub const PREFILL_LEN: usize = 1 + common::LEFT_PAD_TOKENS + NUM_DELAY_TOKENS;
+
+/// Compute prefill length for a given delay_tokens value.
+pub fn prefill_len(delay_tokens: usize) -> usize {
+    1 + common::LEFT_PAD_TOKENS + delay_tokens
+}
 
 // ---- GQA Attention ----
 
@@ -307,20 +316,22 @@ impl TextDecoder {
     pub fn prepare_prefill(
         &self,
         adapter_out: &Tensor,
+        delay_tokens: usize,
         device: &Device,
         dtype: DType,
     ) -> candle_core::Result<Tensor> {
+        let pf_len = prefill_len(delay_tokens);
         let n_adapter = adapter_out.dim(1)?;
 
-        let mut prefill_ids = vec![tokenizer::STREAMING_PAD_ID; PREFILL_LEN];
+        let mut prefill_ids = vec![tokenizer::STREAMING_PAD_ID; pf_len];
         prefill_ids[0] = tokenizer::BOS_ID;
 
         let tok_embeds = self.embed_tokens(&prefill_ids, device)?;
-        let audio_slice = if PREFILL_LEN <= n_adapter {
-            adapter_out.narrow(1, 0, PREFILL_LEN)?
+        let audio_slice = if pf_len <= n_adapter {
+            adapter_out.narrow(1, 0, pf_len)?
         } else {
-            let avail = adapter_out.narrow(1, 0, n_adapter.min(PREFILL_LEN))?;
-            let pad_len = PREFILL_LEN - n_adapter.min(PREFILL_LEN);
+            let avail = adapter_out.narrow(1, 0, n_adapter.min(pf_len))?;
+            let pad_len = pf_len - n_adapter.min(pf_len);
             if pad_len > 0 {
                 let zeros = Tensor::zeros((1, pad_len, HIDDEN_SIZE), dtype, device)?;
                 Tensor::cat(&[&avail, &zeros], 1)?

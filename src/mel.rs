@@ -218,6 +218,20 @@ pub struct IncrementalMel {
 }
 
 impl IncrementalMel {
+    /// Create a fresh IncrementalMel that will apply reflect padding on first push.
+    pub fn new(filters: &[f32]) -> Self {
+        let hann: Vec<f32> = (0..N_FFT)
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / N_FFT as f32).cos()))
+            .collect();
+        Self {
+            sample_buf: Vec::new(),
+            hop_pos: 0,
+            hann,
+            filters: filters.to_vec(),
+            initialized: false,
+        }
+    }
+
     /// Create an IncrementalMel pre-seeded with explicit left context samples
     /// instead of using reflect padding. Use this when you know the preceding audio
     /// (e.g., the tail of delay audio from startup).

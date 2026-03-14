@@ -17,6 +17,8 @@ hound = "3"
 num_cpus = "1"
 cpal = "0.15"
 ctrlc = "3"
+rdev = "0.5"
+enigo = "0.2"
 
 [profile.release]
 opt-level = 3

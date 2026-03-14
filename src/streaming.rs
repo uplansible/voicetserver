@@ -1,56 +1,95 @@
-// Streaming mic capture + real-time inference pipeline for Voicet Phase 2
+// Streaming mic capture + real-time inference pipeline
 //
 // Architecture: cpal audio callback -> mpsc channel -> main thread inference loop
 // Timing: 80ms of audio (1280 samples, 8 mel frames) = 1 decoder token
 //
-// Key insight: the startup must process [silence + delay_audio] together through
-// the batch pipeline so decoder prefill positions 33–38 see real audio adapter
-// frames, matching offline behavior exactly.
+// Phase 3 additions:
+// - StreamConfig for runtime-configurable parameters
+// - State machine: Ready → Active ↔ Paused (hotkey mode)
+// - Rolling prebuffer so speech before hotkey press isn't lost
+// - OutputSink for stdout vs keyboard injection
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-
 
 use crate::adapter::Adapter;
 use crate::common;
 use crate::decoder::{self, TextDecoder};
 use crate::encoder::{self, AudioEncoder};
+use crate::hotkey;
 use crate::mel::{self, IncrementalMel};
 use crate::tokenizer::{self, Tokenizer};
 
-pub const SILENCE_THRESHOLD: f32 = 0.01;
-pub const SILENCE_CHUNKS: usize = decoder::NUM_DELAY_TOKENS + 6;
+/// Runtime-configurable streaming parameters.
+pub struct StreamConfig {
+    pub delay_tokens: usize,
+    pub silence_threshold: f32,
+    pub silence_chunks: usize,
+    pub hotkey: Option<rdev::Key>,
+    pub type_mode: bool,
+}
 
 /// PCM samples per decoder token: MEL_FRAMES_PER_TOKEN × HOP_LENGTH.
 const SAMPLES_PER_TOKEN: usize = common::MEL_FRAMES_PER_TOKEN * mel::HOP_LENGTH;
 
 // Incremental conv stem: keep 4 mel frames as context between iterations.
-// Conv1 (stride=1, k=3) needs 2 frames of left context; conv2 (stride=2, k=3) needs 1.
-// With 4 context frames, the first 2 conv2 outputs are wrong; skip them, keep CHUNK_SIZE.
 const CONV_CTX: usize = 4;
 const CONV_SKIP: usize = 2;
-const NEW_MEL_PER_CHUNK: usize = common::MEL_FRAMES_PER_TOKEN; // 8 mel frames → 4 conv outputs = CHUNK_SIZE
+const NEW_MEL_PER_CHUNK: usize = common::MEL_FRAMES_PER_TOKEN;
 
-// (1 + NUM_DELAY_TOKENS) adapter frames of real audio needed for prefill.
-// Silence covers LEFT_PAD_TOKENS adapter frames; remaining (1 + delay) come from real audio.
-const DELAY_SAMPLES: usize = (1 + decoder::NUM_DELAY_TOKENS) * SAMPLES_PER_TOKEN;
+/// Output destination for transcribed text.
+enum OutputSink {
+    Stdout,
+    Keyboard(enigo::Enigo),
+}
+
+impl OutputSink {
+    fn emit_text(&mut self, text: &[u8]) {
+        match self {
+            OutputSink::Stdout => {
+                let _ = std::io::stdout().write_all(text);
+                let _ = std::io::stdout().flush();
+            }
+            OutputSink::Keyboard(enigo) => {
+                use enigo::Keyboard;
+                if let Ok(s) = std::str::from_utf8(text) {
+                    let _ = enigo.text(s);
+                }
+            }
+        }
+    }
+
+    fn emit_newline(&mut self) {
+        match self {
+            OutputSink::Stdout => {
+                print!("\n\n");
+                let _ = std::io::stdout().flush();
+            }
+            OutputSink::Keyboard(enigo) => {
+                use enigo::{Direction, Key, Keyboard};
+                let _ = enigo.key(Key::Return, Direction::Click);
+                let _ = enigo.key(Key::Return, Direction::Click);
+            }
+        }
+    }
+}
 
 /// Startup result passed to the streaming loop.
 struct StartupState {
     last_token: u32,
-    /// All mel frames from startup [silence + delay], used as conv stem prefix
     mel_frames: Vec<[f32; mel::N_MELS]>,
 }
 
-/// Process [silence + delay_audio] through batch mel → enc.forward() → adapter → prefill,
-/// exactly matching the offline pipeline. Returns state for the streaming loop.
+/// Process [silence + delay_audio] through batch mel → enc → adapter → prefill.
 fn run_startup(
     delay_samples: &[f32],
+    delay_tokens: usize,
     enc: &mut AudioEncoder,
     adapter: &Adapter,
     dec: &mut TextDecoder,
@@ -58,18 +97,16 @@ fn run_startup(
     filters: &[f32],
     device: &Device,
     dtype: DType,
+    sink: &mut OutputSink,
 ) -> Result<StartupState> {
     let left_pad_samples = common::LEFT_PAD_TOKENS * common::MEL_FRAMES_PER_TOKEN * mel::HOP_LENGTH;
 
-    // Concatenate silence + delay audio, just like offline
     let mut padded = vec![0.0f32; left_pad_samples];
     padded.extend_from_slice(delay_samples);
 
-    // Batch mel on the whole thing
     let mel_data = mel::log_mel_spectrogram(&padded, filters);
     let mel_time = mel_data.len() / mel::N_MELS;
 
-    // Save mel frames for conv stem prefix in streaming loop
     let mut mel_frames = Vec::with_capacity(mel_time);
     for t in 0..mel_time {
         let mut frame = [0.0f32; mel::N_MELS];
@@ -83,49 +120,41 @@ fn run_startup(
         .to_dtype(dtype)?
         .unsqueeze(0)?;
 
-    // Full encoder (resets KV caches, processes all chunks)
     let enc_out = enc.forward(&mel_tensor)?;
     let total_enc_frames = enc_out.dim(1)?;
 
-    // Adapter
     let adapter_out = adapter.forward(&enc_out)?;
     let n_adapter = adapter_out.dim(1)?;
 
-    // Delay conditioning
-    let t_cond = decoder::sinusoidal_embedding(decoder::NUM_DELAY_TOKENS as f32, device, dtype)?;
+    let t_cond = decoder::sinusoidal_embedding(delay_tokens as f32, device, dtype)?;
+    let prefill_len = decoder::prefill_len(delay_tokens);
 
-    // Prefill: BOS + (LEFT_PAD_TOKENS + NUM_DELAY_TOKENS) PAD tokens
-    let prefill_embeds = dec.prepare_prefill(&adapter_out, device, dtype)?;
+    let prefill_embeds = dec.prepare_prefill(&adapter_out, delay_tokens, device, dtype)?;
 
     dec.reset_caches();
     dec.precompute_t_cond(&t_cond)?;
     let logits = dec.forward(&prefill_embeds)?;
     let mut last_token = common::argmax_last(&logits)?;
-    emit_token(last_token, tok);
+    emit_token(last_token, tok, sink);
 
-    // Decode any remaining adapter frames beyond prefill (from delay audio)
-    for pos in decoder::PREFILL_LEN..n_adapter {
+    for pos in prefill_len..n_adapter {
         let tok_embed = dec.embed_tokens(&[last_token], device)?;
         let audio_frame = adapter_out.narrow(1, pos, 1)?;
         let fused = tok_embed.add(&audio_frame)?;
         let logits = dec.forward(&fused)?;
         let next_token = common::argmax_last(&logits)?;
-        emit_token(next_token, tok);
+        emit_token(next_token, tok, sink);
         last_token = next_token;
         if last_token == tokenizer::EOS_ID { break; }
     }
 
-    println!("Startup: {} mel frames, {} encoder frames, {} adapter frames",
+    eprintln!("Startup: {} mel frames, {} encoder frames, {} adapter frames",
         mel_time, total_enc_frames, n_adapter);
 
-    Ok(StartupState {
-        last_token,
-        mel_frames,
-    })
+    Ok(StartupState { last_token, mel_frames })
 }
 
 /// The core streaming processing loop.
-/// `mel_buffer` holds CONV_CTX context frames followed by unprocessed new frames.
 fn run_processing_loop(
     enc: &mut AudioEncoder,
     adapter: &Adapter,
@@ -135,12 +164,11 @@ fn run_processing_loop(
     mel_buffer: &mut Vec<[f32; mel::N_MELS]>,
     device: &Device,
     dtype: DType,
+    sink: &mut OutputSink,
 ) -> Result<bool> {
-    // Process tokens while we have enough new mel frames beyond context
     while mel_buffer.len() >= CONV_CTX + NEW_MEL_PER_CHUNK {
         let process_len = CONV_CTX + NEW_MEL_PER_CHUNK;
 
-        // Build mel tensor from context + new frames only (not full history)
         let mut mel_data = vec![0.0f32; mel::N_MELS * process_len];
         for (frame_idx, frame) in mel_buffer[..process_len].iter().enumerate() {
             for mel_bin in 0..mel::N_MELS {
@@ -156,14 +184,9 @@ fn run_processing_loop(
             break;
         }
 
-        // Skip first CONV_SKIP outputs (wrong due to zero-padding over context),
-        // take CHUNK_SIZE new frames
         let new_conv_frames = conv_out.narrow(1, CONV_SKIP, encoder::CHUNK_SIZE)?;
-
-        // Remove processed mel frames; remaining starts with new context
         mel_buffer.drain(..NEW_MEL_PER_CHUNK);
 
-        // Encoder → trim → adapter → decoder → argmax
         let enc_out = enc.forward_chunk(&new_conv_frames)?;
         enc.trim_caches();
 
@@ -174,12 +197,12 @@ fn run_processing_loop(
         let logits = dec.forward(&fused)?;
         let next_token = common::argmax_last(&logits)?;
 
-        emit_token(next_token, tok);
+        emit_token(next_token, tok, sink);
         dec.trim_caches();
 
         state.last_token = next_token;
         if state.last_token == tokenizer::EOS_ID {
-            return Ok(true); // EOS
+            return Ok(true);
         }
     }
     Ok(false)
@@ -194,7 +217,19 @@ pub fn run_streaming(
     filters: &[f32],
     device: &Device,
     dtype: DType,
+    config: &StreamConfig,
 ) -> Result<()> {
+    let delay_samples_count = (1 + config.delay_tokens) * SAMPLES_PER_TOKEN;
+    let hotkey_mode = config.hotkey.is_some();
+
+    // Initialize output sink
+    let mut sink = if config.type_mode {
+        OutputSink::Keyboard(enigo::Enigo::new(&enigo::Settings::default())
+            .map_err(|e| anyhow::anyhow!("Failed to initialize keyboard output: {}", e))?)
+    } else {
+        OutputSink::Stdout
+    };
+
     // Set up Ctrl+C handler
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -202,7 +237,7 @@ pub fn run_streaming(
         r.store(false, Ordering::SeqCst);
     })?;
 
-    // Open mic BEFORE startup (buffer audio during GPU warm-up)
+    // Open mic
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
     let (_stream, native_rate) = open_mic(tx)?;
 
@@ -210,107 +245,244 @@ pub fn run_streaming(
     let resample_ratio = native_rate as f64 / 16000.0;
     let need_resample = (resample_ratio - 1.0).abs() > 0.01;
     let ratio_int = resample_ratio as usize;
-
-    // Collect enough audio for delay (DELAY_SAMPLES at 16kHz)
-    println!("Buffering {:.0}ms of audio for startup...", DELAY_SAMPLES as f64 / 16.0);
     let mut raw_buf: Vec<f32> = Vec::new();
-    let mut samples_16k: Vec<f32> = Vec::new();
 
-    while samples_16k.len() < DELAY_SAMPLES && running.load(Ordering::SeqCst) {
-        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(chunk) => raw_buf.extend_from_slice(&chunk),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(_) => break,
-        }
-        // Drain any extra
-        while let Ok(more) = rx.try_recv() {
-            raw_buf.extend_from_slice(&more);
-        }
-        // Resample
-        resample(&mut raw_buf, &mut samples_16k, need_resample, ratio_int);
-    }
+    if hotkey_mode {
+        // ---- Hotkey mode: startup with silence, toggle with hotkey ----
+        let silence = vec![0.0f32; delay_samples_count];
+        eprintln!("Running startup with silence ({} samples)...", silence.len());
+        let mut state = run_startup(
+            &silence, config.delay_tokens, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
+        )?;
 
-    if samples_16k.len() < DELAY_SAMPLES {
-        anyhow::bail!("Not enough audio for startup");
-    }
+        // Set up hotkey state machine
+        let hotkey_state = Arc::new(AtomicU8::new(hotkey::STATE_READY));
+        let hotkey_key = config.hotkey.unwrap();
+        hotkey::spawn_hotkey_listener(hotkey_key, hotkey_state.clone());
 
-    let delay = samples_16k[..DELAY_SAMPLES].to_vec();
-    let leftover = samples_16k[DELAY_SAMPLES..].to_vec();
+        eprintln!("Press {:?} to start/stop recording. Ctrl+C to quit.", hotkey_key);
 
-    println!("Running startup with {} delay samples...", delay.len());
-    let mut state = run_startup(&delay, enc, adapter, dec, tok, filters, device, dtype)?;
+        // Keep only last CONV_CTX mel frames as conv stem context
+        let mel_len = state.mel_frames.len();
+        let ctx_start = mel_len.saturating_sub(CONV_CTX);
+        let mut mel_buffer: Vec<[f32; mel::N_MELS]> = state.mel_frames[ctx_start..].to_vec();
+        drop(std::mem::take(&mut state.mel_frames));
 
-    println!("\n--- Listening (Ctrl+C to stop) ---\n");
+        // Fresh IncrementalMel — will apply reflect padding on first real audio push
+        let mut inc_mel = IncrementalMel::new(filters);
 
-    // Keep only last CONV_CTX mel frames as context for incremental conv stem
-    let mel_len = state.mel_frames.len();
-    let ctx_start = mel_len.saturating_sub(CONV_CTX);
-    let mut mel_buffer: Vec<[f32; mel::N_MELS]> = state.mel_frames[ctx_start..].to_vec();
-    drop(std::mem::take(&mut state.mel_frames)); // free startup mel history
+        // Rolling prebuffer: captures audio while paused so speech just before
+        // pressing the hotkey isn't lost
+        let mut prebuffer: VecDeque<f32> = VecDeque::with_capacity(delay_samples_count);
 
-    // Seed IncrementalMel with left context from tail of delay audio
-    let left_ctx_len = (mel::N_FFT / 2).min(delay.len());
-    let left_ctx = &delay[delay.len() - left_ctx_len..];
-    let mut inc_mel = IncrementalMel::with_left_context(filters, left_ctx);
+        let mut silence_counter: usize = 0;
+        let mut silence_emitted = false;
+        let mut sample_buf_for_silence: Vec<f32> = Vec::new();
+        let mut prev_state_val = hotkey::STATE_READY;
 
-    // Feed leftover samples from buffer
-    if !leftover.is_empty() {
-        inc_mel.push_samples(&leftover);
-    }
+        while running.load(Ordering::SeqCst) {
+            let current_state_val = hotkey_state.load(Ordering::SeqCst);
 
-    let mut silence_counter: usize = 0;
-    let mut silence_emitted = false;
-    let mut sample_buf_for_silence: Vec<f32> = leftover;
-
-    while running.load(Ordering::SeqCst) {
-        // Pull audio from channel
-        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-            Ok(chunk) => {
-                raw_buf.extend_from_slice(&chunk);
-                while let Ok(more) = rx.try_recv() {
-                    raw_buf.extend_from_slice(&more);
+            // Pull audio from channel
+            let mut new_16k = Vec::new();
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(chunk) => {
+                    raw_buf.extend_from_slice(&chunk);
+                    while let Ok(more) = rx.try_recv() {
+                        raw_buf.extend_from_slice(&more);
+                    }
+                    resample(&mut raw_buf, &mut new_16k, need_resample, ratio_int);
                 }
-                let mut new_16k = Vec::new();
-                resample(&mut raw_buf, &mut new_16k, need_resample, ratio_int);
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            if current_state_val == hotkey::STATE_READY || current_state_val == hotkey::STATE_PAUSED {
+                // ---- Ready/Paused: feed rolling prebuffer, don't process ----
+
+                // Detect Active → Paused transition: flush decoder's lookahead
+                if prev_state_val == hotkey::STATE_ACTIVE {
+                    // Feed any final real audio still in new_16k
+                    if !new_16k.is_empty() {
+                        inc_mel.push_samples(&new_16k);
+                        new_16k.clear();
+                    }
+
+                    // Push (delay_tokens + 4) tokens of silence to flush the
+                    // decoder's lookahead buffer. The decoder will emit PAD tokens
+                    // for the silence, which emit_token ignores.
+                    let flush_samples = (config.delay_tokens + 4) * SAMPLES_PER_TOKEN;
+                    let silence = vec![0.0f32; flush_samples];
+                    inc_mel.push_samples(&silence);
+
+                    // Drain all mel frames and run processing to completion
+                    mel_buffer.extend(inc_mel.drain_frames());
+                    let _ = run_processing_loop(
+                        enc, adapter, dec, tok, &mut state,
+                        &mut mel_buffer, device, dtype, &mut sink,
+                    )?;
+
+                    // Now truncate and go idle
+                    if mel_buffer.len() > CONV_CTX {
+                        mel_buffer.drain(..mel_buffer.len() - CONV_CTX);
+                    }
+                    sample_buf_for_silence.clear();
+                    sink.emit_newline();
+                }
+
+                // Feed prebuffer (capped at delay_samples_count)
+                for &s in &new_16k {
+                    if prebuffer.len() >= delay_samples_count {
+                        prebuffer.pop_front();
+                    }
+                    prebuffer.push_back(s);
+                }
+            } else {
+                // ---- Active: process audio ----
+                let just_resumed = prev_state_val != hotkey::STATE_ACTIVE;
+
+                if just_resumed {
+                    // Flush prebuffer into IncrementalMel and silence detection buffer
+                    let prebuf_samples: Vec<f32> = prebuffer.drain(..).collect();
+                    if !prebuf_samples.is_empty() {
+                        inc_mel.push_samples(&prebuf_samples);
+                        sample_buf_for_silence.extend_from_slice(&prebuf_samples);
+                    }
+                    silence_counter = 0;
+                    // Start with silence_emitted = true so we don't emit a
+                    // paragraph break before the user has spoken anything.
+                    // It resets to false once speech is detected (RMS > threshold).
+                    silence_emitted = true;
+                }
+
                 if !new_16k.is_empty() {
                     inc_mel.push_samples(&new_16k);
                     sample_buf_for_silence.extend_from_slice(&new_16k);
                 }
+
+                // Drain mel frames
+                mel_buffer.extend(inc_mel.drain_frames());
+
+                // Silence detection
+                while sample_buf_for_silence.len() >= SAMPLES_PER_TOKEN {
+                    let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
+                        .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
+                    sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
+                    if rms < config.silence_threshold {
+                        silence_counter += 1;
+                    } else {
+                        silence_counter = 0;
+                        silence_emitted = false;
+                    }
+                }
+
+                // Process tokens
+                let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
+                    &mut mel_buffer, device, dtype, &mut sink)?;
+                if eos { break; }
+
+                // Silence flush
+                if silence_counter >= config.silence_chunks && !silence_emitted {
+                    sink.emit_newline();
+                    silence_emitted = true;
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+
+            prev_state_val = current_state_val;
+        }
+    } else {
+        // ---- Always-on mode: original behavior ----
+        let mut samples_16k: Vec<f32> = Vec::new();
+        eprintln!("Buffering {:.0}ms of audio for startup...", delay_samples_count as f64 / 16.0);
+
+        while samples_16k.len() < delay_samples_count && running.load(Ordering::SeqCst) {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(chunk) => raw_buf.extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+            while let Ok(more) = rx.try_recv() {
+                raw_buf.extend_from_slice(&more);
+            }
+            resample(&mut raw_buf, &mut samples_16k, need_resample, ratio_int);
         }
 
-        // Drain mel frames
-        mel_buffer.extend(inc_mel.drain_frames());
-
-        // Silence detection
-        while sample_buf_for_silence.len() >= SAMPLES_PER_TOKEN {
-            let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
-                .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
-            sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
-            if rms < SILENCE_THRESHOLD {
-                silence_counter += 1;
-            } else {
-                silence_counter = 0;
-                silence_emitted = false;
-            }
+        if samples_16k.len() < delay_samples_count {
+            anyhow::bail!("Not enough audio for startup");
         }
 
-        // Process tokens
-        let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
-            &mut mel_buffer, device, dtype)?;
-        if eos { break; }
+        let delay = samples_16k[..delay_samples_count].to_vec();
+        let leftover = samples_16k[delay_samples_count..].to_vec();
 
-        // Silence flush: emit paragraph break once, then wait for speech to resume
-        if silence_counter >= SILENCE_CHUNKS && !silence_emitted {
-            print!("\n\n");
-            let _ = std::io::stdout().flush();
-            silence_emitted = true;
+        eprintln!("Running startup with {} delay samples...", delay.len());
+        let mut state = run_startup(
+            &delay, config.delay_tokens, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
+        )?;
+
+        eprintln!("\n--- Listening (Ctrl+C to stop) ---\n");
+
+        let mel_len = state.mel_frames.len();
+        let ctx_start = mel_len.saturating_sub(CONV_CTX);
+        let mut mel_buffer: Vec<[f32; mel::N_MELS]> = state.mel_frames[ctx_start..].to_vec();
+        drop(std::mem::take(&mut state.mel_frames));
+
+        let left_ctx_len = (mel::N_FFT / 2).min(delay.len());
+        let left_ctx = &delay[delay.len() - left_ctx_len..];
+        let mut inc_mel = IncrementalMel::with_left_context(filters, left_ctx);
+
+        if !leftover.is_empty() {
+            inc_mel.push_samples(&leftover);
+        }
+
+        let mut silence_counter: usize = 0;
+        // Start true so we don't emit a paragraph break before the user speaks.
+        let mut silence_emitted = true;
+        let mut sample_buf_for_silence: Vec<f32> = leftover;
+
+        while running.load(Ordering::SeqCst) {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(chunk) => {
+                    raw_buf.extend_from_slice(&chunk);
+                    while let Ok(more) = rx.try_recv() {
+                        raw_buf.extend_from_slice(&more);
+                    }
+                    let mut new_16k = Vec::new();
+                    resample(&mut raw_buf, &mut new_16k, need_resample, ratio_int);
+                    if !new_16k.is_empty() {
+                        inc_mel.push_samples(&new_16k);
+                        sample_buf_for_silence.extend_from_slice(&new_16k);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            mel_buffer.extend(inc_mel.drain_frames());
+
+            while sample_buf_for_silence.len() >= SAMPLES_PER_TOKEN {
+                let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
+                    .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
+                sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
+                if rms < config.silence_threshold {
+                    silence_counter += 1;
+                } else {
+                    silence_counter = 0;
+                    silence_emitted = false;
+                }
+            }
+
+            let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
+                &mut mel_buffer, device, dtype, &mut sink)?;
+            if eos { break; }
+
+            if silence_counter >= config.silence_chunks && !silence_emitted {
+                sink.emit_newline();
+                silence_emitted = true;
+            }
         }
     }
 
-    println!("\n\n--- Stopped ---");
+    eprintln!("\n--- Stopped ---");
     Ok(())
 }
 
@@ -321,7 +493,6 @@ fn resample(raw_buf: &mut Vec<f32>, out: &mut Vec<f32>, need_resample: bool, rat
         out.extend(raw_buf.drain(..));
         return;
     }
-    // Decimation by integer ratio: take every ratio_int-th sample
     let n_out = raw_buf.len() / ratio_int;
     out.reserve(n_out);
     for i in 0..n_out {
@@ -330,13 +501,12 @@ fn resample(raw_buf: &mut Vec<f32>, out: &mut Vec<f32>, need_resample: bool, rat
     raw_buf.drain(..n_out * ratio_int);
 }
 
-fn emit_token(token: u32, tok: &Tokenizer) {
+fn emit_token(token: u32, tok: &Tokenizer, sink: &mut OutputSink) {
     if token == tokenizer::STREAMING_PAD_ID { return; }
     if token == tokenizer::STREAMING_WORD_ID { return; }
     if token == tokenizer::EOS_ID { return; }
     if let Some(bytes) = tok.decode_token(token) {
-        let _ = std::io::stdout().write_all(&bytes);
-        let _ = std::io::stdout().flush();
+        sink.emit_text(&bytes);
     }
 }
 
@@ -345,12 +515,12 @@ fn open_mic(tx: mpsc::Sender<Vec<f32>>) -> Result<(cpal::Stream, u32)> {
     let input_device = host.default_input_device()
         .ok_or_else(|| anyhow::anyhow!("No input device found"))?;
 
-    println!("Input device: {}", input_device.name().unwrap_or_default());
+    eprintln!("Input device: {}", input_device.name().unwrap_or_default());
 
     let default_config = input_device.default_input_config()?;
     let native_rate = default_config.sample_rate().0;
     let native_channels = default_config.channels();
-    println!("Native config: {}Hz, {} ch", native_rate, native_channels);
+    eprintln!("Native config: {}Hz, {} ch", native_rate, native_channels);
 
     let config = cpal::StreamConfig {
         channels: 1,
@@ -359,7 +529,7 @@ fn open_mic(tx: mpsc::Sender<Vec<f32>>) -> Result<(cpal::Stream, u32)> {
     };
 
     if native_rate != 16000 {
-        println!("Will resample {}Hz -> 16kHz on inference thread", native_rate);
+        eprintln!("Will resample {}Hz -> 16kHz on inference thread", native_rate);
     }
 
     let stream = input_device.build_input_stream(

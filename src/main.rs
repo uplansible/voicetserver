@@ -2,6 +2,7 @@ mod adapter;
 mod common;
 mod decoder;
 mod encoder;
+mod hotkey;
 mod mel;
 mod streaming;
 mod tokenizer;
@@ -9,6 +10,7 @@ mod tokenizer;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use clap::Parser;
 use std::fs;
 use std::time::Instant;
 
@@ -16,28 +18,83 @@ use common::{argmax_last, MEL_FRAMES_PER_TOKEN};
 
 const MODEL_DIR: &str = "Voxtral-Mini-4B-Realtime";
 
+#[derive(Parser)]
+#[command(name = "voicet", about = "Real-time speech transcription")]
+struct Cli {
+    /// WAV file for offline transcription (omit for streaming mode)
+    wav_file: Option<String>,
+
+    /// CUDA device index
+    #[arg(long, default_value_t = 0)]
+    device: usize,
+
+    /// Delay tokens (1-30, higher = more accuracy, more latency; each token = 80ms)
+    #[arg(long, default_value_t = 4)]
+    delay: usize,
+
+    /// Silence RMS threshold for paragraph breaks
+    #[arg(long, default_value_t = 0.01)]
+    silence_threshold: f32,
+
+    /// Silence chunks before paragraph break (default: delay + 6)
+    #[arg(long)]
+    silence_flush: Option<usize>,
+
+    /// Hotkey to toggle recording (e.g. F9, ScrollLock, Pause)
+    #[arg(long)]
+    hotkey: Option<String>,
+
+    /// Type text as keystrokes into the focused application
+    #[arg(long = "type")]
+    type_mode: bool,
+}
+
 fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Validate --delay range
+    if cli.delay < 1 || cli.delay > 30 {
+        anyhow::bail!("--delay must be between 1 and 30 (got {})", cli.delay);
+    }
+
+    // Validate: --type without --hotkey is probably a mistake
+    if cli.type_mode && cli.hotkey.is_none() {
+        eprintln!("Warning: --type without --hotkey will type continuously into the focused app.");
+        eprintln!("         Consider adding --hotkey F9 to toggle recording.");
+    }
+
+    // Parse hotkey early so we fail fast on invalid key names
+    let hotkey_key = cli.hotkey.as_deref()
+        .map(hotkey::parse_hotkey)
+        .transpose()?;
+
+    let silence_chunks = cli.silence_flush.unwrap_or(cli.delay + 6);
+
     // Match PyTorch's default BF16 matmul behavior (reduced precision accumulation)
     candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
 
-    let wav_path = std::env::args().nth(1);
-
     // --- Setup ---
-    let device = Device::cuda_if_available(0)?;
+    let device = Device::cuda_if_available(cli.device)?;
     let dtype = DType::BF16;
 
     println!("\n{:<28} {}", "Parameter", "Value");
     println!("{:-<28} {:-<32}", "", "");
     println!("{:<28} {} ({}ms)",
-        "Delay tokens", decoder::NUM_DELAY_TOKENS, decoder::NUM_DELAY_TOKENS * 80);
+        "Delay tokens", cli.delay, cli.delay * 80);
     println!("{:<28} {} ({}s)",
         "Encoder sliding window", encoder::SLIDING_WINDOW, encoder::SLIDING_WINDOW * 20 / 1000);
     println!("{:<28} {} ({:.0}min)",
         "Decoder sliding window", decoder::SLIDING_WINDOW, decoder::SLIDING_WINDOW as f64 * 0.08 / 60.0);
     println!("{:<28} {} (RMS < {})",
-        "Silence threshold", streaming::SILENCE_THRESHOLD, streaming::SILENCE_THRESHOLD);
+        "Silence threshold", cli.silence_threshold, cli.silence_threshold);
     println!("{:<28} {} ({}ms)",
-        "Silence newline after", streaming::SILENCE_CHUNKS, streaming::SILENCE_CHUNKS * 80);
+        "Silence newline after", silence_chunks, silence_chunks * 80);
+    if let Some(ref key) = hotkey_key {
+        println!("{:<28} {:?}", "Hotkey", key);
+    }
+    if cli.type_mode {
+        println!("{:<28} enabled", "Keyboard output");
+    }
     println!("{:<28} {:?}", "Compute dtype", dtype);
     println!();
 
@@ -64,17 +121,26 @@ fn main() -> Result<()> {
 
     let filters = mel::mel_filters(MODEL_DIR);
 
-    match wav_path {
-        Some(path) => run_offline(&path, &mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype),
+    let config = streaming::StreamConfig {
+        delay_tokens: cli.delay,
+        silence_threshold: cli.silence_threshold,
+        silence_chunks,
+        hotkey: hotkey_key,
+        type_mode: cli.type_mode,
+    };
+
+    match cli.wav_file {
+        Some(path) => run_offline(&path, cli.delay, &mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype),
         None => {
             println!("\n=== Voicet Streaming Mode ===\n");
-            streaming::run_streaming(&mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype)
+            streaming::run_streaming(&mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype, &config)
         }
     }
 }
 
 fn run_offline(
     wav_path: &str,
+    delay_tokens: usize,
     enc: &mut encoder::AudioEncoder,
     adapter: &adapter::Adapter,
     dec: &mut decoder::TextDecoder,
@@ -118,10 +184,10 @@ fn run_offline(
     let t0 = Instant::now();
     let n_audio_frames = adapter_out.dim(1)?;
 
-    let t_cond = decoder::sinusoidal_embedding(decoder::NUM_DELAY_TOKENS as f32, device, dtype)?;
-    let prefill_len = decoder::PREFILL_LEN;
+    let t_cond = decoder::sinusoidal_embedding(delay_tokens as f32, device, dtype)?;
+    let prefill_len = decoder::prefill_len(delay_tokens);
 
-    let prefill_embeds = dec.prepare_prefill(&adapter_out, device, dtype)?;
+    let prefill_embeds = dec.prepare_prefill(&adapter_out, delay_tokens, device, dtype)?;
 
     dec.reset_caches();
     dec.precompute_t_cond(&t_cond)?;
