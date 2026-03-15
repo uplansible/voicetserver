@@ -16,13 +16,15 @@ use std::time::Instant;
 
 use common::{argmax_last, MEL_FRAMES_PER_TOKEN};
 
-const MODEL_DIR: &str = "Voxtral-Mini-4B-Realtime";
-
 #[derive(Parser)]
 #[command(name = "voicet", about = "Real-time speech transcription")]
 struct Cli {
     /// WAV file for offline transcription (omit for streaming mode)
     wav_file: Option<String>,
+
+    /// Directory containing model files (consolidated.safetensors, tekken.json, mel_filters.bin)
+    #[arg(long, default_value = ".")]
+    model_dir: String,
 
     /// CUDA device index
     #[arg(long, default_value_t = 0)]
@@ -110,14 +112,14 @@ fn main() -> Result<()> {
     println!();
 
     println!("Loading safetensors...");
-    let st_path = format!("{MODEL_DIR}/consolidated.safetensors");
+    let st_path = format!("{}/consolidated.safetensors", cli.model_dir);
     let st_data = unsafe { memmap2::Mmap::map(&fs::File::open(&st_path)?)? };
     let vb = VarBuilder::from_slice_safetensors(&st_data, dtype, &device)?;
 
     let t_total = Instant::now();
 
     println!("Loading tokenizer...");
-    let tok = tokenizer::Tokenizer::load(MODEL_DIR)?;
+    let tok = tokenizer::Tokenizer::load(&cli.model_dir)?;
 
     println!("Loading encoder...");
     let mut enc = encoder::AudioEncoder::load(&vb, &device, dtype)?;
@@ -130,7 +132,7 @@ fn main() -> Result<()> {
 
     println!("Total model load: {:.2}s", t_total.elapsed().as_secs_f64());
 
-    let filters = mel::mel_filters(MODEL_DIR);
+    let filters = mel::mel_filters(&cli.model_dir);
 
     let config = streaming::StreamConfig {
         delay_tokens: cli.delay,
