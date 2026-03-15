@@ -118,6 +118,49 @@ Other dependencies: `rdev` (global hotkey + Ctrl+C via low-level keyboard hook),
 
 ---
 
+## Performance Optimizations
+
+### GPU Kernel Optimizations
+
+| # | Optimization | File(s) | What it does |
+|---|---|---|---|
+| 1 | Flash Attention (encoder) | `encoder.rs` | `flash_attn_windowed(q, k, v, scale, Some(749), Some(0))` — single fused CUDA kernel per layer handles Q@K, causal sliding window masking, softmax, and @V. No intermediate attention matrix materialized. 32 layers × 1 kernel replaces 32 × (matmul + transpose + mask + softmax + matmul + transpose + 2 contiguous). |
+| 2 | Flash Attention (decoder) | `decoder.rs` | `flash_attn_windowed(q, k, v, scale, Some(2047), Some(0))` — same as encoder, plus native GQA support (32Q/8KV heads handled internally, no `repeat_kv()` needed). 26 layers × 1 kernel. |
+| 3 | Fused RMSNorm | `common.rs` | `candle_nn::ops::rms_norm` — single CUDA kernel replaces 7 separate ops (to_dtype, sqr, mean, add, sqrt, div, mul, to_dtype). Affects both encoder (65 calls) and decoder (53 calls) per forward. Saves ~530 kernel launches/token. |
+| 4 | Precomputed Ada-RMSNorm | `decoder.rs` | `precompute_t_cond()` computes all 26 per-layer Ada-RMSNorm scales once (Linear→GELU→Linear→unsqueeze→add). Stored in `ada_scales: Option<Vec<Tensor>>`. Called once after t_cond is created; forward uses cached values. Saves ~130 kernel launches/token. |
+
+### Memory Layout Optimizations
+
+| # | Optimization | File(s) | What it does |
+|---|---|---|---|
+| 5 | KV cache layout | `common.rs` | `KvCache` uses `[batch, seq, heads, dim]` layout (flash attention's expected format). Append/trim/len all operate on dim 1. No transposes needed between cache and attention. |
+| 6 | RoPE layout | `common.rs` | `RotaryEmbedding::apply` broadcasts over dim 2 (heads), matching the `[batch, seq, heads, dim]` tensor layout. Seq_len read from `dim(1)`, cos/sin unsqueeze on dim 2. |
+| 7 | Zero-copy lm_head | `decoder.rs` | `tok_embeddings.t()` is a zero-copy view (stride change). cuBLAS handles the transpose natively via its GEMM transpose flags. Saves ~800MB VRAM vs caching a contiguous transposed copy. |
+
+### KV Cache Management
+
+| # | Optimization | File(s) | What it does |
+|---|---|---|---|
+| 8 | KV cache trim with headroom | `common.rs` | When cache exceeds sliding window, trims to 75% of max instead of `max - 1`. This means trimming (which copies the entire cache) happens every N/4 tokens instead of every token. For the decoder (window 2048): trims every ~512 tokens instead of every token. |
+| 9 | Offline encoder KV trim | `encoder.rs` | Offline `forward()` trims encoder KV caches after each chunk. Without this, 5 minutes of audio accumulated unbounded KV entries across 32 layers, causing OOM. |
+| 10 | Offline decoder KV trim | `main.rs` | Offline generation loop trims decoder KV caches. Same OOM fix as encoder — without trimming, long files exhausted VRAM. |
+
+### Offline Mode Optimizations
+
+| # | Optimization | File(s) | What it does |
+|---|---|---|---|
+| 11 | Large encoder chunks | `encoder.rs` | Offline `forward()` uses chunks of `SLIDING_WINDOW / 2` (375 frames) instead of `CHUNK_SIZE` (4 frames). Larger matmuls saturate GPU compute units. Encoder time on 5min audio: 53s → 1s (52x speedup). Streaming still uses 4-frame chunks via `forward_chunk()`. |
+| 12 | Auto delay=20 for offline | `main.rs` | Offline transcription auto-overrides delay to 20 (1600ms lookahead) regardless of `--delay` flag. No latency penalty offline, so maximum accuracy is free. |
+
+### Measured Performance (RTX 5080)
+
+- **Streaming**: ~30ms per tick (encoder chunk + decoder step), well within 80ms budget
+- **Offline decoding**: 63 tok/s (0.20x real-time factor on 5min audio)
+- **Offline encoder**: 1.0s for 5min audio (14,880 frames)
+- **VRAM usage**: ~10.6GB (model weights + KV caches)
+
+---
+
 ## Key Weight Name Mapping
 
 The safetensors file uses **Mistral native naming** (not HuggingFace). 711 tensors total. We load from `consolidated.safetensors`.
