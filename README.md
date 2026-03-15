@@ -21,6 +21,7 @@ Other features:
 Resumable requests. Processes audio pipeline in parallel with gpu compute, eliminating gpu compute latency
 
 Performance comes from:
+
 - **Flash Attention v2** — fused CUDA kernels for both encoder (32 layers) and decoder (26 layers)
 - **Fused RMSNorm** — single CUDA kernel replaces 7 ops, saves ~530 kernel launches per token
 - **Precomputed Ada-RMSNorm conditioning** — 26 per-layer scale tensors computed once, not every forward pass
@@ -32,8 +33,8 @@ Performance comes from:
 ### Prerequisites
 
 - NVIDIA GPU with CUDA support (tested on RTX 5080)
-- [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) installed
-- Model weights: download [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime) into a `Voxtral-Mini-4B-Realtime/` directory
+- LINUX ONLY: [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) installed
+- Model weights: download [Voxtral-Mini-4B-Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime) into a the voicet.exe directory. You only need consolidated.safetensors and tekken.json
 
 ### Build
 
@@ -44,11 +45,13 @@ cargo build --release
 ### Run
 
 **Live streaming** — speak into your mic:
+
 ```bash
 ./target/release/voicet
 ```
 
 **Offline transcription** — transcribe a WAV file:
+
 ```bash
 ./target/release/voicet path/to/audio.wav
 ```
