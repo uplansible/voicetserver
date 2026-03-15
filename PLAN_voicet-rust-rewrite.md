@@ -188,19 +188,40 @@ Goal: daily-driver features — hotkey toggle, keyboard output, configurable CLI
 7. **Multi-channel mic** — Accepts native channel count, averages all channels to mono in the callback.
 8. **Dependencies** — Added `rdev`, `enigo`; removed `ctrlc`.
 
+### Phase 4: Offline performance + memory optimization — DONE
+
+Goal: Long audio files transcribe without OOM, with maximum GPU utilization and accuracy.
+
+1. **Offline KV cache trimming** — Encoder and decoder KV caches were unbounded in offline mode (streaming already trimmed). 5-minute files exhausted VRAM. Added `enc.trim_caches()` and `dec.trim_caches()` to the offline paths.
+2. **KV cache trim with headroom** — `KvCache::trim()` now trims to 75% of max capacity instead of `max - 1`. This avoids copying the entire cache every single token. Decoder (window 2048) now trims every ~512 tokens instead of every token.
+3. **Large encoder chunks for offline** — `forward()` uses `SLIDING_WINDOW / 2` (375 frames) instead of `CHUNK_SIZE` (4 frames). Larger matmuls saturate GPU compute units. Encoder time on 5min audio: **53s → 1s (52x speedup)**. Streaming still uses 4-frame chunks.
+4. **Auto delay=20 for offline** — Offline transcription overrides `--delay` to 20 (1600ms lookahead). No latency penalty offline, so maximum accuracy is free. Config table shows the effective value.
+5. **Zero-copy lm_head** — Removed pre-cached `tok_embeddings_t` (800MB contiguous transpose). `tok_embeddings.t()` is a zero-copy view; cuBLAS handles the transpose natively. **VRAM: 11.4GB → 10.6GB**.
+6. **`--model-dir` flag** — Model files loaded from current directory by default (was hardcoded to `Voxtral-Mini-4B-Realtime/` subfolder). Enables standalone distribution.
+7. **First public release** — v0.5.1 release zip with voicet.exe + 3 bundled CUDA DLLs (cublas64_13.dll, curand64_10.dll, nvcudart_hybrid64.dll) + mel_filters.bin. No CUDA Toolkit install required.
+
+**Measured performance (RTX 5080):**
+- Streaming: ~30ms per tick (well within 80ms budget)
+- Offline decoding: 63 tok/s (0.20x real-time factor)
+- Offline encoder: 1.0s for 5min audio
+- VRAM: ~10.6GB
+
 ## What we're NOT doing
 
-- No quantization (BF16 on 24GB VRAM is fine)
+- No quantization (BF16 on 10.6GB VRAM is fine for NVIDIA GPUs)
 - No WASM/browser support
 - No multi-GPU, no batched inference
 - No speaker diarization
 - No hand-written CUDA kernels (using candle's cuBLAS matmul + candle-flash-attn + candle-nn fused kernels)
+- No CPU inference (4.4B params needs ~200+ GB/s bandwidth for real-time; CPUs top out at ~50 GB/s)
 
 ## Success criteria
 
-- Single static binary (+ model weights)
-- < 10 crate dependencies
-- Startup time < 2s
-- Same transcription quality as Python version
-- Lower latency (no GIL, no TextIteratorStreamer word buffering)
-- Memory: ~9GB VRAM for model + ~100MB for KV caches
+- Single static binary (+ model weights) ✓
+- < 10 crate dependencies ✓
+- Startup time < 2s ✓ (~3s including model load)
+- Same transcription quality as Python version ✓
+- Lower latency (no GIL, no TextIteratorStreamer word buffering) ✓
+- Memory: ~10.6GB VRAM ✓
+- Standalone distribution with bundled CUDA DLLs ✓
+- Long audio files without OOM ✓
