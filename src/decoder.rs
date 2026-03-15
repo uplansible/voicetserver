@@ -243,8 +243,7 @@ pub fn sinusoidal_embedding(delay_value: f32, device: &Device, dtype: DType) -> 
 pub struct TextDecoder {
     layers: Vec<DecoderLayer>,
     final_norm: RmsNorm,
-    tok_embeddings: Tensor,   // [131072, 3072] for embed_tokens (index_select)
-    tok_embeddings_t: Tensor, // [3072, 131072] cached transpose for lm_head matmul
+    tok_embeddings: Tensor,   // [131072, 3072] for embed_tokens (index_select) + lm_head (tied)
     rope: RotaryEmbedding,
     caches: Vec<KvCache>,
     ada_scales: Option<Vec<Tensor>>, // precomputed per-layer Ada-RMSNorm scales
@@ -271,15 +270,13 @@ impl TextDecoder {
             "mm_streams_embeddings.embedding_module.tok_embeddings.weight",
         ).context("loading tok_embeddings")?;
 
-        println!("  Caching transposed lm_head...");
-        let tok_embeddings_t = tok_embeddings.t()?.contiguous()?;
 
         println!("  Creating decoder RoPE...");
         let rope = RotaryEmbedding::new(131072, HEAD_DIM, ROPE_THETA, device, dtype)?;
 
         let caches: Vec<KvCache> = (0..NUM_LAYERS).map(|_| KvCache::new()).collect();
 
-        Ok(Self { layers, final_norm, tok_embeddings, tok_embeddings_t, rope, caches, ada_scales: None })
+        Ok(Self { layers, final_norm, tok_embeddings, rope, caches, ada_scales: None })
     }
 
     /// Reset KV caches for a new generation.
@@ -369,10 +366,10 @@ impl TextDecoder {
 
         x = self.final_norm.forward(&x)?;
 
-        // lm_head: x @ tok_embeddings^T (cached transpose)
+        // lm_head: x @ tok_embeddings^T (tied weights, transpose handled by cuBLAS)
         let seq_len = x.dim(1)?;
         let last = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
-        let logits = last.matmul(&self.tok_embeddings_t)?;
+        let logits = last.matmul(&self.tok_embeddings.t()?)?;
         logits.unsqueeze(1)
     }
 }
