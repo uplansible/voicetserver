@@ -7,6 +7,7 @@ edition = "2021"
 candle-core = { path = "candle-fork/candle-core", features = ["cuda"] }
 candle-nn = { path = "candle-fork/candle-nn", features = ["cuda"] }
 candle-flash-attn = { path = "candle-fork/candle-flash-attn" }
+half = { version = "2.3.1", features = ["num-traits"] }
 safetensors = "0.7"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -18,6 +19,9 @@ num_cpus = "1"
 cpal = "0.15"
 rdev = "0.5"
 enigo = "0.2"
+
+[build-dependencies]
+cudaforge = "0.1"
 
 [profile.release]
 opt-level = 3

@@ -95,14 +95,22 @@ impl Attention {
         // Append to KV cache
         let (k_full, v_full) = cache.append(&k, &v)?;
 
-        // Flash attention with causal sliding window (GQA handled natively: 32Q/8KV)
+        // Attention: custom M=1 kernel for streaming decode, flash attention for prefill/offline
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let out = candle_flash_attn::flash_attn_windowed(
-            &q, &k_full, &v_full,
-            scale,
-            Some(SLIDING_WINDOW - 1), // window_size_left
-            Some(0),                   // window_size_right (causal)
-        )?;
+        let out = if seq_len == 1 {
+            crate::m1_attention::m1_attn_windowed(
+                &q, &k_full, &v_full,
+                scale,
+                SLIDING_WINDOW - 1,
+            )?
+        } else {
+            candle_flash_attn::flash_attn_windowed(
+                &q, &k_full, &v_full,
+                scale,
+                Some(SLIDING_WINDOW - 1),
+                Some(0),
+            )?
+        };
 
         // Reshape: [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, hidden]
         let out = out.reshape((batch, seq_len, NUM_HEADS * HEAD_DIM))?;

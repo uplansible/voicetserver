@@ -193,6 +193,8 @@ fn run_processing_loop(
     while mel_buffer.len() >= CONV_CTX + NEW_MEL_PER_CHUNK {
         let process_len = CONV_CTX + NEW_MEL_PER_CHUNK;
 
+        // let t0 = std::time::Instant::now();
+
         let mut mel_data = vec![0.0f32; mel::N_MELS * process_len];
         for (frame_idx, frame) in mel_buffer[..process_len].iter().enumerate() {
             for mel_bin in 0..mel::N_MELS {

@@ -3,6 +3,7 @@ mod common;
 mod decoder;
 mod encoder;
 mod hotkey;
+mod m1_attention;
 mod mel;
 mod streaming;
 mod tokenizer;
@@ -32,11 +33,11 @@ struct Cli {
     device: usize,
 
     /// Delay tokens (1-30, higher = more accuracy, more latency; each token = 80ms)
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 4)]
     delay: usize,
 
     /// Silence RMS threshold for paragraph breaks
-    #[arg(long, default_value_t = 0.007)]
+    #[arg(long, default_value_t = 0.006)]
     silence_threshold: f32,
 
     /// Silence chunks before paragraph break (default: delay + 9)
@@ -44,7 +45,7 @@ struct Cli {
     silence_flush: Option<usize>,
 
     /// Minimum speech chunks before silence detection activates (each chunk = 80ms)
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 12)]
     min_speech: usize,
 
     /// EMA smoothing factor for speech detection (0.0-1.0, lower = smoother)
@@ -79,7 +80,7 @@ fn main() -> Result<()> {
         .map(hotkey::parse_hotkey)
         .transpose()?;
 
-    let silence_chunks = cli.silence_flush.unwrap_or(cli.delay + 9);
+    let silence_chunks = cli.silence_flush.unwrap_or(cli.delay + 14);
 
     // mmap the safetensors file (instant — no disk I/O yet) and spawn readahead
     // thread to pre-fault pages at full sequential bandwidth. Starting this before

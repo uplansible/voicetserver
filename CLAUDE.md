@@ -26,7 +26,8 @@ Release: users place them next to the binary (--model-dir defaults to ".")
 
 # Release process
 ## Windows
-1. Build, then copy exe + CUDA DLLs + mel_filters.bin to release/ folder
+1. Build, then copy exe + CUDA DLLs + mel_filters.bin + voicet_typemode.bat to release/ folder
+   - CUDA DLLs: cublas64_13.dll, curand64_10.dll (check with: dumpbin //DEPENDENTS voicet.exe | grep -i cu)
 2. Zip with PowerShell: Compress-Archive
 3. gh release create vX.Y.Z <zip> --title "..." --notes "..."
 4. Version in commit message, tag on commit, release tied to tag

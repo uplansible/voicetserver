@@ -162,7 +162,8 @@ Other dependencies: `rdev` (global hotkey + Ctrl+C via low-level keyboard hook),
 | #   | Optimization              | File(s)      | What it does                                                                                                                                                                                                                                                                                                             |
 | --- | ------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 1   | Flash Attention (encoder) | `encoder.rs` | `flash_attn_windowed(q, k, v, scale, Some(749), Some(0))` — single fused CUDA kernel per layer handles Q@K, causal sliding window masking, softmax, and @V. No intermediate attention matrix materialized. 32 layers × 1 kernel replaces 32 × (matmul + transpose + mask + softmax + matmul + transpose + 2 contiguous). |
-| 2   | Flash Attention (decoder) | `decoder.rs` | `flash_attn_windowed(q, k, v, scale, Some(2047), Some(0))` — same as encoder, plus native GQA support (32Q/8KV heads handled internally, no `repeat_kv()` needed). 26 layers × 1 kernel.                                                                                                                                 |
+| 2   | Flash Attention (decoder) | `decoder.rs` | `flash_attn_windowed(q, k, v, scale, Some(2047), Some(0))` — same as encoder, plus native GQA support (32Q/8KV heads handled internally, no `repeat_kv()` needed). 26 layers × 1 kernel. Used for prefill and offline (seq_len > 1).                                                                                      |
+| 2b  | M=1 custom attention      | `m1_attention.rs`, `src/kernels/m1_attention.cu` | Custom CUDA kernel for streaming decode (seq_len_q == 1). 32 threads (1 warp) per query head, 4 dims per thread. Cooperative Q·K dot product via warp shuffle, online softmax, per-thread V accumulation — no cross-thread reduction needed. Native GQA (32Q/8KV). ~3% faster than flash attention for the M=1 case. |
 | 3   | Fused RMSNorm             | `common.rs`  | `candle_nn::ops::rms_norm` — single CUDA kernel replaces 7 separate ops (to_dtype, sqr, mean, add, sqrt, div, mul, to_dtype). Affects both encoder (65 calls) and decoder (53 calls) per forward. Saves ~530 kernel launches/token.                                                                                      |
 | 4   | Precomputed Ada-RMSNorm   | `decoder.rs` | `precompute_t_cond()` computes all 26 per-layer Ada-RMSNorm scales once (Linear→GELU→Linear→unsqueeze→add). Stored in `ada_scales: Option<Vec<Tensor>>`. Called once after t_cond is created; forward uses cached values. Saves ~130 kernel launches/token.                                                              |
 
@@ -202,7 +203,7 @@ Reduced end to end loading of voice..exe: CUDA runtimes + model load to GPU from
 ### Measured Performance (RTX 5080)
 
 - **Cold model load**: 2.94s (Arrow Lake + RTX 5080)
-- **Streaming**: ~30ms per tick (encoder chunk + decoder step), well within 80ms budget
+- **Streaming**: ~25ms per tick (encoder chunk + decoder step), well within 80ms budget
 - **Offline decoding**: 63 tok/s (0.20x real-time factor on 5min audio)
 - **Offline encoder**: 1.0s for 5min audio (14,880 frames)
 - **VRAM usage**: ~10.6GB (model weights + KV caches)
