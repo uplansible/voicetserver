@@ -38,7 +38,7 @@ An autoregressive language model that generates text tokens one at a time. At ea
 
 ### The Delay Mechanism
 
-The model can be configured to look ahead by N steps before committing to text output. This is controlled by **`NUM_DELAY_TOKENS`** in `decoder.rs` (see config table below) — a single constant that drives both the prefill padding count and the sinusoidal conditioning embedding. The embedding is injected into every decoder layer via adaptive normalization (Ada-RMSNorm). Valid range: 1–30 (80ms–2400ms).
+The model can be configured to look ahead by N steps before committing to text output. This is controlled by **`delay_tokens`** (see config table below), which drives both the prefill padding count and the sinusoidal conditioning embedding. The embedding is injected into every decoder layer via adaptive normalization (Ada-RMSNorm). Valid range: 1–30 (80ms–2400ms). Delay can be adjusted at runtime via `--delay-up`/`--delay-down` hotkeys, which trigger a full model restart (encoder/decoder cache reset + new prefill + recomputed Ada-RMSNorm scales).
 
 The delay conditioning uses a **per-layer bottleneck** architecture. Each of the 26 decoder layers has its own `ada_rms_norm_t_cond` with two linear projections and a GELU activation: `Linear(3072→32) → GELU → Linear(32→3072)`. The sinusoidal embedding of `num_delay_tokens` is projected through this per-layer bottleneck to modulate **only the FFN-path RMSNorm** (not the attention norm). The modulation formula is: `ffn_norm(x) * (1 + ada_rms_norm(t_cond))`.
 
@@ -79,10 +79,11 @@ This is NOT a buffer or queue. It's a **learned behavior**: during training, the
 
 ### Startup
 
-1. Buffer `(1 + NUM_DELAY_TOKENS) * 1280` samples of real mic audio
+1. Generate `(1 + delay_tokens) * 1280` samples of silence
 2. Prepend 40,960 samples of silence (32 tokens worth)
-3. Batch mel → full encoder forward → adapter → decoder prefill (BOS + 38 PAD tokens)
+3. Batch mel → full encoder forward → adapter → decoder prefill (BOS + 32 + delay PAD tokens)
 4. Save last 4 mel frames as conv stem context for the incremental loop
+5. Real mic audio enters through the incremental loop (no startup buffering delay)
 
 ### Steady-state loop
 
@@ -106,12 +107,14 @@ Printed at startup. CLI flags override defaults; architectural constants are fix
 
 | CLI flag              | Default   | Effect                                                                                                                                |
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `--delay`             | 3 (240ms) | Accuracy vs latency tradeoff. Higher = more lookahead = better accuracy but slower response. Valid: 1-30.                             |
-| `--silence-threshold` | 0.007     | Raw RMS energy below which a chunk counts as silent.                                                                                  |
-| `--silence-flush`     | delay+9   | Consecutive silent chunks before emitting a paragraph break.                                                                          |
-| `--min-speech`        | 8 (640ms) | Minimum consecutive non-silent chunks (EMA-smoothed) before silence detection can trigger. Prevents breaks after 1-2 word utterances. |
+| `--delay`             | 4 (320ms) | Accuracy vs latency tradeoff. Higher = more lookahead = better accuracy but slower response. Valid: 1-30.                             |
+| `--silence-threshold` | 0.006     | Raw RMS energy below which a chunk counts as silent.                                                                                  |
+| `--silence-flush`     | delay+14  | Consecutive silent chunks before emitting a paragraph break.                                                                          |
+| `--min-speech`        | 12 (960ms)| Minimum consecutive non-silent chunks (EMA-smoothed) before silence detection can trigger. Prevents breaks after 1-2 word utterances. |
 | `--rms-ema`           | 0.3       | EMA smoothing factor for speech detection. Lower = smoother, rides over inter-syllable dips.                                          |
-| `--hotkey`            | none      | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause, PrintScreen). Enables hotkey mode with prebuffer.                       |
+| `--hotkey`            | none      | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause, PrintScreen). Starts paused; first press begins recording.              |
+| `--delay-up`          | none      | Hotkey to increase delay by 1 (triggers model restart with new delay conditioning).                                                   |
+| `--delay-down`        | none      | Hotkey to decrease delay by 1 (triggers model restart with new delay conditioning).                                                   |
 | `--type`              | off       | Inject text as keystrokes into focused app via enigo instead of printing to stdout.                                                   |
 | `--device`            | 0         | CUDA device index.                                                                                                                    |
 

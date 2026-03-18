@@ -56,6 +56,14 @@ struct Cli {
     #[arg(long)]
     hotkey: Option<String>,
 
+    /// Hotkey to increase delay (e.g. F11)
+    #[arg(long)]
+    delay_up: Option<String>,
+
+    /// Hotkey to decrease delay (e.g. F10)
+    #[arg(long)]
+    delay_down: Option<String>,
+
     /// Type text as keystrokes into the focused application
     #[arg(long = "type")]
     type_mode: bool,
@@ -75,8 +83,14 @@ fn main() -> Result<()> {
         eprintln!("         Consider adding --hotkey F9 to toggle recording.");
     }
 
-    // Parse hotkey early so we fail fast on invalid key names
+    // Parse hotkeys early so we fail fast on invalid key names
     let hotkey_key = cli.hotkey.as_deref()
+        .map(hotkey::parse_hotkey)
+        .transpose()?;
+    let delay_up_key = cli.delay_up.as_deref()
+        .map(hotkey::parse_hotkey)
+        .transpose()?;
+    let delay_down_key = cli.delay_down.as_deref()
         .map(hotkey::parse_hotkey)
         .transpose()?;
 
@@ -128,6 +142,12 @@ fn main() -> Result<()> {
     if let Some(ref key) = hotkey_key {
         println!("{:<28} {:?}", "Hotkey", key);
     }
+    if let Some(ref key) = delay_up_key {
+        println!("{:<28} {:?}", "Delay up key", key);
+    }
+    if let Some(ref key) = delay_down_key {
+        println!("{:<28} {:?}", "Delay down key", key);
+    }
     if cli.type_mode {
         println!("{:<28} enabled", "Keyboard output");
     }
@@ -162,6 +182,8 @@ fn main() -> Result<()> {
         min_speech_chunks: cli.min_speech,
         rms_ema_alpha: cli.rms_ema,
         hotkey: hotkey_key,
+        delay_up_key,
+        delay_down_key,
         type_mode: cli.type_mode,
     };
 

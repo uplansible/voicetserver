@@ -14,7 +14,7 @@ use candle_core::{DType, Device, Tensor};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -34,6 +34,8 @@ pub struct StreamConfig {
     pub min_speech_chunks: usize,
     pub rms_ema_alpha: f32,
     pub hotkey: Option<rdev::Key>,
+    pub delay_up_key: Option<rdev::Key>,
+    pub delay_down_key: Option<rdev::Key>,
     pub type_mode: bool,
 }
 
@@ -282,7 +284,16 @@ pub fn run_streaming(
         hotkey::STATE_ACTIVE
     };
     let hotkey_state = Arc::new(AtomicU8::new(initial_state));
-    hotkey::spawn_listener(running.clone(), config.hotkey, Some(hotkey_state.clone()));
+    let delay_value = Arc::new(AtomicUsize::new(config.delay_tokens));
+    let has_delay_keys = config.delay_up_key.is_some() || config.delay_down_key.is_some();
+    hotkey::spawn_listener(
+        running.clone(),
+        config.hotkey,
+        Some(hotkey_state.clone()),
+        config.delay_up_key,
+        config.delay_down_key,
+        if has_delay_keys { Some(delay_value.clone()) } else { None },
+    );
 
     if let Some(key) = config.hotkey {
         eprintln!("Press {:?} to start/stop recording. Ctrl+C to quit.", key);
@@ -298,6 +309,7 @@ pub fn run_streaming(
 
     let mut inc_mel = IncrementalMel::new(filters);
     let mut prebuffer: VecDeque<f32> = VecDeque::with_capacity(delay_samples_count);
+    let mut local_delay = config.delay_tokens;
 
     // Silence detection state
     let mut silence_counter: usize = 0;
@@ -325,6 +337,23 @@ pub fn run_streaming(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
+        // Check for delay change — restart model with new delay
+        let new_delay = delay_value.load(Ordering::SeqCst);
+        if new_delay != local_delay {
+            local_delay = new_delay;
+            let silence = vec![0.0f32; (1 + local_delay) * SAMPLES_PER_TOKEN];
+            state = run_startup(
+                &silence, local_delay, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
+            )?;
+            let mel_len = state.mel_frames.len();
+            mel_buffer = state.mel_frames[mel_len.saturating_sub(CONV_CTX)..].to_vec();
+            drop(std::mem::take(&mut state.mel_frames));
+            inc_mel = IncrementalMel::new(filters);
+            if current_state_val == hotkey::STATE_ACTIVE { sink.emit_newline(); }
+            prev_state_val = current_state_val;
+            continue;
+        }
+
         if current_state_val == hotkey::STATE_READY || current_state_val == hotkey::STATE_PAUSED {
             // ---- Ready/Paused: feed rolling prebuffer, don't process ----
 
@@ -335,7 +364,7 @@ pub fn run_streaming(
                     new_16k.clear();
                 }
 
-                let flush_samples = (config.delay_tokens + 4) * SAMPLES_PER_TOKEN;
+                let flush_samples = (local_delay + 4) * SAMPLES_PER_TOKEN;
                 let flush_silence = vec![0.0f32; flush_samples];
                 inc_mel.push_samples(&flush_silence);
 
@@ -358,9 +387,10 @@ pub fn run_streaming(
                 sample_buf_for_silence.clear();
             }
 
-            // Feed prebuffer (capped at delay_samples_count)
+            // Feed prebuffer (capped to current delay)
+            let prebuf_cap = (1 + local_delay) * SAMPLES_PER_TOKEN;
             for &s in &new_16k {
-                if prebuffer.len() >= delay_samples_count {
+                if prebuffer.len() >= prebuf_cap {
                     prebuffer.pop_front();
                 }
                 prebuffer.push_back(s);

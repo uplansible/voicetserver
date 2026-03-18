@@ -8,7 +8,7 @@
 // On Linux: uses rdev::listen().
 
 use anyhow::{bail, Result};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub const STATE_READY: u8 = 0;
@@ -68,11 +68,15 @@ fn rdev_key_to_vk(key: rdev::Key) -> u32 {
 #[cfg(target_os = "windows")]
 pub fn spawn_listener(
     _running: Arc<AtomicBool>,
-    hotkey: Option<rdev::Key>,
-    state: Option<Arc<AtomicU8>>,
+    toggle_key: Option<rdev::Key>,
+    toggle_state: Option<Arc<AtomicU8>>,
+    delay_up_key: Option<rdev::Key>,
+    delay_down_key: Option<rdev::Key>,
+    delay_value: Option<Arc<AtomicUsize>>,
 ) {
-    let (Some(key), Some(state)) = (hotkey, state) else { return };
-    let vk = rdev_key_to_vk(key);
+    if toggle_key.is_none() && delay_up_key.is_none() && delay_down_key.is_none() {
+        return;
+    }
 
     std::thread::spawn(move || {
         #[repr(C)]
@@ -84,20 +88,56 @@ pub fn spawn_listener(
         const MOD_NOREPEAT: u32 = 0x4000;
 
         unsafe {
-            if RegisterHotKey(0, 1, MOD_NOREPEAT, vk) == 0 {
-                eprintln!("Failed to register hotkey");
-                return;
+            if let Some(key) = toggle_key {
+                if RegisterHotKey(0, 1, MOD_NOREPEAT, rdev_key_to_vk(key)) == 0 {
+                    eprintln!("Failed to register toggle hotkey");
+                }
+            }
+            if let Some(key) = delay_up_key {
+                if RegisterHotKey(0, 2, MOD_NOREPEAT, rdev_key_to_vk(key)) == 0 {
+                    eprintln!("Failed to register delay-up hotkey");
+                }
+            }
+            if let Some(key) = delay_down_key {
+                if RegisterHotKey(0, 3, MOD_NOREPEAT, rdev_key_to_vk(key)) == 0 {
+                    eprintln!("Failed to register delay-down hotkey");
+                }
             }
             loop {
                 let mut msg = std::mem::zeroed::<Msg>();
                 if GetMessageW(&mut msg, 0, 0, 0) <= 0 { break; }
                 if msg.message == 0x0312 /* WM_HOTKEY */ {
-                    if state.load(Ordering::SeqCst) == STATE_ACTIVE {
-                        state.store(STATE_PAUSED, Ordering::SeqCst);
-                        eprintln!("[paused]");
-                    } else {
-                        state.store(STATE_ACTIVE, Ordering::SeqCst);
-                        eprintln!("[recording]");
+                    match msg.wparam as i32 {
+                        1 => {
+                            if let Some(ref st) = toggle_state {
+                                if st.load(Ordering::SeqCst) == STATE_ACTIVE {
+                                    st.store(STATE_PAUSED, Ordering::SeqCst);
+                                    eprintln!("[paused]");
+                                } else {
+                                    st.store(STATE_ACTIVE, Ordering::SeqCst);
+                                    eprintln!("[recording]");
+                                }
+                            }
+                        }
+                        2 => {
+                            if let Some(ref dv) = delay_value {
+                                let old = dv.load(Ordering::SeqCst);
+                                if old < 30 {
+                                    dv.store(old + 1, Ordering::SeqCst);
+                                    eprintln!("[delay → {}]", old + 1);
+                                }
+                            }
+                        }
+                        3 => {
+                            if let Some(ref dv) = delay_value {
+                                let old = dv.load(Ordering::SeqCst);
+                                if old > 1 {
+                                    dv.store(old - 1, Ordering::SeqCst);
+                                    eprintln!("[delay → {}]", old - 1);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -112,14 +152,18 @@ pub fn spawn_listener(
 #[cfg(not(target_os = "windows"))]
 pub fn spawn_listener(
     running: Arc<AtomicBool>,
-    hotkey: Option<rdev::Key>,
-    state: Option<Arc<AtomicU8>>,
+    toggle_key: Option<rdev::Key>,
+    toggle_state: Option<Arc<AtomicU8>>,
+    delay_up_key: Option<rdev::Key>,
+    delay_down_key: Option<rdev::Key>,
+    delay_value: Option<Arc<AtomicUsize>>,
 ) {
     use std::time::Instant;
 
     std::thread::spawn(move || {
         let mut ctrl_held = false;
-        let mut last_press = Instant::now();
+        let mut last_toggle = Instant::now();
+        let mut last_delay = Instant::now();
         let debounce = std::time::Duration::from_millis(200);
 
         if let Err(e) = rdev::listen(move |event| match event.event_type {
@@ -130,15 +174,35 @@ pub fn spawn_listener(
                 if k == rdev::Key::KeyC && ctrl_held {
                     running.store(false, Ordering::SeqCst);
                 }
-                if let (Some(hk), Some(ref st)) = (hotkey, &state) {
-                    if k == hk && last_press.elapsed() >= debounce {
-                        last_press = Instant::now();
+                if let (Some(hk), Some(ref st)) = (toggle_key, &toggle_state) {
+                    if k == hk && last_toggle.elapsed() >= debounce {
+                        last_toggle = Instant::now();
                         if st.load(Ordering::SeqCst) == STATE_ACTIVE {
                             st.store(STATE_PAUSED, Ordering::SeqCst);
                             eprintln!("[paused]");
                         } else {
                             st.store(STATE_ACTIVE, Ordering::SeqCst);
                             eprintln!("[recording]");
+                        }
+                    }
+                }
+                if let (Some(uk), Some(ref dv)) = (delay_up_key, &delay_value) {
+                    if k == uk && last_delay.elapsed() >= debounce {
+                        last_delay = Instant::now();
+                        let old = dv.load(Ordering::SeqCst);
+                        if old < 30 {
+                            dv.store(old + 1, Ordering::SeqCst);
+                            eprintln!("[delay → {}]", old + 1);
+                        }
+                    }
+                }
+                if let (Some(dk), Some(ref dv)) = (delay_down_key, &delay_value) {
+                    if k == dk && last_delay.elapsed() >= debounce {
+                        last_delay = Instant::now();
+                        let old = dv.load(Ordering::SeqCst);
+                        if old > 1 {
+                            dv.store(old - 1, Ordering::SeqCst);
+                            eprintln!("[delay → {}]", old - 1);
                         }
                     }
                 }

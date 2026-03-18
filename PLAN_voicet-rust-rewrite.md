@@ -169,7 +169,7 @@ This combines streaming inference + mic capture into one phase — there's no po
 11. **Unbounded mel growth** — Fixed: conv stem was re-run on entire mel history every 80ms (O(n) per token). Now uses incremental 4-frame context window (O(1) per token).
 12. **Encoder KV cache growth** — Fixed: `KvCache::trim()` drops entries beyond sliding window. Tracks `base_offset` for correct RoPE after trimming.
 13. **Decoder KV cache growth** — Fixed: same trim mechanism.
-14. **Unified delay configuration** — `NUM_DELAY_TOKENS` in `decoder.rs` is the single constant driving prefill padding, sinusoidal embedding, and startup buffer size.
+14. **Unified delay configuration** — `delay_tokens` drives prefill padding, sinusoidal embedding, and startup buffer size. Adjustable at runtime via `--delay-up`/`--delay-down` hotkeys.
 15. **Config table** — All tuneable parameters printed at startup.
 
 **Validated** — Offline mode (`voicet <file.wav>`) produces identical output before and after all changes.
@@ -180,14 +180,15 @@ See [phase3.md](phase3.md) for full details.
 
 Goal: daily-driver features — hotkey toggle, keyboard output, configurable CLI, robust silence detection.
 
-1. **CLI with clap derive** — `--device`, `--delay`, `--silence-threshold`, `--silence-flush`, `--min-speech`, `--rms-ema`, `--hotkey`, `--type`. Config table prints all runtime values at startup.
-2. **Hotkey toggle** — `rdev` low-level keyboard hook. Unified `spawn_listener()` handles both hotkey toggle (200ms debounce) and Ctrl+C detection (replaced `ctrlc` crate, which failed in PowerShell 7).
-3. **State machine** — Ready → Active ↔ Paused. Hotkey mode prefills on silence (instant startup). On pause, flushes `(delay_tokens + 4)` tokens of silence through the pipeline at GPU speed to emit remaining in-flight text. No silence/speech detection in hotkey mode.
-4. **Rolling prebuffer** — `VecDeque<f32>` capped at `delay_samples` (~400ms) captures audio while paused so speech before the hotkey press isn't lost. Flushed to IncrementalMel on resume.
+1. **CLI with clap derive** — `--device`, `--delay`, `--silence-threshold`, `--silence-flush`, `--min-speech`, `--rms-ema`, `--hotkey`, `--delay-up`, `--delay-down`, `--type`. Config table prints all runtime values at startup.
+2. **Hotkey toggle** — Windows: `RegisterHotKey` (no keyboard hook — avoids interference with enigo's `SendInput`). Linux: `rdev::listen()`. Unified `spawn_listener()` handles toggle, delay adjustment, and Ctrl+C (Linux). 200ms debounce on all keys.
+3. **State machine** — Ready → Active ↔ Paused. Unified code path for hotkey and always-on modes (no hotkey = starts Active). Startup always uses silence (instant, no buffering delay). On pause, flushes `(delay_tokens + 4)` tokens of silence through the pipeline to emit in-flight text.
+4. **Rolling prebuffer** — `VecDeque<f32>` capped at `delay_samples` captures audio while paused so speech before the hotkey press isn't lost. Flushed to IncrementalMel on resume.
 5. **`--type` mode** — `enigo` crate injects keystrokes into the focused app via `OutputSink` enum.
-6. **Silence/speech detection** (always-on mode) — Raw RMS for silence counting, EMA-smoothed RMS for speech detection (rides over inter-syllable dips). Minimum speech duration (`--min-speech`, default 8 chunks = 640ms) prevents paragraph breaks after short utterances.
+6. **Silence/speech detection** — Raw RMS for silence counting, EMA-smoothed RMS for speech detection (rides over inter-syllable dips). Minimum speech duration prevents paragraph breaks after short utterances. Runs in both hotkey and always-on modes.
 7. **Multi-channel mic** — Accepts native channel count, averages all channels to mono in the callback.
 8. **Dependencies** — Added `rdev`, `enigo`; removed `ctrlc`.
+9. **Runtime delay adjustment** — `--delay-up`/`--delay-down` hotkeys increment/decrement delay (clamped 1–30) via `AtomicUsize`. Main loop detects the change each tick and calls `run_startup()` to fully reset the model: encoder/decoder KV caches, sinusoidal embedding, Ada-RMSNorm scales, and prefill.
 
 ## What we're NOT doing
 
