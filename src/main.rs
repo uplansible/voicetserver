@@ -67,6 +67,14 @@ struct Cli {
     /// Type text as keystrokes into the focused application
     #[arg(long = "type")]
     type_mode: bool,
+
+    /// Enable dual-delay mode: fast + slow parallel streams with merged display
+    #[arg(long)]
+    dual_delay: bool,
+
+    /// Slow stream delay tokens for dual-delay mode (1-30, default: 20)
+    #[arg(long, default_value_t = 20)]
+    slow_delay: usize,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +83,20 @@ fn main() -> Result<()> {
     // Validate --delay range
     if cli.delay < 1 || cli.delay > 30 {
         anyhow::bail!("--delay must be between 1 and 30 (got {})", cli.delay);
+    }
+
+    // Validate dual-delay options
+    if cli.dual_delay {
+        if cli.slow_delay < 1 || cli.slow_delay > 30 {
+            anyhow::bail!("--slow-delay must be between 1 and 30 (got {})", cli.slow_delay);
+        }
+        if cli.slow_delay <= cli.delay {
+            eprintln!("Warning: --slow-delay ({}) should be greater than --delay ({}) for effective dual-delay",
+                cli.slow_delay, cli.delay);
+        }
+        if cli.type_mode {
+            anyhow::bail!("--dual-delay and --type cannot be used together (dual delay is terminal-only for now)");
+        }
     }
 
     // Validate: --type without --hotkey is probably a mistake
@@ -125,9 +147,14 @@ fn main() -> Result<()> {
 
     println!("\n{:<28} {}", "Parameter", "Value");
     println!("{:-<28} {:-<32}", "", "");
-    println!("{:<28} {} ({}ms){}",
-        "Delay tokens", effective_delay, effective_delay * 80,
-        if is_offline { " (offline max accuracy)" } else { "" });
+    if cli.dual_delay && !is_offline {
+        println!("{:<28} {} ({}ms)", "Fast delay tokens", effective_delay, effective_delay * 80);
+        println!("{:<28} {} ({}ms)", "Slow delay tokens", cli.slow_delay, cli.slow_delay * 80);
+    } else {
+        println!("{:<28} {} ({}ms){}",
+            "Delay tokens", effective_delay, effective_delay * 80,
+            if is_offline { " (offline max accuracy)" } else { "" });
+    }
     println!("{:<28} {} ({}s)",
         "Encoder sliding window", encoder::SLIDING_WINDOW, encoder::SLIDING_WINDOW * 20 / 1000);
     println!("{:<28} {} ({:.0}min)",
@@ -185,11 +212,17 @@ fn main() -> Result<()> {
         delay_up_key,
         delay_down_key,
         type_mode: cli.type_mode,
+        dual_delay: cli.dual_delay,
+        slow_delay_tokens: cli.slow_delay,
     };
 
     match cli.wav_file {
         Some(path) => {
             run_offline(&path, effective_delay, &mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype)
+        }
+        None if config.dual_delay => {
+            println!("\n=== Voicet Dual-Delay Streaming ===\n");
+            streaming::run_dual_streaming(&mut enc, &adapter, &dec, &tok, &filters, &device, dtype, &config)
         }
         None => {
             println!("\n=== Voicet Streaming Mode ===\n");
