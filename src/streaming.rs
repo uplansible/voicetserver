@@ -14,7 +14,7 @@ use candle_core::{DType, Device, Tensor};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -24,31 +24,20 @@ use crate::decoder::{self, TextDecoder};
 use crate::encoder::{self, AudioEncoder};
 use crate::hotkey;
 use crate::mel::{self, IncrementalMel};
+use crate::settings::SharedSettings;
 use crate::tokenizer::{self, Tokenizer};
-
-/// Runtime-configurable streaming parameters.
-pub struct StreamConfig {
-    pub delay_tokens: usize,
-    pub silence_threshold: f32,
-    pub silence_chunks: usize,
-    pub min_speech_chunks: usize,
-    pub rms_ema_alpha: f32,
-    pub hotkey: Option<rdev::Key>,
-    pub delay_up_key: Option<rdev::Key>,
-    pub delay_down_key: Option<rdev::Key>,
-    pub type_mode: bool,
-}
 
 /// PCM samples per decoder token: MEL_FRAMES_PER_TOKEN × HOP_LENGTH.
 const SAMPLES_PER_TOKEN: usize = common::MEL_FRAMES_PER_TOKEN * mel::HOP_LENGTH;
 
 
 /// Debug status line at top of terminal (row 1). Uses ANSI save/restore cursor.
-fn debug_status(rms: f32, smooth: f32, config: &StreamConfig, silence_ctr: usize, speech_ctr: usize, emitted: bool) {
+fn debug_status(rms: f32, smooth: f32, settings: &SharedSettings, silence_ctr: usize, speech_ctr: usize, emitted: bool) {
     let w = 30;
     let max = 0.03f32;
     let level = ((smooth / max).min(1.0) * w as f32) as usize;
-    let tp = ((config.silence_threshold / max).min(1.0) * w as f32) as usize;
+    let threshold = settings.silence_threshold.load(Ordering::Relaxed);
+    let tp = ((threshold / max).min(1.0) * w as f32) as usize;
     let mut bar = String::with_capacity(w);
     for i in 0..w {
         if i == tp { bar.push('|'); }
@@ -57,8 +46,8 @@ fn debug_status(rms: f32, smooth: f32, config: &StreamConfig, silence_ctr: usize
     }
     eprint!(
         "\x1b[s\x1b[1;1H\x1b[K [{}] raw={:.4} ema={:.4} sil={}/{} spk={}/{} em={}\x1b[u",
-        bar, rms, smooth, silence_ctr, config.silence_chunks,
-        speech_ctr, config.min_speech_chunks, emitted,
+        bar, rms, smooth, silence_ctr, settings.silence_chunks.load(Ordering::Relaxed),
+        speech_ctr, settings.min_speech_chunks.load(Ordering::Relaxed), emitted,
     );
 }
 
@@ -71,6 +60,7 @@ const NEW_MEL_PER_CHUNK: usize = common::MEL_FRAMES_PER_TOKEN;
 enum OutputSink {
     Stdout,
     Keyboard(enigo::Enigo),
+    Discard,
 }
 
 impl OutputSink {
@@ -86,6 +76,7 @@ impl OutputSink {
                     let _ = enigo.text(s);
                 }
             }
+            OutputSink::Discard => {}
         }
     }
 
@@ -102,6 +93,7 @@ impl OutputSink {
                 let _ = enigo.key(Key::Return, Direction::Click);
                 let _ = enigo.key(Key::Shift, Direction::Release);
             }
+            OutputSink::Discard => {}
         }
     }
 }
@@ -245,19 +237,20 @@ pub fn run_streaming(
     filters: &[f32],
     device: &Device,
     dtype: DType,
-    config: &StreamConfig,
+    settings: &Arc<SharedSettings>,
+    running: &Arc<AtomicBool>,
+    hotkey_thread_id: &Arc<AtomicU32>,
 ) -> Result<()> {
-    let delay_samples_count = (1 + config.delay_tokens) * SAMPLES_PER_TOKEN;
+    let delay = settings.delay_tokens.load(Ordering::Relaxed);
+    let delay_samples_count = (1 + delay) * SAMPLES_PER_TOKEN;
 
     // Initialize output sink
-    let mut sink = if config.type_mode {
+    let mut sink = if settings.type_mode.load(Ordering::Relaxed) {
         OutputSink::Keyboard(enigo::Enigo::new(&enigo::Settings::default())
             .map_err(|e| anyhow::anyhow!("Failed to initialize keyboard output: {}", e))?)
     } else {
         OutputSink::Stdout
     };
-
-    let running = Arc::new(AtomicBool::new(true));
 
     // Open mic
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
@@ -273,29 +266,14 @@ pub fn run_streaming(
     let silence = vec![0.0f32; delay_samples_count];
     eprintln!("Running startup with silence ({} samples)...", silence.len());
     let mut state = run_startup(
-        &silence, config.delay_tokens, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
+        &silence, delay, enc, adapter, dec, tok, filters, device, dtype, &mut sink,
     )?;
 
-    // State machine: with hotkey starts READY (waiting for press),
-    // without hotkey starts ACTIVE (recording immediately)
-    let initial_state = if config.hotkey.is_some() {
-        hotkey::STATE_READY
-    } else {
-        hotkey::STATE_ACTIVE
-    };
-    let hotkey_state = Arc::new(AtomicU8::new(initial_state));
-    let delay_value = Arc::new(AtomicUsize::new(config.delay_tokens));
-    let has_delay_keys = config.delay_up_key.is_some() || config.delay_down_key.is_some();
-    hotkey::spawn_listener(
-        running.clone(),
-        config.hotkey,
-        Some(hotkey_state.clone()),
-        config.delay_up_key,
-        config.delay_down_key,
-        if has_delay_keys { Some(delay_value.clone()) } else { None },
-    );
+    // Spawn hotkey listener
+    hotkey::spawn_listener(running.clone(), settings.clone(), hotkey_thread_id.clone());
 
-    if let Some(key) = config.hotkey {
+    let hotkey_key = settings.hotkey.lock().unwrap().clone();
+    if let Some(key) = hotkey_key {
         eprintln!("Press {:?} to start/stop recording. Ctrl+C to quit.", key);
     } else {
         eprintln!("\n--- Listening (Ctrl+C to stop) ---\n");
@@ -309,7 +287,7 @@ pub fn run_streaming(
 
     let mut inc_mel = IncrementalMel::new(filters);
     let mut prebuffer: VecDeque<f32> = VecDeque::with_capacity(delay_samples_count);
-    let mut local_delay = config.delay_tokens;
+    let mut local_delay = delay;
 
     // Silence detection state
     let mut silence_counter: usize = 0;
@@ -318,10 +296,10 @@ pub fn run_streaming(
     let mut silence_emitted = true;
     let mut sample_buf_for_silence: Vec<f32> = Vec::new();
 
-    let mut prev_state_val = initial_state;
+    let mut prev_state_val = settings.state.load(Ordering::SeqCst);
 
     while running.load(Ordering::SeqCst) {
-        let current_state_val = hotkey_state.load(Ordering::SeqCst);
+        let current_state_val = settings.state.load(Ordering::SeqCst);
 
         // Pull audio from channel
         let mut new_16k = Vec::new();
@@ -338,7 +316,7 @@ pub fn run_streaming(
         }
 
         // Check for delay change — restart model with new delay
-        let new_delay = delay_value.load(Ordering::SeqCst);
+        let new_delay = settings.delay_tokens.load(Ordering::SeqCst);
         if new_delay != local_delay {
             local_delay = new_delay;
             let silence = vec![0.0f32; (1 + local_delay) * SAMPLES_PER_TOKEN];
@@ -354,8 +332,19 @@ pub fn run_streaming(
             continue;
         }
 
-        if current_state_val == hotkey::STATE_READY || current_state_val == hotkey::STATE_PAUSED {
-            // ---- Ready/Paused: feed rolling prebuffer, don't process ----
+        // Output mode swap
+        let want_type = settings.type_mode.load(Ordering::Relaxed);
+        if want_type != matches!(sink, OutputSink::Keyboard(_)) {
+            sink = if want_type {
+                OutputSink::Keyboard(enigo::Enigo::new(&enigo::Settings::default())
+                    .map_err(|e| anyhow::anyhow!("Failed to initialize keyboard output: {}", e))?)
+            } else {
+                OutputSink::Discard
+            };
+        }
+
+        if current_state_val == hotkey::STATE_PAUSED {
+            // ---- Paused: feed rolling prebuffer, don't process ----
 
             // Detect Active → Paused transition: flush decoder's lookahead
             if prev_state_val == hotkey::STATE_ACTIVE {
@@ -417,28 +406,30 @@ pub fn run_streaming(
                 let rms = (sample_buf_for_silence[..SAMPLES_PER_TOKEN].iter()
                     .map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
                 sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
-                smoothed_rms = config.rms_ema_alpha * rms + (1.0 - config.rms_ema_alpha) * smoothed_rms;
-                if rms < config.silence_threshold {
+                let rms_alpha = settings.rms_ema_alpha.load(Ordering::Relaxed);
+                let sil_thresh = settings.silence_threshold.load(Ordering::Relaxed);
+                smoothed_rms = rms_alpha * rms + (1.0 - rms_alpha) * smoothed_rms;
+                if rms < sil_thresh {
                     silence_counter += 1;
                 } else {
                     silence_counter = 0;
                 }
-                if smoothed_rms >= config.silence_threshold {
+                if smoothed_rms >= sil_thresh {
                     speech_counter += 1;
-                    if speech_counter >= config.min_speech_chunks {
+                    if speech_counter >= settings.min_speech_chunks.load(Ordering::Relaxed) {
                         silence_emitted = false;
                     }
                 } else {
                     speech_counter = 0;
                 }
-                debug_status(rms, smoothed_rms, config, silence_counter, speech_counter, silence_emitted);
+                debug_status(rms, smoothed_rms, settings, silence_counter, speech_counter, silence_emitted);
             }
 
             let eos = run_processing_loop(enc, adapter, dec, tok, &mut state,
                 &mut mel_buffer, device, dtype, &mut sink)?;
             if eos { break; }
 
-            if silence_counter >= config.silence_chunks && !silence_emitted {
+            if silence_counter >= settings.silence_chunks.load(Ordering::Relaxed) && !silence_emitted {
                 sink.emit_newline();
                 silence_emitted = true;
             }

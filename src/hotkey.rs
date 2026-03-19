@@ -7,36 +7,68 @@
 //
 // On Linux: uses rdev::listen().
 
-use anyhow::{bail, Result};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use anyhow::Result;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
 
-pub const STATE_READY: u8 = 0;
+use crate::settings::SharedSettings;
+
+pub const STATE_PAUSED: u8 = 0;
 pub const STATE_ACTIVE: u8 = 1;
-pub const STATE_PAUSED: u8 = 2;
+pub const STATE_LOADING: u8 = 2;
+
+/// Supported hotkeys — single source of truth for parse/stringify/UI.
+pub const SUPPORTED_KEYS: &[(&str, rdev::Key)] = &[
+    ("F1", rdev::Key::F1),
+    ("F2", rdev::Key::F2),
+    ("F3", rdev::Key::F3),
+    ("F4", rdev::Key::F4),
+    ("F5", rdev::Key::F5),
+    ("F6", rdev::Key::F6),
+    ("F7", rdev::Key::F7),
+    ("F8", rdev::Key::F8),
+    ("F9", rdev::Key::F9),
+    ("F10", rdev::Key::F10),
+    ("F11", rdev::Key::F11),
+    ("F12", rdev::Key::F12),
+    ("ScrollLock", rdev::Key::ScrollLock),
+    ("Pause", rdev::Key::Pause),
+    ("PrintScreen", rdev::Key::PrintScreen),
+];
+
+/// Toggle recording state: Active ↔ Paused. Ignored while loading.
+pub fn toggle_state(state: &AtomicU8, source: &str) {
+    let current = state.load(Ordering::SeqCst);
+    if current == STATE_LOADING { return; }
+    if current == STATE_ACTIVE {
+        state.store(STATE_PAUSED, Ordering::SeqCst);
+        eprintln!("[paused]{}", source);
+    } else {
+        state.store(STATE_ACTIVE, Ordering::SeqCst);
+        eprintln!("[recording]{}", source);
+    }
+}
 
 pub fn parse_hotkey(s: &str) -> Result<rdev::Key> {
-    match s {
-        "F1" => Ok(rdev::Key::F1),
-        "F2" => Ok(rdev::Key::F2),
-        "F3" => Ok(rdev::Key::F3),
-        "F4" => Ok(rdev::Key::F4),
-        "F5" => Ok(rdev::Key::F5),
-        "F6" => Ok(rdev::Key::F6),
-        "F7" => Ok(rdev::Key::F7),
-        "F8" => Ok(rdev::Key::F8),
-        "F9" => Ok(rdev::Key::F9),
-        "F10" => Ok(rdev::Key::F10),
-        "F11" => Ok(rdev::Key::F11),
-        "F12" => Ok(rdev::Key::F12),
-        "ScrollLock" => Ok(rdev::Key::ScrollLock),
-        "Pause" => Ok(rdev::Key::Pause),
-        "PrintScreen" => Ok(rdev::Key::PrintScreen),
-        _ => bail!(
-            "Unknown hotkey '{}'. Valid keys: F1-F12, ScrollLock, Pause, PrintScreen",
-            s
-        ),
-    }
+    SUPPORTED_KEYS
+        .iter()
+        .find(|(name, _)| *name == s)
+        .map(|(_, key)| *key)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown hotkey '{}'. Valid keys: F1-F12, ScrollLock, Pause, PrintScreen",
+                s
+            )
+        })
+}
+
+/// Convert an rdev::Key to its string name (reverse of parse_hotkey).
+pub fn key_to_string(key: rdev::Key) -> String {
+    SUPPORTED_KEYS
+        .iter()
+        .find(|(_, k)| *k == key)
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
 }
 
 // ============================================================
@@ -68,81 +100,60 @@ fn rdev_key_to_vk(key: rdev::Key) -> u32 {
 #[cfg(target_os = "windows")]
 pub fn spawn_listener(
     _running: Arc<AtomicBool>,
-    toggle_key: Option<rdev::Key>,
-    toggle_state: Option<Arc<AtomicU8>>,
-    delay_up_key: Option<rdev::Key>,
-    delay_down_key: Option<rdev::Key>,
-    delay_value: Option<Arc<AtomicUsize>>,
+    settings: Arc<SharedSettings>,
+    hotkey_thread_id: Arc<AtomicU32>,
 ) {
-    if toggle_key.is_none() && delay_up_key.is_none() && delay_down_key.is_none() {
-        return;
-    }
-
     std::thread::spawn(move || {
         #[repr(C)]
         struct Msg { hwnd: isize, message: u32, wparam: usize, lparam: isize, time: u32, pt: [i32; 2] }
         extern "system" {
             fn RegisterHotKey(hwnd: isize, id: i32, mods: u32, vk: u32) -> i32;
+            fn UnregisterHotKey(hwnd: isize, id: i32) -> i32;
             fn GetMessageW(msg: *mut Msg, hwnd: isize, min: u32, max: u32) -> i32;
+            fn GetCurrentThreadId() -> u32;
         }
         const MOD_NOREPEAT: u32 = 0x4000;
 
         unsafe {
-            if let Some(key) = toggle_key {
+            hotkey_thread_id.store(GetCurrentThreadId(), Ordering::SeqCst);
+
+            let initial_key = settings.hotkey.lock().unwrap().clone();
+            if let Some(key) = initial_key {
                 if RegisterHotKey(0, 1, MOD_NOREPEAT, rdev_key_to_vk(key)) == 0 {
-                    eprintln!("Failed to register toggle hotkey");
+                    eprintln!("Failed to register hotkey");
                 }
             }
-            if let Some(key) = delay_up_key {
-                if RegisterHotKey(0, 2, MOD_NOREPEAT, rdev_key_to_vk(key)) == 0 {
-                    eprintln!("Failed to register delay-up hotkey");
-                }
-            }
-            if let Some(key) = delay_down_key {
-                if RegisterHotKey(0, 3, MOD_NOREPEAT, rdev_key_to_vk(key)) == 0 {
-                    eprintln!("Failed to register delay-down hotkey");
-                }
-            }
+
             loop {
                 let mut msg = std::mem::zeroed::<Msg>();
                 if GetMessageW(&mut msg, 0, 0, 0) <= 0 { break; }
-                if msg.message == 0x0312 /* WM_HOTKEY */ {
-                    match msg.wparam as i32 {
-                        1 => {
-                            if let Some(ref st) = toggle_state {
-                                if st.load(Ordering::SeqCst) == STATE_ACTIVE {
-                                    st.store(STATE_PAUSED, Ordering::SeqCst);
-                                    eprintln!("[paused]");
-                                } else {
-                                    st.store(STATE_ACTIVE, Ordering::SeqCst);
-                                    eprintln!("[recording]");
-                                }
-                            }
-                        }
-                        2 => {
-                            if let Some(ref dv) = delay_value {
-                                let old = dv.load(Ordering::SeqCst);
-                                if old < 30 {
-                                    dv.store(old + 1, Ordering::SeqCst);
-                                    eprintln!("[delay → {}]", old + 1);
-                                }
-                            }
-                        }
-                        3 => {
-                            if let Some(ref dv) = delay_value {
-                                let old = dv.load(Ordering::SeqCst);
-                                if old > 1 {
-                                    dv.store(old - 1, Ordering::SeqCst);
-                                    eprintln!("[delay → {}]", old - 1);
-                                }
-                            }
-                        }
-                        _ => {}
+                match msg.message {
+                    0x0312 /* WM_HOTKEY */ if msg.wparam as i32 == 1 => {
+                        toggle_state(&settings.state, "");
                     }
+                    0x0400 /* WM_USER */ => {
+                        UnregisterHotKey(0, 1);
+                        if msg.wparam != 0 {
+                            RegisterHotKey(0, 1, MOD_NOREPEAT, msg.wparam as u32);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     });
+}
+
+/// Post a message to the hotkey thread to change the registered hotkey.
+#[cfg(target_os = "windows")]
+pub fn change_hotkey(thread_id: &AtomicU32, new_key: Option<rdev::Key>) {
+    let tid = thread_id.load(Ordering::SeqCst);
+    if tid == 0 { return; }
+    let vk = new_key.map(|k| rdev_key_to_vk(k) as usize).unwrap_or(0);
+    extern "system" {
+        fn PostThreadMessageW(tid: u32, msg: u32, wparam: usize, lparam: isize) -> i32;
+    }
+    unsafe { PostThreadMessageW(tid, 0x0400, vk, 0); }
 }
 
 // ============================================================
@@ -152,18 +163,14 @@ pub fn spawn_listener(
 #[cfg(not(target_os = "windows"))]
 pub fn spawn_listener(
     running: Arc<AtomicBool>,
-    toggle_key: Option<rdev::Key>,
-    toggle_state: Option<Arc<AtomicU8>>,
-    delay_up_key: Option<rdev::Key>,
-    delay_down_key: Option<rdev::Key>,
-    delay_value: Option<Arc<AtomicUsize>>,
+    settings: Arc<SharedSettings>,
+    _hotkey_thread_id: Arc<AtomicU32>,
 ) {
     use std::time::Instant;
 
     std::thread::spawn(move || {
         let mut ctrl_held = false;
         let mut last_toggle = Instant::now();
-        let mut last_delay = Instant::now();
         let debounce = std::time::Duration::from_millis(200);
 
         if let Err(e) = rdev::listen(move |event| match event.event_type {
@@ -174,36 +181,11 @@ pub fn spawn_listener(
                 if k == rdev::Key::KeyC && ctrl_held {
                     running.store(false, Ordering::SeqCst);
                 }
-                if let (Some(hk), Some(ref st)) = (toggle_key, &toggle_state) {
+                let current_hotkey = settings.hotkey.lock().unwrap().clone();
+                if let Some(hk) = current_hotkey {
                     if k == hk && last_toggle.elapsed() >= debounce {
                         last_toggle = Instant::now();
-                        if st.load(Ordering::SeqCst) == STATE_ACTIVE {
-                            st.store(STATE_PAUSED, Ordering::SeqCst);
-                            eprintln!("[paused]");
-                        } else {
-                            st.store(STATE_ACTIVE, Ordering::SeqCst);
-                            eprintln!("[recording]");
-                        }
-                    }
-                }
-                if let (Some(uk), Some(ref dv)) = (delay_up_key, &delay_value) {
-                    if k == uk && last_delay.elapsed() >= debounce {
-                        last_delay = Instant::now();
-                        let old = dv.load(Ordering::SeqCst);
-                        if old < 30 {
-                            dv.store(old + 1, Ordering::SeqCst);
-                            eprintln!("[delay → {}]", old + 1);
-                        }
-                    }
-                }
-                if let (Some(dk), Some(ref dv)) = (delay_down_key, &delay_value) {
-                    if k == dk && last_delay.elapsed() >= debounce {
-                        last_delay = Instant::now();
-                        let old = dv.load(Ordering::SeqCst);
-                        if old > 1 {
-                            dv.store(old - 1, Ordering::SeqCst);
-                            eprintln!("[delay → {}]", old - 1);
-                        }
+                        toggle_state(&settings.state, "");
                     }
                 }
             }
@@ -218,3 +200,7 @@ pub fn spawn_listener(
         }
     });
 }
+
+/// No-op on Linux: rdev listener reads settings.hotkey mutex each keypress.
+#[cfg(not(target_os = "windows"))]
+pub fn change_hotkey(_thread_id: &AtomicU32, _new_key: Option<rdev::Key>) {}

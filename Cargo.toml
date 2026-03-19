@@ -19,6 +19,9 @@ num_cpus = "1"
 cpal = "0.15"
 rdev = "0.5"
 enigo = "0.2"
+tray-icon = "0.19"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+winit = "0.30"
 
 [build-dependencies]
 cudaforge = "0.1"

@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod adapter;
 mod common;
 mod decoder;
@@ -5,14 +7,18 @@ mod encoder;
 mod hotkey;
 mod m1_attention;
 mod mel;
+mod settings;
+mod settings_window;
 mod streaming;
 mod tokenizer;
+mod tray;
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use clap::Parser;
 use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,36 +39,28 @@ struct Cli {
     device: usize,
 
     /// Delay tokens (1-30, higher = more accuracy, more latency; each token = 80ms)
-    #[arg(long, default_value_t = 4)]
-    delay: usize,
+    #[arg(long)]
+    delay: Option<usize>,
 
     /// Silence RMS threshold for paragraph breaks
-    #[arg(long, default_value_t = 0.006)]
-    silence_threshold: f32,
+    #[arg(long)]
+    silence_threshold: Option<f32>,
 
-    /// Silence chunks before paragraph break (default: delay + 9)
+    /// Silence chunks before paragraph break (default: delay + 14)
     #[arg(long)]
     silence_flush: Option<usize>,
 
     /// Minimum speech chunks before silence detection activates (each chunk = 80ms)
-    #[arg(long, default_value_t = 12)]
-    min_speech: usize,
+    #[arg(long)]
+    min_speech: Option<usize>,
 
     /// EMA smoothing factor for speech detection (0.0-1.0, lower = smoother)
-    #[arg(long, default_value_t = 0.3)]
-    rms_ema: f32,
+    #[arg(long)]
+    rms_ema: Option<f32>,
 
     /// Hotkey to toggle recording (e.g. F9, ScrollLock, Pause)
     #[arg(long)]
     hotkey: Option<String>,
-
-    /// Hotkey to increase delay (e.g. F11)
-    #[arg(long)]
-    delay_up: Option<String>,
-
-    /// Hotkey to decrease delay (e.g. F10)
-    #[arg(long)]
-    delay_down: Option<String>,
 
     /// Type text as keystrokes into the focused application
     #[arg(long = "type")]
@@ -70,31 +68,38 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    // Validate --delay range
-    if cli.delay < 1 || cli.delay > 30 {
-        anyhow::bail!("--delay must be between 1 and 30 (got {})", cli.delay);
+    // Handle subprocess mode for settings UI
+    if std::env::args().any(|a| a == "--settings-ui") {
+        settings_window::run_standalone();
+        return Ok(());
     }
 
-    // Validate: --type without --hotkey is probably a mistake
-    if cli.type_mode && cli.hotkey.is_none() {
+    let cli = Cli::parse();
+
+    // Load settings: INI defaults, then CLI overrides
+    let ini_path = settings::settings_path();
+    let mut vals = settings::load_ini(&ini_path);
+
+    if let Some(d) = cli.delay { vals.delay = d; }
+    if let Some(t) = cli.silence_threshold { vals.silence_threshold = t; }
+    if let Some(f) = cli.silence_flush { vals.silence_chunks = Some(f); }
+    if let Some(m) = cli.min_speech { vals.min_speech_chunks = m; }
+    if let Some(r) = cli.rms_ema { vals.rms_ema_alpha = r; }
+    if let Some(ref h) = cli.hotkey {
+        vals.hotkey = Some(hotkey::parse_hotkey(h)?);
+    }
+    if cli.type_mode { vals.type_mode = true; }
+
+    // Validate
+    if vals.delay < 1 || vals.delay > 30 {
+        anyhow::bail!("--delay must be between 1 and 30 (got {})", vals.delay);
+    }
+    if vals.type_mode && vals.hotkey.is_none() {
         eprintln!("Warning: --type without --hotkey will type continuously into the focused app.");
         eprintln!("         Consider adding --hotkey F9 to toggle recording.");
     }
 
-    // Parse hotkeys early so we fail fast on invalid key names
-    let hotkey_key = cli.hotkey.as_deref()
-        .map(hotkey::parse_hotkey)
-        .transpose()?;
-    let delay_up_key = cli.delay_up.as_deref()
-        .map(hotkey::parse_hotkey)
-        .transpose()?;
-    let delay_down_key = cli.delay_down.as_deref()
-        .map(hotkey::parse_hotkey)
-        .transpose()?;
-
-    let silence_chunks = cli.silence_flush.unwrap_or(cli.delay + 14);
+    let silence_chunks = vals.silence_chunks.unwrap_or(vals.delay + 14);
 
     // mmap the safetensors file (instant — no disk I/O yet) and spawn readahead
     // thread to pre-fault pages at full sequential bandwidth. Starting this before
@@ -121,7 +126,7 @@ fn main() -> Result<()> {
     let dtype = DType::BF16;
 
     let is_offline = cli.wav_file.is_some();
-    let effective_delay = if is_offline { 20 } else { cli.delay };
+    let effective_delay = if is_offline { 20 } else { vals.delay };
 
     println!("\n{:<28} {}", "Parameter", "Value");
     println!("{:-<28} {:-<32}", "", "");
@@ -133,26 +138,39 @@ fn main() -> Result<()> {
     println!("{:<28} {} ({:.0}min)",
         "Decoder sliding window", decoder::SLIDING_WINDOW, decoder::SLIDING_WINDOW as f64 * 0.08 / 60.0);
     println!("{:<28} {} (RMS < {})",
-        "Silence threshold", cli.silence_threshold, cli.silence_threshold);
+        "Silence threshold", vals.silence_threshold, vals.silence_threshold);
     println!("{:<28} {} ({}ms)",
         "Silence newline after", silence_chunks, silence_chunks * 80);
     println!("{:<28} {} ({}ms)",
-        "Min speech to activate", cli.min_speech, cli.min_speech * 80);
-    println!("{:<28} {}", "RMS EMA alpha", cli.rms_ema);
-    if let Some(ref key) = hotkey_key {
+        "Min speech to activate", vals.min_speech_chunks, vals.min_speech_chunks * 80);
+    println!("{:<28} {}", "RMS EMA alpha", vals.rms_ema_alpha);
+    if let Some(ref key) = vals.hotkey {
         println!("{:<28} {:?}", "Hotkey", key);
     }
-    if let Some(ref key) = delay_up_key {
-        println!("{:<28} {:?}", "Delay up key", key);
-    }
-    if let Some(ref key) = delay_down_key {
-        println!("{:<28} {:?}", "Delay down key", key);
-    }
-    if cli.type_mode {
+    if vals.type_mode {
         println!("{:<28} enabled", "Keyboard output");
     }
     println!("{:<28} {:?}", "Compute dtype", dtype);
     println!();
+
+    // For streaming mode: spawn tray immediately so it's visible during model load
+    let has_hotkey = vals.hotkey.is_some();
+    let (settings, running, hotkey_thread_id) = if !is_offline {
+        let s = Arc::new(settings::SharedSettings::new(
+            vals, silence_chunks, hotkey::STATE_LOADING,
+        ));
+        let r = Arc::new(AtomicBool::new(true));
+        let h = Arc::new(AtomicU32::new(0));
+        {
+            let s2 = s.clone();
+            let r2 = r.clone();
+            let h2 = h.clone();
+            std::thread::spawn(move || tray::run_tray(s2, r2, h2));
+        }
+        (Some(s), Some(r), Some(h))
+    } else {
+        (None, None, None)
+    };
 
     let vb = VarBuilder::from_slice_safetensors(&st_data, dtype, &device)?;
 
@@ -175,25 +193,25 @@ fn main() -> Result<()> {
 
     let filters = mel::mel_filters(&cli.model_dir);
 
-    let config = streaming::StreamConfig {
-        delay_tokens: cli.delay,
-        silence_threshold: cli.silence_threshold,
-        silence_chunks,
-        min_speech_chunks: cli.min_speech,
-        rms_ema_alpha: cli.rms_ema,
-        hotkey: hotkey_key,
-        delay_up_key,
-        delay_down_key,
-        type_mode: cli.type_mode,
-    };
-
     match cli.wav_file {
         Some(path) => {
             run_offline(&path, effective_delay, &mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype)
         }
         None => {
+            let settings = settings.unwrap();
+            let running = running.unwrap();
+            let hotkey_thread_id = hotkey_thread_id.unwrap();
+
+            // Model loaded — transition from Loading to operational state
+            let initial_state = if has_hotkey {
+                hotkey::STATE_PAUSED
+            } else {
+                hotkey::STATE_ACTIVE
+            };
+            settings.state.store(initial_state, Ordering::SeqCst);
+
             println!("\n=== Voicet Streaming Mode ===\n");
-            streaming::run_streaming(&mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype, &config)
+            streaming::run_streaming(&mut enc, &adapter, &mut dec, &tok, &filters, &device, dtype, &settings, &running, &hotkey_thread_id)
         }
     }
 }
