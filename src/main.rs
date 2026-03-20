@@ -154,7 +154,6 @@ fn main() -> Result<()> {
     println!();
 
     // For streaming mode: spawn tray immediately so it's visible during model load
-    let has_hotkey = vals.hotkey.is_some();
     let (settings, running, hotkey_thread_id) = if !is_offline {
         let s = Arc::new(settings::SharedSettings::new(
             vals, silence_chunks, hotkey::STATE_LOADING,

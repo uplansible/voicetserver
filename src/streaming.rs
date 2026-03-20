@@ -327,7 +327,6 @@ pub fn run_streaming(
             mel_buffer = state.mel_frames[mel_len.saturating_sub(CONV_CTX)..].to_vec();
             drop(std::mem::take(&mut state.mel_frames));
             inc_mel = IncrementalMel::new(filters);
-            if current_state_val == hotkey::STATE_ACTIVE { sink.emit_newline(); }
             prev_state_val = current_state_val;
             continue;
         }
@@ -366,8 +365,6 @@ pub fn run_streaming(
                 if mel_buffer.len() > CONV_CTX {
                     mel_buffer.drain(..mel_buffer.len() - CONV_CTX);
                 }
-                sink.emit_newline();
-
                 // Reset silence detection
                 silence_counter = 0;
                 speech_counter = 0;

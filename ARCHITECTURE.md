@@ -38,7 +38,7 @@ An autoregressive language model that generates text tokens one at a time. At ea
 
 ### The Delay Mechanism
 
-The model can be configured to look ahead by N steps before committing to text output. This is controlled by **`delay_tokens`** (see config table below), which drives both the prefill padding count and the sinusoidal conditioning embedding. The embedding is injected into every decoder layer via adaptive normalization (Ada-RMSNorm). Valid range: 1–30 (80ms–2400ms). Delay can be adjusted at runtime via `--delay-up`/`--delay-down` hotkeys, which trigger a full model restart (encoder/decoder cache reset + new prefill + recomputed Ada-RMSNorm scales).
+The model can be configured to look ahead by N steps before committing to text output. This is controlled by **`delay_tokens`** (see config table below), which drives both the prefill padding count and the sinusoidal conditioning embedding. The embedding is injected into every decoder layer via adaptive normalization (Ada-RMSNorm). Valid range: 1–30 (80ms–2400ms). Delay can be adjusted at runtime via the settings window, which triggers a full model restart (encoder/decoder cache reset + new prefill + recomputed Ada-RMSNorm scales).
 
 The delay conditioning uses a **per-layer bottleneck** architecture. Each of the 26 decoder layers has its own `ada_rms_norm_t_cond` with two linear projections and a GELU activation: `Linear(3072→32) → GELU → Linear(32→3072)`. The sinusoidal embedding of `num_delay_tokens` is projected through this per-layer bottleneck to modulate **only the FFN-path RMSNorm** (not the attention norm). The modulation formula is: `ffn_norm(x) * (1 + ada_rms_norm(t_cond))`.
 
@@ -103,19 +103,17 @@ The conv stem runs on a fixed 12-frame window each tick (O(1) per token, not O(n
 
 ## Configurable Parameters
 
-Printed at startup. CLI flags override defaults; architectural constants are fixed.
+All parameters are adjustable via the settings window (right-click tray icon) and persist to `settings.ini`. CLI flags override `settings.ini` on launch. Architectural constants are fixed.
 
-| CLI flag              | Default   | Effect                                                                                                                                |
+| CLI flag / setting    | Default   | Effect                                                                                                                                |
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `--delay`             | 4 (320ms) | Accuracy vs latency tradeoff. Higher = more lookahead = better accuracy but slower response. Valid: 1-30.                             |
 | `--silence-threshold` | 0.006     | Raw RMS energy below which a chunk counts as silent.                                                                                  |
 | `--silence-flush`     | delay+14  | Consecutive silent chunks before emitting a paragraph break.                                                                          |
 | `--min-speech`        | 12 (960ms)| Minimum consecutive non-silent chunks (EMA-smoothed) before silence detection can trigger. Prevents breaks after 1-2 word utterances. |
 | `--rms-ema`           | 0.3       | EMA smoothing factor for speech detection. Lower = smoother, rides over inter-syllable dips.                                          |
-| `--hotkey`            | none      | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause, PrintScreen). Starts paused; first press begins recording.              |
-| `--delay-up`          | none      | Hotkey to increase delay by 1 (triggers model restart with new delay conditioning).                                                   |
-| `--delay-down`        | none      | Hotkey to decrease delay by 1 (triggers model restart with new delay conditioning).                                                   |
-| `--type`              | off       | Inject text as keystrokes into focused app via enigo instead of printing to stdout.                                                   |
+| `--hotkey`            | none      | Global hotkey to toggle recording (F1-F12, ScrollLock, Pause, PrintScreen).                                                           |
+| `--type`              | on        | Inject text as keystrokes into focused app via enigo instead of printing to stdout.                                                   |
 | `--device`            | 0         | CUDA device index.                                                                                                                    |
 
 | Architectural constant | Location     | Value          | Notes                                 |
@@ -132,7 +130,7 @@ Voicet uses the [candle](https://github.com/huggingface/candle) ML framework for
 
 The `candle-flash-attn` crate is a fork ([Liddo-kun/candle](https://github.com/Liddo-kun/candle), branch `voicet-minimal-kernels`) that compiles only the CUDA kernels this model needs: BF16, head_dim 64 (encoder) and 128 (decoder). The upstream crate compiles all 32 variants (8 head dims × 2 dtypes × 2 causal modes), which inflated the binary from ~10 MB to ~190 MB. The fork reduces it to ~35 MB.
 
-Other dependencies: `rdev` (global hotkey + Ctrl+C via low-level keyboard hook), `enigo` (keystroke injection for `--type` mode), `cpal` (mic capture), `hound` (WAV reading), `clap` (CLI parsing).
+Other dependencies: `rdev` (global hotkey + Ctrl+C via low-level keyboard hook), `enigo` (keystroke injection for `--type` mode), `cpal` (mic capture), `hound` (WAV reading), `clap` (CLI parsing), `tray-icon` (system tray), `eframe`/`egui` (settings window GUI).
 
 ---
 
