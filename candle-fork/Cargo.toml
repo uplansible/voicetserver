@@ -50,8 +50,6 @@ criterion = { version = "0.8", default-features = false }
 cudarc = { version = "0.19.1", features = [
     "std",
     "cublas",
-    "cublaslt",
-    "curand",
     "driver",
     "nvrtc",
     "f16",

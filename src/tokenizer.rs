@@ -17,28 +17,36 @@ pub struct Tokenizer {
     vocab: Vec<Vec<u8>>,
 }
 
+/// Minimal structure to deserialize only what we need from tekken.json,
+/// avoiding a full serde_json::Value DOM (~50-75MB for 15MB file).
+#[derive(serde::Deserialize)]
+struct TekkenFile {
+    vocab: Vec<VocabEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct VocabEntry {
+    token_bytes: String,
+}
+
 impl Tokenizer {
     pub fn load(model_dir: &str) -> Result<Self> {
         let path = format!("{model_dir}/tekken.json");
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {path}"))?;
-        let json: serde_json::Value = serde_json::from_str(&data)
+        let parsed: TekkenFile = serde_json::from_str(&data)
             .context("parsing tekken.json")?;
+        drop(data);
 
-        let vocab_arr = json["vocab"].as_array()
-            .context("tekken.json missing 'vocab' array")?;
-
-        // Build vocab indexed by rank
-        let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(vocab_arr.len());
         let engine = base64::engine::general_purpose::STANDARD;
+        let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(parsed.vocab.len());
 
-        for entry in vocab_arr {
-            let token_bytes_b64 = entry["token_bytes"].as_str()
-                .context("missing token_bytes")?;
-            let bytes = engine.decode(token_bytes_b64)
+        for entry in &parsed.vocab {
+            let bytes = engine.decode(&entry.token_bytes)
                 .context("base64 decode failed")?;
             vocab.push(bytes);
         }
+        drop(parsed);
 
         Ok(Self { vocab })
     }

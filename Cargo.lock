@@ -4510,6 +4510,7 @@ dependencies = [
  "num_cpus",
  "rdev",
  "safetensors 0.7.0",
+ "serde",
  "serde_json",
  "tray-icon",
  "winit",

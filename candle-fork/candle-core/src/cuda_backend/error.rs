@@ -12,9 +12,6 @@ pub enum CudaError {
     #[error(transparent)]
     Cublas(#[from] cudarc::cublas::result::CublasError),
 
-    #[error(transparent)]
-    Curand(#[from] cudarc::curand::result::CurandError),
-
     #[error("missing kernel '{module_name}'")]
     MissingKernel { module_name: String },
 
