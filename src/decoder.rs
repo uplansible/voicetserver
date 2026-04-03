@@ -39,6 +39,28 @@ pub fn prefill_len(delay_tokens: usize) -> usize {
     1 + common::LEFT_PAD_TOKENS + delay_tokens
 }
 
+// ---- CPU attention fallback (non-cuda builds) ----
+
+/// Plain scaled dot-product attention without flash-attn or M=1 kernel.
+/// Input layout: [batch, seq_len, heads, head_dim]. Used only in CPU/dev builds.
+#[cfg(not(feature = "cuda"))]
+fn cpu_sdp_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> candle_core::Result<Tensor> {
+    let q = q.transpose(1, 2)?; // [b, h, sq, d]
+    let k = k.transpose(1, 2)?; // [b, h, sk, d]
+    let v = v.transpose(1, 2)?; // [b, h, sk, d]
+
+    let k_t = k.transpose(2, 3)?;
+    let scores = q.matmul(&k_t)?.affine(scale as f64, 0.0)?;
+    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let out = probs.matmul(&v)?;
+    out.transpose(1, 2)?.contiguous()
+}
+
 // ---- GQA Attention ----
 
 struct Attention {
@@ -97,6 +119,7 @@ impl Attention {
 
         // Attention: custom M=1 kernel for streaming decode, flash attention for prefill/offline
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        #[cfg(feature = "cuda")]
         let out = if seq_len == 1 {
             crate::m1_attention::m1_attn_windowed(
                 &q, &k_full, &v_full,
@@ -111,6 +134,9 @@ impl Attention {
                 Some(0),
             )?
         };
+        // CPU fallback: plain scaled dot-product attention (dev builds without GPU)
+        #[cfg(not(feature = "cuda"))]
+        let out = cpu_sdp_attention(&q, &k_full, &v_full, scale)?;
 
         // Reshape: [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, hidden]
         let out = out.reshape((batch, seq_len, NUM_HEADS * HEAD_DIM))?;

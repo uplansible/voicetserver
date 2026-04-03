@@ -1,0 +1,137 @@
+# German medical terms seed list for SCHMIDIspeech correction dictionary
+# One term per line. Used by the Aho-Corasick correction automaton (Phase 3).
+# Terms are case-sensitive as they appear in dictation output.
+
+# Kardiologie
+Myokardiszintigraphie
+Koronarangiographie
+Koronararterie
+Perikarditis
+Myokarditis
+Endokarditis
+Aortenklappenstenose
+Mitralklappeninsuffizienz
+Trikuspidalklappeninsuffizienz
+Vorhofflimmern
+Kammerflimmern
+Tachykardie
+Bradykardie
+Herzinsuffizienz
+Kardiomyopathie
+Arteriosklerose
+Atherosklerose
+Aortenaneurysma
+Pulmonalembolie
+Tiefe Venenthrombose
+
+# Neurologie
+Enzephalitis
+Meningitis
+Subarachnoidalblutung
+Intrakranielle Hypertension
+Zerebrovaskulärer Insult
+Transitorische ischämische Attacke
+Polyneuropathie
+Myasthenia gravis
+Multiple Sklerose
+Parkinson-Syndrom
+Alzheimer-Demenz
+Epilepsie
+Migräne
+Trigeminusneuralgie
+
+# Pneumologie
+Pneumonie
+Bronchopneumonie
+Pleuritis
+Pneumothorax
+Pleuraerguss
+Asthma bronchiale
+Chronisch obstruktive Lungenerkrankung
+Pulmonale Hypertonie
+Lungenemphysem
+Bronchialkarzinom
+
+# Gastroenterologie
+Cholezystitis
+Cholelithiasis
+Pankreatitis
+Appendizitis
+Peritonitis
+Divertikulitis
+Colitis ulcerosa
+Morbus Crohn
+Hepatitis
+Leberzirrhose
+Ösophagitis
+Gastritis
+
+# Nephrologie
+Glomerulonephritis
+Pyelonephritis
+Niereninsuffizienz
+Nierenversagen
+Urolithiasis
+Harnwegsinfektion
+Nephrolithiasis
+
+# Hämatologie
+Thrombozytopenie
+Leukozytose
+Leukopenie
+Anämie
+Polyzythämie
+Gerinnungsstörung
+Thrombophilie
+Hämophilie
+
+# Endokrinologie
+Hypothyreose
+Hyperthyreose
+Diabetes mellitus
+Insulinresistenz
+Nebenniereninsuffizienz
+Hyperparathyreoidismus
+Hypoparathyreoidismus
+
+# HNO
+Laryngoskopie
+Laryngitis
+Pharyngitis
+Tonsillitis
+Rhinosinusitis
+Otitis media
+Vestibularisschwäche
+
+# Onkologie
+Adenokarzinom
+Plattenepithelkarzinom
+Lymphom
+Leukämie
+Myelom
+Melanom
+Metastase
+Chemotherapie
+Radiotherapie
+
+# Orthopädie
+Gonarthrose
+Koxarthrose
+Spondylarthrose
+Diskusprolaps
+Osteomyelitis
+Fraktur
+
+# Allgemein
+Anamnese
+Diagnose
+Differentialdiagnose
+Laborwerte
+Blutbild
+Röntgenaufnahme
+Computertomographie
+Magnetresonanztomographie
+Ultraschalluntersuchung
+Echokardiographie
+Elektrokardiogramm
+Elektroenzephalogramm

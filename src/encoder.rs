@@ -90,17 +90,46 @@ impl Attention {
 
         // Flash attention with causal sliding window
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        #[cfg(feature = "cuda")]
         let out = candle_flash_attn::flash_attn_windowed(
             &q, &k_full, &v_full,
             scale,
             Some(SLIDING_WINDOW - 1), // window_size_left
             Some(0),                   // window_size_right (causal)
         )?;
+        // CPU fallback: plain scaled dot-product attention (no causal masking needed
+        // during dev/test since the encoder uses causal KV cache layout).
+        #[cfg(not(feature = "cuda"))]
+        let out = cpu_sdp_attention(&q, &k_full, &v_full, scale)?;
 
         // Reshape: [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, hidden]
         let out = out.reshape((batch, seq_len, NUM_HEADS * HEAD_DIM))?;
         self.wo.forward(&out)
     }
+}
+
+// ---- CPU attention fallback (non-cuda builds) ----
+
+/// Plain scaled dot-product attention without flash-attn or causal masking.
+/// Input layout: [batch, seq_len, heads, head_dim]. Used only in CPU/dev builds.
+#[cfg(not(feature = "cuda"))]
+#[allow(dead_code)]
+fn cpu_sdp_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> candle_core::Result<Tensor> {
+    // Reshape to [batch, heads, seq, head_dim] for matmul
+    let q = q.transpose(1, 2)?; // [b, h, sq, d]
+    let k = k.transpose(1, 2)?; // [b, h, sk, d]
+    let v = v.transpose(1, 2)?; // [b, h, sk, d]
+
+    let k_t = k.transpose(2, 3)?; // [b, h, d, sk]
+    let scores = q.matmul(&k_t)?.affine(scale as f64, 0.0)?; // [b, h, sq, sk]
+    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let out = probs.matmul(&v)?; // [b, h, sq, d]
+    out.transpose(1, 2)?.contiguous() // [b, sq, h, d]
 }
 
 // ---- SwiGLU MLP ----

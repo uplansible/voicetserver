@@ -1,30 +1,60 @@
 [package]
-name = "voicet"
+name = "voicetserver"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Dev (Docker, no GPU): `cargo build` — no CUDA, CPU tensors only
+# Production (GPU server): `cargo build --release --features cuda`
+default = []
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "dep:candle-flash-attn",
+]
+
 [dependencies]
-candle-core = { path = "candle-fork/candle-core", features = ["cuda"] }
-candle-nn = { path = "candle-fork/candle-nn", features = ["cuda"] }
-candle-flash-attn = { path = "candle-fork/candle-flash-attn" }
+# ML framework (vendored fork — do not update without reason)
+candle-core = { path = "candle-fork/candle-core" }
+candle-nn   = { path = "candle-fork/candle-nn" }
+candle-flash-attn = { path = "candle-fork/candle-flash-attn", optional = true }
+
+# Numerics
 half = { version = "2.3.1", features = ["num-traits"] }
+
+# Model loading
 safetensors = "0.7"
-clap = { version = "4", features = ["derive"] }
-anyhow = "1"
-memmap2 = "0.9"
-serde = { version = "1", features = ["derive"] }
+memmap2     = "0.9"
+
+# Serialisation
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
-hound = "3"
+base64     = "0.22"
+
+# CLI
+clap   = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+# Audio (offline WAV only — mic removed)
+hound    = "3"
 num_cpus = "1"
-cpal = "0.15"
-rdev = "0.5"
-enigo = "0.2"
-tray-icon = "0.19"
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
-winit = "0.30"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket server + TLS
+axum        = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls      = "0.23"
+rustls-pemfile = "2"
+
+# Audio decode (raw f32 PCM from browser AudioWorklet; Opus planned for Phase 3)
+
+# Text correction (Phase 3)
+aho-corasick = "1"
 
 [build-dependencies]
+# CUDA kernel compiler — always present as build-dep, but only invoked when cuda feature is enabled
 cudaforge = "0.1"
 
 [profile.release]

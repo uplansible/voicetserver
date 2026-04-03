@@ -1,83 +1,102 @@
 # Build
 
-## Windows
+## Dev (Docker, no GPU)
 
-cargo build --release --target-dir target
+```bash
+apt install -y pkg-config build-essential libssl-dev
+cargo build
+cargo check   # fast syntax check
+```
 
-## Linux (x86_64 or aarch64/DGX Spark)
+## Production (GPU server, Ubuntu + CUDA 12.x)
 
-# Prerequisites: apt install pkg-config libasound2-dev libx11-dev libxtst-dev libxdo-dev
+```bash
+apt install -y pkg-config build-essential libssl-dev
+export CUDA_PATH=/usr/local/cuda
+export PATH=$CUDA_PATH/bin:$PATH
+CUDA_COMPUTE_CAP=89 cargo build --release --features cuda
+# Compute capability: Ada Lovelace (RTX 4000/4090) = 89, Ampere (RTX 3000) = 86, Turing (RTX 2000) = 75
+```
 
-# CUDA toolkit must be installed (nvcc in PATH or /usr/local/cuda)
-
-export CUDA_PATH=/usr/local/cuda  # override .cargo/config.toml's Windows default
-cargo build --release
-
-# Or use the build script (auto-detects arch, checks deps, sets CUDA_PATH):
-
-./scripts/build-linux.sh              # build only
-./scripts/build-linux.sh --package    # build + create release tarball
+Binary: `target/release/voicetserver`
 
 # Test
 
-## Streaming (mic)
+## Offline WAV
 
-./target/release/voicet.exe --model-dir Voxtral-Mini-4B-Realtime
+```bash
+./target/release/voicetserver --model-dir /path/to/Voxtral-Mini-4B-Realtime audio.wav
+```
 
-## Offline (WAV file)
+## WebSocket server (dev, no TLS)
 
-./target/release/voicet.exe --model-dir Voxtral-Mini-4B-Realtime church.wav
+```bash
+./target/release/voicetserver --model-dir /path/to/Voxtral-Mini-4B-Realtime
+# Listens on ws://127.0.0.1:8765/asr
+curl http://127.0.0.1:8765/health
+```
 
-## Full featured
+## WebSocket server (production, TLS)
 
-./target/release/voicet.exe --model-dir Voxtral-Mini-4B-Realtime --hotkey F9 --type
+```bash
+./target/release/voicetserver \
+  --model-dir /path/to/Voxtral-Mini-4B-Realtime \
+  --bind-addr 0.0.0.0 \
+  --tls-cert /etc/tailscale/certs/<host>.crt \
+  --tls-key  /etc/tailscale/certs/<host>.key
+```
+
+# Features
+
+- `default = []` — no CUDA; dev builds always work without nvcc
+- `cuda` — enables candle CUDA backend + flash-attn; required for production inference
+
+All CUDA-only code gated behind `#[cfg(feature = "cuda")]` in source files.
+`build.rs` checks `CARGO_FEATURE_CUDA` env var (not `#[cfg]` — build scripts don't see feature flags).
 
 # Model files
 
-Dev: model weights are in Voxtral-Mini-4B-Realtime/ subfolder
-Release: users place them next to the binary (--model-dir defaults to ".")
+Required in `--model-dir`:
+- `consolidated.safetensors` (~8.9 GB) — model weights
+- `tekken.json` — tokenizer
+- `mel_filters.bin` — precomputed Slaney mel filterbank (128×201 f32 LE); copy from `assets/mel_filters.bin` or regenerate with `python3 scripts/generate_mel_filters.py <dir>`
 
-# Release process
+Download from HuggingFace: `mistralai/Voxtral-Mini-4B-Realtime-2602`
 
-## Windows
+# Architecture
 
-1. Build, then copy exe + CUDA DLLs + mel_filters.bin + voicet_typemode.bat to release/ folder
-   - CUDA DLLs: cublas64_13.dll, curand64_10.dll (check with: dumpbin //DEPENDENTS voicet.exe | grep -i cu)
-2. Zip with PowerShell: Compress-Archive
-3. gh release create vX.Y.Z <zip> --title "..." --notes "..."
-4. Version in commit message, tag on commit, release tied to tag
+- `src/main.rs` — tokio entry point; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex)
+- `src/streaming.rs` — `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
+- `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
+- `src/server.rs` — axum 0.8 WebSocket handler + TLS via axum-server 0.8 + rustls
+- `src/encoder.rs` / `src/decoder.rs` — Voxtral model; flash-attn behind `#[cfg(feature = "cuda")]`
+- `src/session.rs` — Phase 2 stub (patient session vocabulary)
+- `src/macros.rs` — Phase 4 stub (macro expansion)
+- `candle-fork/` — vendored Candle ML framework; do not update without reason
 
-## Linux
+GPU lock: single `tokio::sync::Mutex<ModelInner>` wrapping both enc and dec.
+Acquire → do all sync Candle work → release before every `.await`.
+Use `let inner = &mut *guard;` to enable disjoint field borrows (enc, dec).
 
-1. Run ./scripts/build-linux.sh --package (on target machine or matching arch)
-2. Produces voicet-v{VERSION}-linux-{x64|arm64}-cuda.tar.gz
-3. Tarball contains: voicet binary + CUDA .so libs + mel_filters.bin + run-voicet.sh wrapper
-4. gh release create vX.Y.Z <tarball> --title "..." --notes "..."
+# Browser client
 
-# Folder structure notes
+`schmidispeech.user.js` — Violentmonkey userscript.
+Sends raw 16kHz mono f32 LE PCM over WebSocket binary frames.
+Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}`.
 
-- target/release/ — cargo build output
-- release/ — Windows distribution staging (exe + CUDA DLLs + mel_filters.bin)
-- release-linux/ — Linux distribution staging (created by build-linux.sh --package)
-- scripts/ — build scripts (build-linux.sh)
-- candle-fork/ — vendored candle dependency, don't update without reason
-- 
+Server URL stored via `GM_setValue('server_url', 'wss://...:8765/asr')`.
 
-# Platform notes
+# Folder structure
 
-- .cargo/config.toml sets CUDA_PATH to Windows default; Linux builds override via env var
-- No source code changes needed for Linux — rdev, enigo, cpal all support Linux natively
-- DGX Spark = aarch64 (Grace ARM CPU + Blackwell GPU), other Linux RTX = x86_64
-- Linux build deps: ALSA (cpal), X11+Xtst (rdev), libxdo (enigo)
-- Linux release bundles .so files + LD_LIBRARY_PATH wrapper; Windows bundles .dll files
+- `src/` — Rust source
+- `assets/mel_filters.bin` — precomputed mel filterbank (commit this)
+- `config/medical_terms_de.txt` — German medical seed terms
+- `docs/ubuntu_dependencies.md` — package list by phase
+- `scripts/generate_mel_filters.py` — mel filterbank generator (pure Python, no deps)
+- `schmidispeech.user.js` — browser userscript
+- `candle-fork/` — vendored Candle
+- `README.private.md` — private deploy notes (gitignored)
 
-# Docs
+# Versioning
 
-- ARCHITECTURE.md — current state reference (model, protocols, optimizations)
-- PLAN_voicet-rust-rewrite.md — historical record of what was built per phase
-- README.md — user-facing project overview
-
-# GitHub
-
-- Repo: github.com/Liddo-kun/voicet (public)
-- Versioning: v0.3, v0.5, v0.5.1, v0.5.2 — include version in commit messages
+Semantic versioning in `Cargo.toml`. Increment patch on each push.

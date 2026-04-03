@@ -2,6 +2,7 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use std::fs;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "cuda")]
     candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
 
     let device = Device::cuda_if_available(0)?;

@@ -1,13 +1,9 @@
-// Shared settings infrastructure for GUI and CLI configuration.
+// Shared settings infrastructure for server configuration.
 //
-// SharedSettings holds all adjustable parameters as atomics, shared between
-// the inference thread, hotkey thread, and (future) tray/settings UI threads.
+// SharedSettings holds all adjustable inference parameters as atomics, shared
+// between the model loading thread and per-connection streaming tasks.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
-
-use crate::hotkey;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 pub const SILENCE_CHUNKS_DEFAULT: usize = 20;
 
@@ -26,7 +22,7 @@ impl AtomicF32 {
     }
 }
 
-/// All GUI-adjustable settings as atomic types.
+/// Inference parameters shared across all WebSocket connections.
 pub struct SharedSettings {
     pub silence_threshold: AtomicF32,
     pub silence_chunks: AtomicUsize,
@@ -34,13 +30,15 @@ pub struct SharedSettings {
     pub min_speech_chunks: AtomicUsize,
     pub rms_ema_alpha: AtomicF32,
     pub delay_tokens: AtomicUsize,
-    pub hotkey: Mutex<Option<rdev::Key>>,
-    pub type_mode: AtomicBool,
+    /// Server state: STATE_READY / STATE_LOADING (no hotkey toggle in server mode).
     pub state: AtomicU8,
 }
 
+pub const STATE_LOADING: u8 = 2;
+pub const STATE_READY: u8 = 1;
+
 impl SharedSettings {
-    pub fn new(vals: IniValues, silence_chunks: usize, initial_state: u8) -> Self {
+    pub fn new(vals: IniValues, silence_chunks: usize) -> Self {
         Self {
             silence_threshold: AtomicF32::new(vals.silence_threshold),
             silence_chunks: AtomicUsize::new(silence_chunks),
@@ -48,14 +46,12 @@ impl SharedSettings {
             min_speech_chunks: AtomicUsize::new(vals.min_speech_chunks),
             rms_ema_alpha: AtomicF32::new(vals.rms_ema_alpha),
             delay_tokens: AtomicUsize::new(vals.delay),
-            hotkey: Mutex::new(vals.hotkey),
-            type_mode: AtomicBool::new(vals.type_mode),
-            state: AtomicU8::new(initial_state),
+            state: AtomicU8::new(STATE_LOADING),
         }
     }
 }
 
-/// Intermediate non-atomic settings for INI loading and CLI merging.
+/// Intermediate non-atomic settings for CLI argument merging.
 pub struct IniValues {
     pub delay: usize,
     pub silence_threshold: f32,
@@ -63,8 +59,6 @@ pub struct IniValues {
     pub paragraph_delay_offset: usize,
     pub min_speech_chunks: usize,
     pub rms_ema_alpha: f32,
-    pub hotkey: Option<rdev::Key>,
-    pub type_mode: bool,
 }
 
 impl Default for IniValues {
@@ -76,121 +70,6 @@ impl Default for IniValues {
             paragraph_delay_offset: 4,
             min_speech_chunks: 15,
             rms_ema_alpha: 0.3,
-            hotkey: None,
-            type_mode: true,
         }
-    }
-}
-
-fn parse_ini(contents: &str) -> IniValues {
-    let mut vals = IniValues::default();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "delay" => { if let Ok(v) = value.parse() { vals.delay = v; } }
-                "silence_threshold" => { if let Ok(v) = value.parse() { vals.silence_threshold = v; } }
-                "silence_chunks" => { if let Ok(v) = value.parse() { vals.silence_chunks = Some(v); } }
-                "paragraph_delay_offset" => { if let Ok(v) = value.parse() { vals.paragraph_delay_offset = v; } }
-                "min_speech_chunks" => { if let Ok(v) = value.parse() { vals.min_speech_chunks = v; } }
-                "rms_ema_alpha" => { if let Ok(v) = value.parse() { vals.rms_ema_alpha = v; } }
-                "hotkey" => {
-                    if value.eq_ignore_ascii_case("none") || value.is_empty() {
-                        vals.hotkey = None;
-                    } else if let Ok(k) = hotkey::parse_hotkey(value) {
-                        vals.hotkey = Some(k);
-                    }
-                }
-                "output_mode" => {
-                    vals.type_mode = value == "type";
-                }
-                _ => {}
-            }
-        }
-    }
-    vals
-}
-
-/// Load settings from an INI file. Missing keys use defaults. Missing file = all defaults.
-pub fn load_ini(path: &Path) -> IniValues {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => parse_ini(&contents),
-        Err(_) => IniValues::default(),
-    }
-}
-
-/// Format settings as INI content. Single source of truth for the INI layout.
-pub fn format_ini(
-    delay: usize, silence_threshold: f32, silence_chunks: usize,
-    paragraph_delay_offset: usize, min_speech_chunks: usize,
-    rms_ema_alpha: f32, hotkey_str: &str, output_mode: &str,
-) -> String {
-    format!(
-        "delay={}\nsilence_threshold={}\nsilence_chunks={}\nparagraph_delay_offset={}\nmin_speech_chunks={}\nrms_ema_alpha={}\nhotkey={}\noutput_mode={}\n",
-        delay, silence_threshold, silence_chunks,
-        paragraph_delay_offset, min_speech_chunks,
-        rms_ema_alpha, hotkey_str, output_mode,
-    )
-}
-
-/// Save current settings to an INI file.
-pub fn save_settings(path: &Path, settings: &SharedSettings) {
-    let hotkey_str = match *settings.hotkey.lock().unwrap() {
-        Some(key) => hotkey::key_to_string(key),
-        None => "none".to_string(),
-    };
-    let output_mode = if settings.type_mode.load(Ordering::Relaxed) { "type" } else { "none" };
-
-    let content = format_ini(
-        settings.delay_tokens.load(Ordering::Relaxed),
-        settings.silence_threshold.load(Ordering::Relaxed),
-        settings.silence_chunks.load(Ordering::Relaxed),
-        settings.paragraph_delay_offset.load(Ordering::Relaxed),
-        settings.min_speech_chunks.load(Ordering::Relaxed),
-        settings.rms_ema_alpha.load(Ordering::Relaxed),
-        &hotkey_str,
-        output_mode,
-    );
-
-    let _ = std::fs::write(path, content);
-}
-
-/// Path to settings.ini next to the executable.
-pub fn settings_path() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("settings.ini")
-}
-
-/// Reload settings from INI file into shared atomics. Skips on read error.
-pub fn reload_from_file(settings: &SharedSettings, path: &Path, hotkey_thread_id: &AtomicU32) {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let vals = parse_ini(&contents);
-
-    settings.delay_tokens.store(vals.delay, Ordering::Relaxed);
-    settings.silence_threshold.store(vals.silence_threshold, Ordering::Relaxed);
-    if let Some(sc) = vals.silence_chunks {
-        settings.silence_chunks.store(sc, Ordering::Relaxed);
-    }
-    settings.paragraph_delay_offset.store(vals.paragraph_delay_offset, Ordering::Relaxed);
-    settings.min_speech_chunks.store(vals.min_speech_chunks, Ordering::Relaxed);
-    settings.rms_ema_alpha.store(vals.rms_ema_alpha, Ordering::Relaxed);
-    settings.type_mode.store(vals.type_mode, Ordering::Relaxed);
-
-    let mut current = settings.hotkey.lock().unwrap();
-    if *current != vals.hotkey {
-        *current = vals.hotkey;
-        drop(current);
-        hotkey::change_hotkey(hotkey_thread_id, vals.hotkey);
     }
 }
