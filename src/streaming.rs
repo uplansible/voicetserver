@@ -277,7 +277,7 @@ impl StreamingState {
             self.sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
             if self.silence.process_chunk(rms, settings) {
                 outputs.push(ChunkOutput::Silence);
-                self.text_buf.clear();
+                // text_buf is cleared by take_text_buf() in the caller — do not clear here
             }
         }
 
