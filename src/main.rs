@@ -1,6 +1,7 @@
 mod adapter;
 mod audio;
 mod common;
+mod config;
 mod decoder;
 mod encoder;
 mod macros;
@@ -9,6 +10,7 @@ mod session;
 mod settings;
 mod streaming;
 mod tokenizer;
+mod words;
 
 #[cfg(feature = "cuda")]
 mod m1_attention;
@@ -18,10 +20,12 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use clap::Parser;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use common::MEL_FRAMES_PER_TOKEN;
+use config::{MergedConfig, ValueSource};
 
 #[derive(Parser, Clone)]
 #[command(name = "voicetserver", about = "SCHMIDIspeech — real-time German medical dictation server")]
@@ -29,43 +33,43 @@ pub struct Cli {
     /// WAV file for offline transcription (omit for server mode)
     pub wav_file: Option<String>,
 
-    /// Directory containing model files (consolidated.safetensors, tekken.json, mel_filters.bin)
-    #[arg(long, default_value = ".")]
-    pub model_dir: String,
+    /// Directory containing model files (consolidated.safetensors, tekken.json, mel_filters.bin) [default: "."]
+    #[arg(long)]
+    pub model_dir: Option<String>,
 
-    /// CUDA device index
-    #[arg(long, default_value_t = 0)]
-    pub device: usize,
+    /// CUDA device index [default: 0]
+    #[arg(long)]
+    pub device: Option<usize>,
 
-    /// Delay tokens (1–30; each = 80ms lookahead; higher = more accuracy)
-    #[arg(long, default_value_t = 4)]
-    pub delay: usize,
+    /// Delay tokens (1–30; each = 80ms lookahead; higher = more accuracy) [default: 4]
+    #[arg(long)]
+    pub delay: Option<usize>,
 
-    /// Silence RMS threshold for paragraph breaks
-    #[arg(long, default_value_t = 0.006)]
-    pub silence_threshold: f32,
+    /// Silence RMS threshold for paragraph breaks [default: 0.006]
+    #[arg(long)]
+    pub silence_threshold: Option<f32>,
 
-    /// Consecutive silent chunks before silence is detected (each chunk = 80ms)
-    #[arg(long, default_value_t = 20)]
-    pub silence_flush: usize,
+    /// Consecutive silent chunks before silence is detected (each chunk = 80ms) [default: 20]
+    #[arg(long)]
+    pub silence_flush: Option<usize>,
 
-    /// Minimum speech chunks before silence detection activates (each chunk = 80ms)
-    #[arg(long, default_value_t = 15)]
-    pub min_speech: usize,
+    /// Minimum speech chunks before silence detection activates (each chunk = 80ms) [default: 15]
+    #[arg(long)]
+    pub min_speech: Option<usize>,
 
-    /// EMA smoothing factor for speech detection (0.0–1.0, lower = smoother)
-    #[arg(long, default_value_t = 0.3)]
-    pub rms_ema: f32,
+    /// EMA smoothing factor for speech detection (0.0–1.0, lower = smoother) [default: 0.3]
+    #[arg(long)]
+    pub rms_ema: Option<f32>,
 
     // ---- Server flags ----
 
-    /// WebSocket listen port
-    #[arg(long, default_value_t = 8765)]
-    pub port: u16,
+    /// WebSocket listen port [default: 8765]
+    #[arg(long)]
+    pub port: Option<u16>,
 
-    /// Bind address (use 0.0.0.0 with Tailscale; 127.0.0.1 for local dev without TLS)
-    #[arg(long, default_value = "127.0.0.1")]
-    pub bind_addr: String,
+    /// Bind address (use 0.0.0.0 with Tailscale; 127.0.0.1 for local dev without TLS) [default: "127.0.0.1"]
+    #[arg(long)]
+    pub bind_addr: Option<String>,
 
     /// Path to TLS certificate (.crt/.pem). Required for wss:// (Tailscale cert).
     #[arg(long)]
@@ -78,6 +82,7 @@ pub struct Cli {
     /// LoRA adapter directory (accepted and logged; not yet wired — Phase 3)
     #[arg(long)]
     pub lora_adapter: Option<String>,
+
 }
 
 /// Mutable model components — serialised by a single tokio::sync::Mutex.
@@ -98,22 +103,51 @@ pub struct VoxtralModel {
     pub dtype: DType,
 }
 
+/// Validate that a path exists; emit a source-tagged error if not.
+fn check_path(path: &str, source: ValueSource, field: &str) -> Result<()> {
+    if !Path::new(path).exists() {
+        let tag = config::source_tag(source, field);
+        anyhow::bail!("{}: path not found: {}", tag, path);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(ref adapter_dir) = cli.lora_adapter {
+    // Load config file and merge with CLI args (CLI overrides config overrides defaults).
+    config::bootstrap_config_dir()?;
+    let file_config = config::load_config_file()?;
+    let merged = config::merge(&cli, &file_config);
+
+    if let Some(ref adapter_dir) = merged.lora_adapter {
         eprintln!("Note: --lora-adapter '{}' accepted but not yet wired (Phase 3)", adapter_dir);
     }
 
     // Validate delay
-    if cli.delay < 1 || cli.delay > 30 {
-        anyhow::bail!("--delay must be between 1 and 30 (got {})", cli.delay);
+    if merged.delay < 1 || merged.delay > 30 {
+        let tag = config::source_tag(
+            if cli.delay.is_some() { ValueSource::CliArg } else { ValueSource::ConfigFile },
+            "delay",
+        );
+        anyhow::bail!("{}: must be between 1 and 30 (got {})", tag, merged.delay);
+    }
+
+    // Validate model_dir
+    check_path(&merged.model_dir.value, merged.model_dir.source, "model_dir")?;
+
+    // Validate TLS paths if provided
+    if let Some(ref cert) = merged.tls_cert.value {
+        check_path(cert, merged.tls_cert.source, "tls_cert")?;
+    }
+    if let Some(ref key) = merged.tls_key.value {
+        check_path(key, merged.tls_key.source, "tls_key")?;
     }
 
     // mmap safetensors + spawn readahead (gives 0.5–1s head start before CUDA init)
     println!("Loading safetensors...");
-    let st_path = format!("{}/consolidated.safetensors", cli.model_dir);
+    let st_path = format!("{}/consolidated.safetensors", merged.model_dir.value);
     let st_data = Arc::new(unsafe { memmap2::Mmap::map(&fs::File::open(&st_path)?)? });
     let readahead = {
         let data = Arc::clone(&st_data);
@@ -130,27 +164,29 @@ async fn main() -> Result<()> {
     #[cfg(feature = "cuda")]
     candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
 
-    let device = Device::cuda_if_available(cli.device)?;
+    let device = Device::cuda_if_available(merged.device)?;
     let dtype = DType::BF16;
 
     let is_offline = cli.wav_file.is_some();
-    let effective_delay = if is_offline { 20 } else { cli.delay };
+    let effective_delay = if is_offline { 20 } else { merged.delay };
 
     println!("\n{:<28} {}", "Parameter", "Value");
     println!("{:-<28} {:-<32}", "", "");
     println!("{:<28} {} ({}ms){}",
         "Delay tokens", effective_delay, effective_delay * 80,
         if is_offline { " (offline max accuracy)" } else { "" });
-    println!("{:<28} {}", "Silence threshold", cli.silence_threshold);
-    println!("{:<28} {} ({}ms)", "Silence detection", cli.silence_flush, cli.silence_flush * 80);
-    println!("{:<28} {} ({}ms)", "Min speech to activate", cli.min_speech, cli.min_speech * 80);
-    println!("{:<28} {}", "RMS EMA alpha", cli.rms_ema);
+    println!("{:<28} {}", "Silence threshold", merged.silence_threshold);
+    println!("{:<28} {} ({}ms)", "Silence detection", merged.silence_flush, merged.silence_flush * 80);
+    println!("{:<28} {} ({}ms)", "Min speech to activate", merged.min_speech, merged.min_speech * 80);
+    println!("{:<28} {}", "RMS EMA alpha", merged.rms_ema);
     println!("{:<28} {:?}", "Compute dtype", dtype);
     if !is_offline {
-        println!("{:<28} {}:{}", "Listen", cli.bind_addr, cli.port);
-        let tls = cli.tls_cert.is_some() && cli.tls_key.is_some();
+        println!("{:<28} {}:{}", "Listen", merged.bind_addr.value, merged.port);
+        let tls = merged.tls_cert.value.is_some() && merged.tls_key.value.is_some();
         println!("{:<28} {}", "TLS", if tls { "enabled (wss://)" } else { "disabled (ws://)" });
     }
+    println!("{:<28} {}", "Config file", config::config_file_path().display());
+    println!("{:<28} {}", "Custom words", config::custom_words_path().display());
     println!();
 
     let vb = VarBuilder::from_slice_safetensors(&st_data, dtype, &device)?;
@@ -158,7 +194,7 @@ async fn main() -> Result<()> {
     let t_total = Instant::now();
 
     println!("Loading tokenizer...");
-    let tok = tokenizer::Tokenizer::load(&cli.model_dir)?;
+    let tok = tokenizer::Tokenizer::load(&merged.model_dir.value)?;
 
     println!("Loading encoder...");
     let enc = encoder::AudioEncoder::load(&vb, &device, dtype)?;
@@ -172,7 +208,7 @@ async fn main() -> Result<()> {
     println!("Total model load: {:.2}s", t_total.elapsed().as_secs_f64());
     let _ = readahead.join();
 
-    let filters = mel::mel_filters(&cli.model_dir);
+    let filters = mel::mel_filters(&merged.model_dir.value);
 
     match cli.wav_file {
         Some(ref path) => {
@@ -187,7 +223,8 @@ async fn main() -> Result<()> {
                 device,
                 dtype,
             });
-            server::run(model, Arc::new(cli)).await
+            let shared_config = Arc::new(tokio::sync::Mutex::new(file_config));
+            server::run(model, merged, shared_config).await
         }
     }
 }
@@ -322,62 +359,101 @@ fn load_wav(path: &str) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
-// ---- Server module (inline import) ----
+// ---- Server module (inline) ----
 mod server {
     use super::*;
-    use crate::settings::{IniValues, SharedSettings, SILENCE_CHUNKS_DEFAULT, STATE_READY};
+    use crate::config::{save_config_file, SharedConfigFile};
+    use crate::settings::{IniValues, SharedSettings, StartupSnapshot, STATE_READY};
+    use crate::words::WordsCorrector;
     use axum::{
         extract::{State, WebSocketUpgrade},
-        response::Response,
+        http::StatusCode,
+        response::{IntoResponse, Response},
         routing::get,
-        Router,
+        Json, Router,
     };
     use axum::extract::ws::{Message, WebSocket};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower_http::cors::{Any, CorsLayer};
 
-    pub async fn run(model: Arc<VoxtralModel>, cli: Arc<Cli>) -> Result<()> {
+    pub async fn run(
+        model: Arc<VoxtralModel>,
+        merged: MergedConfig,
+        config_file: SharedConfigFile,
+    ) -> Result<()> {
         let vals = IniValues {
-            delay: cli.delay,
-            silence_threshold: cli.silence_threshold,
-            silence_chunks: Some(cli.silence_flush),
+            delay: merged.delay,
+            silence_threshold: merged.silence_threshold,
+            silence_chunks: Some(merged.silence_flush),
             paragraph_delay_offset: 4,
-            min_speech_chunks: cli.min_speech,
-            rms_ema_alpha: cli.rms_ema,
+            min_speech_chunks: merged.min_speech,
+            rms_ema_alpha: merged.rms_ema,
         };
-        let settings = Arc::new(SharedSettings::new(vals, cli.silence_flush));
+        let settings = Arc::new(SharedSettings::new(vals, merged.silence_flush));
         settings.state.store(STATE_READY, Ordering::SeqCst);
 
-        let connection_count = Arc::new(AtomicUsize::new(0));
+        let tls_enabled = merged.tls_cert.value.is_some() && merged.tls_key.value.is_some();
+        let snapshot = StartupSnapshot {
+            model_dir:    merged.model_dir.value.clone(),
+            device:       merged.device,
+            port:         merged.port,
+            bind_addr:    merged.bind_addr.value.clone(),
+            tls_enabled,
+            lora_adapter: merged.lora_adapter.clone(),
+        };
 
-        let state = AppState {
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let words_path = crate::config::custom_words_path();
+        let words = Arc::new(tokio::sync::RwLock::new(
+            WordsCorrector::load(&words_path)
+        ));
+
+        let state = Arc::new(AppState {
             model,
             settings,
-            connection_count: connection_count.clone(),
-        };
+            connection_count,
+            startup_snapshot: snapshot,
+            config_file,
+            words_path,
+            words,
+        });
+
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::PATCH,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers(Any);
 
         let app = Router::new()
             .route("/health", get(health_handler))
-            .route("/asr", get(ws_handler))
-            .with_state(Arc::new(state));
+            .route("/asr",    get(ws_handler))
+            .route("/config", get(config_get_handler).patch(config_patch_handler))
+            .route("/words",  get(words_get_handler).post(words_post_handler))
+            .layer(cors)
+            .with_state(state);
 
-        let addr: std::net::SocketAddr = format!("{}:{}", cli.bind_addr, cli.port)
+        let addr: std::net::SocketAddr = format!("{}:{}", merged.bind_addr.value, merged.port)
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid bind address: {}", e))?;
 
-        let use_tls = cli.tls_cert.is_some() && cli.tls_key.is_some();
-
-        if use_tls {
-            let cert_path = cli.tls_cert.as_ref().unwrap();
-            let key_path = cli.tls_key.as_ref().unwrap();
+        if tls_enabled {
+            let cert_path = merged.tls_cert.value.as_ref().unwrap();
+            let key_path  = merged.tls_key.value.as_ref().unwrap();
             let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await
                 .map_err(|e| anyhow::anyhow!("TLS config error: {}", e))?;
-            println!("=== SCHMIDIspeech server listening on wss://{}:{}/asr ===", cli.bind_addr, cli.port);
+            println!("=== SCHMIDIspeech server listening on wss://{}:{}/asr ===",
+                merged.bind_addr.value, merged.port);
             axum_server::bind_rustls(addr, tls_config)
                 .serve(app.into_make_service())
                 .await?;
         } else {
-            println!("=== SCHMIDIspeech server listening on ws://{}:{}/asr (no TLS) ===", cli.bind_addr, cli.port);
+            println!("=== SCHMIDIspeech server listening on ws://{}:{}/asr (no TLS) ===",
+                merged.bind_addr.value, merged.port);
             axum_server::bind(addr)
                 .serve(app.into_make_service())
                 .await?;
@@ -388,15 +464,23 @@ mod server {
 
     #[derive(Clone)]
     struct AppState {
-        model: Arc<VoxtralModel>,
-        settings: Arc<SharedSettings>,
+        model:            Arc<VoxtralModel>,
+        settings:         Arc<SharedSettings>,
         connection_count: Arc<AtomicUsize>,
+        startup_snapshot: StartupSnapshot,
+        config_file:      SharedConfigFile,
+        words_path:       std::path::PathBuf,
+        words:            Arc<tokio::sync::RwLock<WordsCorrector>>,
     }
 
-    async fn health_handler(State(state): State<Arc<AppState>>) -> axum::response::Json<serde_json::Value> {
+    // ---- /health ----
+
+    async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         let connections = state.connection_count.load(Ordering::Relaxed);
-        axum::response::Json(json!({ "status": "ready", "connections": connections }))
+        Json(json!({ "status": "ready", "connections": connections }))
     }
+
+    // ---- /asr WebSocket ----
 
     async fn ws_handler(
         ws: WebSocketUpgrade,
@@ -420,7 +504,6 @@ mod server {
     async fn handle_asr_session(socket: &mut WebSocket, state: &AppState) -> Result<()> {
         use crate::audio;
         use crate::streaming::{ChunkOutput, StreamingState};
-        use std::sync::atomic::Ordering;
 
         let model = &state.model;
         let settings = &state.settings;
@@ -471,7 +554,8 @@ mod server {
                                 json!({ "type": "partial", "text": text }).to_string()
                             }
                             ChunkOutput::Silence => {
-                                let final_text = stream_state.take_text_buf();
+                                let raw = stream_state.take_text_buf();
+                                let final_text = state.words.read().await.apply(&raw);
                                 json!({ "type": "final", "text": final_text }).to_string()
                             }
                             ChunkOutput::Pad => continue,
@@ -483,9 +567,10 @@ mod server {
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     // Flush remaining buffer as final
-                    let remaining = stream_state.take_text_buf();
-                    if !remaining.is_empty() {
-                        let msg = json!({ "type": "final", "text": remaining }).to_string();
+                    let raw = stream_state.take_text_buf();
+                    if !raw.is_empty() {
+                        let corrected = state.words.read().await.apply(&raw);
+                        let msg = json!({ "type": "final", "text": corrected }).to_string();
                         let _ = socket.send(Message::Text(msg.into())).await;
                     }
                     break;
@@ -499,5 +584,143 @@ mod server {
         }
 
         Ok(())
+    }
+
+    // ---- GET /config ----
+
+    async fn config_get_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+        let s = &state.settings;
+        let snap = &state.startup_snapshot;
+        Json(json!({
+            // Runtime-adjustable — live values from atomics
+            "delay":             s.delay_tokens.load(Ordering::Relaxed),
+            "silence_threshold": s.silence_threshold.load(Ordering::Relaxed),
+            "silence_flush":     s.silence_chunks.load(Ordering::Relaxed),
+            "min_speech":        s.min_speech_chunks.load(Ordering::Relaxed),
+            "rms_ema":           s.rms_ema_alpha.load(Ordering::Relaxed),
+            // Startup-only — from snapshot; changing via PATCH writes config file but requires restart
+            "model_dir":         snap.model_dir,
+            "device":            snap.device,
+            "port":              snap.port,
+            "bind_addr":         snap.bind_addr,
+            "tls_enabled":       snap.tls_enabled,
+            "lora_adapter":      snap.lora_adapter,
+            "_startup_only":     ["model_dir", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter"],
+            "_note":             "Changing startup_only fields writes to config file but requires server restart."
+        }))
+    }
+
+    // ---- PATCH /config ----
+
+    #[derive(serde::Deserialize)]
+    struct ConfigPatch {
+        // Runtime-adjustable
+        delay:             Option<usize>,
+        silence_threshold: Option<f32>,
+        silence_flush:     Option<usize>,
+        min_speech:        Option<usize>,
+        rms_ema:           Option<f32>,
+        // Startup-only (written to file, restart required)
+        model_dir:    Option<String>,
+        device:       Option<usize>,
+        port:         Option<u16>,
+        bind_addr:    Option<String>,
+        tls_cert:     Option<String>,
+        tls_key:      Option<String>,
+        lora_adapter: Option<String>,
+    }
+
+    async fn config_patch_handler(
+        State(state): State<Arc<AppState>>,
+        Json(patch): Json<ConfigPatch>,
+    ) -> Response {
+        // Validate ranges for runtime fields
+        if let Some(d) = patch.delay {
+            if d < 1 || d > 30 {
+                return (StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("delay must be between 1 and 30, got {}", d)).into_response();
+            }
+        }
+        if let Some(r) = patch.rms_ema {
+            if !(0.0..=1.0).contains(&r) {
+                return (StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("rms_ema must be between 0.0 and 1.0, got {}", r)).into_response();
+            }
+        }
+
+        // Apply runtime params to atomics immediately
+        let s = &state.settings;
+        if let Some(v) = patch.delay             { s.delay_tokens.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.silence_threshold { s.silence_threshold.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.silence_flush     { s.silence_chunks.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.min_speech        { s.min_speech_chunks.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.rms_ema           { s.rms_ema_alpha.store(v, Ordering::SeqCst); }
+
+        // Update config file under lock and persist to disk
+        {
+            let mut cfg = state.config_file.lock().await;
+            if patch.delay.is_some()             { cfg.delay             = patch.delay; }
+            if patch.silence_threshold.is_some() { cfg.silence_threshold = patch.silence_threshold; }
+            if patch.silence_flush.is_some()     { cfg.silence_flush     = patch.silence_flush; }
+            if patch.min_speech.is_some()        { cfg.min_speech        = patch.min_speech; }
+            if patch.rms_ema.is_some()           { cfg.rms_ema           = patch.rms_ema; }
+            if patch.model_dir.is_some()         { cfg.model_dir         = patch.model_dir; }
+            if patch.device.is_some()            { cfg.device            = patch.device; }
+            if patch.port.is_some()              { cfg.port              = patch.port; }
+            if patch.bind_addr.is_some()         { cfg.bind_addr         = patch.bind_addr; }
+            if patch.tls_cert.is_some()          { cfg.tls_cert          = patch.tls_cert; }
+            if patch.tls_key.is_some()           { cfg.tls_key           = patch.tls_key; }
+            if patch.lora_adapter.is_some()      { cfg.lora_adapter      = patch.lora_adapter; }
+
+            if let Err(e) = save_config_file(&cfg) {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to persist config: {}", e)).into_response();
+            }
+        }
+
+        config_get_handler(State(state)).await.into_response()
+    }
+
+    // ---- GET /words ----
+
+    async fn words_get_handler(State(state): State<Arc<AppState>>) -> Response {
+        let corrector = state.words.read().await;
+        Json(json!({ "words": corrector.raw_lines })).into_response()
+    }
+
+    // ---- POST /words ----
+
+    #[derive(serde::Deserialize)]
+    struct WordsPatch {
+        add:    Option<Vec<String>>,
+        remove: Option<Vec<String>>,
+    }
+
+    async fn words_post_handler(
+        State(state): State<Arc<AppState>>,
+        Json(body): Json<WordsPatch>,
+    ) -> Response {
+        // Read current words into a sorted, deduplicated set
+        let content = tokio::fs::read_to_string(&state.words_path).await.unwrap_or_default();
+        let mut words: std::collections::BTreeSet<String> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for w in body.add.unwrap_or_default() { words.insert(w); }
+        for w in body.remove.unwrap_or_default() { words.remove(&w); }
+
+        let new_content = words.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n") + "\n";
+        match tokio::fs::write(&state.words_path, new_content).await {
+            Ok(_) => {
+                // Rebuild the in-memory corrector from the updated file
+                let new_corrector = WordsCorrector::load(&state.words_path);
+                let raw_lines = new_corrector.raw_lines.clone();
+                *state.words.write().await = new_corrector;
+                Json(json!({ "words": raw_lines })).into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
     }
 }

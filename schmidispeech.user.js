@@ -125,38 +125,166 @@
         display: 'none',
         flexDirection: 'column',
         gap: '8px',
-        minWidth: '280px',
+        minWidth: '300px',
         boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
         fontSize: '13px',
     });
+
+    const INPUT_STYLE = 'background:#2a2a2a;color:#ddd;border:1px solid #555;border-radius:6px;padding:6px 8px;font-size:13px;width:100%;box-sizing:border-box;outline:none;';
+    const LABEL_STYLE = 'color:#aaa;font-size:11px;';
+    const BTN_CANCEL  = 'background:#333;color:#aaa;border:1px solid #555;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;';
+    const BTN_PRIMARY = 'background:#2980b9;color:#fff;border:none;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;';
+
     configPanel.innerHTML = `
-        <div style="font-weight:bold;margin-bottom:4px;">SCHMIDIspeech — Einstellungen</div>
-        <div style="color:#aaa;font-size:11px;">Server URL</div>
-        <input id="schmidi-url-input" type="text" style="
-            background:#2a2a2a; color:#ddd; border:1px solid #555;
-            border-radius:6px; padding:6px 8px; font-size:13px; width:100%;
-            box-sizing:border-box; outline:none;
-        "/>
-        <div style="color:#aaa;font-size:11px;">Tastenkürzel (z.B. ctrl+shift+d, alt+s)</div>
-        <input id="schmidi-hotkey-input" type="text" style="
-            background:#2a2a2a; color:#ddd; border:1px solid #555;
-            border-radius:6px; padding:6px 8px; font-size:13px; width:100%;
-            box-sizing:border-box; outline:none;
-        "/>
-        <div style="display:flex;gap:8px;justify-content:flex-end;">
-            <button id="schmidi-cancel" style="
-                background:#333;color:#aaa;border:1px solid #555;
-                border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;">Abbrechen</button>
-            <button id="schmidi-save" style="
-                background:#2980b9;color:#fff;border:none;
-                border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;">Speichern</button>
+        <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech — Einstellungen</div>
+        <div style="display:flex;gap:0;border-bottom:1px solid #444;margin-bottom:4px;">
+            <button id="schmidi-tab-client" style="background:none;border:none;border-bottom:2px solid #2980b9;color:#ddd;padding:4px 10px;cursor:pointer;font-size:12px;font-weight:bold;">Client</button>
+            <button id="schmidi-tab-server" style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 10px;cursor:pointer;font-size:12px;">Server</button>
+        </div>
+
+        <!-- Client tab -->
+        <div id="schmidi-pane-client" style="display:flex;flex-direction:column;gap:8px;">
+            <div style="${LABEL_STYLE}">Server URL</div>
+            <input id="schmidi-url-input" type="text" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Tastenkürzel (z.B. ctrl+shift+d, alt+s)</div>
+            <input id="schmidi-hotkey-input" type="text" style="${INPUT_STYLE}"/>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="schmidi-cancel" style="${BTN_CANCEL}">Abbrechen</button>
+                <button id="schmidi-save-client" style="${BTN_PRIMARY}">Speichern</button>
+            </div>
+        </div>
+
+        <!-- Server tab -->
+        <div id="schmidi-pane-server" style="display:none;flex-direction:column;gap:6px;">
+            <div style="${LABEL_STYLE}">Delay tokens (1–30, je 80ms)</div>
+            <input id="schmidi-delay" type="number" min="1" max="30" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Silence threshold (RMS)</div>
+            <input id="schmidi-silence-threshold" type="number" step="0.001" min="0" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Silence detection chunks (je 80ms)</div>
+            <input id="schmidi-silence-flush" type="number" min="1" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Min speech chunks (je 80ms)</div>
+            <input id="schmidi-min-speech" type="number" min="1" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">RMS EMA alpha (0.0–1.0)</div>
+            <input id="schmidi-rms-ema" type="number" step="0.01" min="0" max="1" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE};margin-top:4px;">Eigene Wörter (ein Wort pro Zeile)</div>
+            <textarea id="schmidi-words" rows="5" style="${INPUT_STYLE}font-family:monospace;resize:vertical;"></textarea>
+            <div id="schmidi-server-status" style="color:#aaa;font-size:11px;min-height:14px;"></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="schmidi-cancel2" style="${BTN_CANCEL}">Abbrechen</button>
+                <button id="schmidi-save-words" style="${BTN_CANCEL}">Wörter speichern</button>
+                <button id="schmidi-save-server" style="${BTN_PRIMARY}">Params speichern</button>
+            </div>
         </div>
     `;
     document.body.appendChild(configPanel);
 
+    // ---- Tab switching ----
+    function switchTab(tab) {
+        const isClient = (tab === 'client');
+        configPanel.querySelector('#schmidi-pane-client').style.display = isClient ? 'flex' : 'none';
+        configPanel.querySelector('#schmidi-pane-server').style.display = isClient ? 'none' : 'flex';
+        configPanel.querySelector('#schmidi-tab-client').style.borderBottomColor = isClient ? '#2980b9' : 'transparent';
+        configPanel.querySelector('#schmidi-tab-client').style.color = isClient ? '#ddd' : '#888';
+        configPanel.querySelector('#schmidi-tab-server').style.borderBottomColor = isClient ? 'transparent' : '#2980b9';
+        configPanel.querySelector('#schmidi-tab-server').style.color = isClient ? '#888' : '#ddd';
+    }
+    configPanel.querySelector('#schmidi-tab-client').addEventListener('click', () => switchTab('client'));
+    configPanel.querySelector('#schmidi-tab-server').addEventListener('click', () => {
+        switchTab('server');
+        loadServerConfig();
+    });
+
+    // ---- HTTP helpers ----
+    function getHttpBase() {
+        return getServerUrl()
+            .replace(/^ws(s?):\/\//, 'http$1://')
+            .replace(/\/asr$/, '');
+    }
+
+    function setServerStatus(msg, isError) {
+        const el = configPanel.querySelector('#schmidi-server-status');
+        if (el) { el.textContent = msg; el.style.color = isError ? '#e74c3c' : '#aaa'; }
+    }
+
+    async function loadServerConfig() {
+        setServerStatus('Lade Server-Einstellungen…', false);
+        try {
+            const [cfgRes, wordsRes] = await Promise.all([
+                fetch(`${getHttpBase()}/config`),
+                fetch(`${getHttpBase()}/words`),
+            ]);
+            if (!cfgRes.ok) throw new Error('GET /config: ' + cfgRes.status);
+            const cfg = await cfgRes.json();
+            configPanel.querySelector('#schmidi-delay').value            = cfg.delay            ?? '';
+            configPanel.querySelector('#schmidi-silence-threshold').value = cfg.silence_threshold ?? '';
+            configPanel.querySelector('#schmidi-silence-flush').value    = cfg.silence_flush    ?? '';
+            configPanel.querySelector('#schmidi-min-speech').value       = cfg.min_speech       ?? '';
+            configPanel.querySelector('#schmidi-rms-ema').value          = cfg.rms_ema          ?? '';
+
+            if (wordsRes.ok) {
+                const w = await wordsRes.json();
+                configPanel.querySelector('#schmidi-words').value = (w.words || []).join('\n');
+            }
+            setServerStatus('', false);
+        } catch (e) {
+            setServerStatus('Fehler: ' + e.message, true);
+        }
+    }
+
+    async function saveServerParams() {
+        const patch = {
+            delay:             parseInt(configPanel.querySelector('#schmidi-delay').value) || undefined,
+            silence_threshold: parseFloat(configPanel.querySelector('#schmidi-silence-threshold').value) || undefined,
+            silence_flush:     parseInt(configPanel.querySelector('#schmidi-silence-flush').value) || undefined,
+            min_speech:        parseInt(configPanel.querySelector('#schmidi-min-speech').value) || undefined,
+            rms_ema:           parseFloat(configPanel.querySelector('#schmidi-rms-ema').value) || undefined,
+        };
+        // Remove undefined keys
+        Object.keys(patch).forEach(k => patch[k] === undefined && delete patch[k]);
+        setServerStatus('Speichere…', false);
+        try {
+            const res = await fetch(`${getHttpBase()}/config`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(patch),
+            });
+            if (!res.ok) throw new Error(await res.text());
+            setServerStatus('Gespeichert ✓', false);
+        } catch (e) {
+            setServerStatus('Fehler: ' + e.message, true);
+        }
+    }
+
+    async function saveWords() {
+        const lines = configPanel.querySelector('#schmidi-words').value
+            .split('\n').map(s => s.trim()).filter(Boolean);
+        setServerStatus('Speichere Wörter…', false);
+        try {
+            // Compute diff against current state: fetch current list, then add/remove
+            const wordsRes = await fetch(`${getHttpBase()}/words`);
+            const current = wordsRes.ok ? (await wordsRes.json()).words || [] : [];
+            const newSet  = new Set(lines);
+            const curSet  = new Set(current);
+            const add     = lines.filter(w => !curSet.has(w));
+            const remove  = current.filter(w => !newSet.has(w));
+            const res = await fetch(`${getHttpBase()}/words`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ add, remove }),
+            });
+            if (!res.ok) throw new Error(await res.text());
+            setServerStatus(`Wörter gespeichert ✓ (${lines.length} Einträge)`, false);
+        } catch (e) {
+            setServerStatus('Fehler: ' + e.message, true);
+        }
+    }
+
+    // ---- Config panel actions ----
+
     function openConfig() {
         configPanel.querySelector('#schmidi-url-input').value = getServerUrl();
         configPanel.querySelector('#schmidi-hotkey-input').value = getHotkey();
+        switchTab('client');
         configPanel.style.display = 'flex';
         configPanel.querySelector('#schmidi-url-input').focus();
         configPanel.querySelector('#schmidi-url-input').select();
@@ -164,7 +292,9 @@
     function closeConfig() { configPanel.style.display = 'none'; }
 
     configPanel.querySelector('#schmidi-cancel').addEventListener('click', closeConfig);
-    configPanel.querySelector('#schmidi-save').addEventListener('click', () => {
+    configPanel.querySelector('#schmidi-cancel2').addEventListener('click', closeConfig);
+
+    configPanel.querySelector('#schmidi-save-client').addEventListener('click', () => {
         const url = configPanel.querySelector('#schmidi-url-input').value.trim();
         const hk  = configPanel.querySelector('#schmidi-hotkey-input').value.trim();
         if (url) setServerUrl(url);
@@ -173,12 +303,18 @@
         showToast('Einstellungen gespeichert');
         closeConfig();
     });
+
+    configPanel.querySelector('#schmidi-save-server').addEventListener('click', saveServerParams);
+    configPanel.querySelector('#schmidi-save-words').addEventListener('click', saveWords);
+
     configPanel.querySelectorAll('input').forEach((input) => {
         input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') configPanel.querySelector('#schmidi-save').click();
             if (e.key === 'Escape') closeConfig();
             e.stopPropagation();
         });
+    });
+    configPanel.querySelector('#schmidi-words').addEventListener('keydown', (e) => {
+        e.stopPropagation();
     });
     document.addEventListener('click', (e) => {
         if (!configPanel.contains(e.target) && e.target !== btn) closeConfig();

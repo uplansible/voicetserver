@@ -7,6 +7,10 @@ use base64::Engine;
 
 pub const BOS_ID: u32 = 1;
 pub const EOS_ID: u32 = 2;
+#[allow(dead_code)]
+pub const AUDIO_ID: u32 = 24;        // audio frame token (encoder output marker)
+#[allow(dead_code)]
+pub const BEGIN_AUDIO_ID: u32 = 25;  // begin-audio boundary token
 pub const STREAMING_PAD_ID: u32 = 32;
 pub const STREAMING_WORD_ID: u32 = 33;
 

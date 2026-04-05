@@ -22,6 +22,18 @@ impl AtomicF32 {
     }
 }
 
+/// Read-only snapshot of startup parameters — included in GET /config responses.
+/// These cannot be changed at runtime; a server restart is required.
+#[derive(serde::Serialize, Clone)]
+pub struct StartupSnapshot {
+    pub model_dir:    String,
+    pub device:       usize,
+    pub port:         u16,
+    pub bind_addr:    String,
+    pub tls_enabled:  bool,
+    pub lora_adapter: Option<String>,
+}
+
 /// Inference parameters shared across all WebSocket connections.
 pub struct SharedSettings {
     pub silence_threshold: AtomicF32,

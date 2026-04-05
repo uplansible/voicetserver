@@ -20,6 +20,8 @@ CUDA_COMPUTE_CAP=89 cargo build --release --features cuda
 
 Binary: `target/release/voicetserver`
 
+Versioned local copies: `releases/v<version>/voicetserver` (not committed, gitignored)
+
 # Test
 
 ## Offline WAV
@@ -46,6 +48,8 @@ curl http://127.0.0.1:8765/health
   --tls-key  /etc/tailscale/certs/<host>.key
 ```
 
+All settings can also be stored in `~/.config/voicetserver/config.toml` instead of passing CLI flags.
+
 # Features
 
 - `default = []` — no CUDA; dev builds always work without nvcc
@@ -63,12 +67,24 @@ Required in `--model-dir`:
 
 Download from HuggingFace: `mistralai/Voxtral-Mini-4B-Realtime-2602`
 
+## Model language behaviour
+
+Voxtral Mini 4B Realtime has **no language token mechanism**. It auto-detects language from the audio signal. There is no way to force a specific language — the model will transcribe in whatever language it hears. Confirmed by inspecting `tekken.json` (no `added_tokens`) and the reference C implementation (antirez/voxtral.c).
+
+Known special token IDs (all others in 0–999 are skipped as audio control tokens):
+- `BOS = 1`, `EOS = 2`
+- `AUDIO = 24`, `BEGIN_AUDIO = 25` — audio frame boundary markers
+- `STREAMING_PAD = 32` — silence/padding
+- `STREAMING_WORD = 33` — word boundary control token
+
 # Architecture
 
-- `src/main.rs` — tokio entry point; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex)
+- `src/main.rs` — tokio entry point; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers
 - `src/streaming.rs` — `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
-- `src/server.rs` — axum 0.8 WebSocket handler + TLS via axum-server 0.8 + rustls
+- `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
+- `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`
+- `src/settings.rs` — `SharedSettings` (atomic runtime params) + `StartupSnapshot`
 - `src/encoder.rs` / `src/decoder.rs` — Voxtral model; flash-attn behind `#[cfg(feature = "cuda")]`
 - `src/session.rs` — Phase 2 stub (patient session vocabulary)
 - `src/macros.rs` — Phase 4 stub (macro expansion)
@@ -78,24 +94,69 @@ GPU lock: single `tokio::sync::Mutex<ModelInner>` wrapping both enc and dec.
 Acquire → do all sync Candle work → release before every `.await`.
 Use `let inner = &mut *guard;` to enable disjoint field borrows (enc, dec).
 
+# Config file
+
+`~/.config/voicetserver/config.toml` — created automatically with commented template on first run.
+CLI args override config file values. Unknown fields in the config file are silently ignored.
+
+Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`.
+
+Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`.
+
+# Custom words
+
+`~/.config/voicetserver/custom_words.txt` — one entry per line:
+- `wrong=correct` — replacement pair: every occurrence of `wrong` in transcribed text is replaced with `correct`
+- `PlainTerm` — stored as-is, no correction effect yet (Phase 3 vocab boosting)
+- `# comment` — ignored
+
+The aho-corasick automaton is built at startup and hot-reloaded whenever `POST /words` updates the file. No restart required.
+
+Example: add `Migration=Miktion` to correct a model phonetic confusion.
+
+# HTTP API
+
+All endpoints support CORS (`allow_origin: *`).
+
+- `GET /health` — `{"status":"ready","connections":N}`
+- `GET /config` — current settings (runtime + startup snapshot)
+- `PATCH /config` — update settings; runtime params apply immediately, startup params written to file
+- `GET /words` — `{"words":[...]}`
+- `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
+- `ws[s]://host:port/asr` — WebSocket audio stream (raw f32 LE PCM 16kHz mono)
+
 # Browser client
 
 `schmidispeech.user.js` — Violentmonkey userscript.
 Sends raw 16kHz mono f32 LE PCM over WebSocket binary frames.
 Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}`.
 
-Server URL stored via `GM_setValue('server_url', 'wss://...:8765/asr')`.
+Server URL and hotkey stored via `GM_setValue` (`server_url`, `hotkey`).
+Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Client tab).
+Text is inserted live at cursor on each `final`; trailing partial inserted on stop.
+Falls back to clipboard if no editable element was captured.
+
+Right-click → **Server tab**: edit runtime params and custom words directly from the browser.
+
+## Silence / final message behaviour
+
+`ChunkOutput::Silence` fires after silence threshold; server calls `take_text_buf()` which
+returns and clears the accumulated text. Do NOT call `self.text_buf.clear()` before this —
+it would cause every silence-triggered final to send empty text.
+
+Custom word correction is applied to the text returned by `take_text_buf()` before sending.
 
 # Folder structure
 
 - `src/` — Rust source
 - `assets/mel_filters.bin` — precomputed mel filterbank (commit this)
-- `config/medical_terms_de.txt` — German medical seed terms
+- `config/medical_terms_de.txt` — German medical seed terms (source list; not auto-loaded — add entries to `~/.config/voicetserver/custom_words.txt`)
 - `docs/ubuntu_dependencies.md` — package list by phase
 - `scripts/generate_mel_filters.py` — mel filterbank generator (pure Python, no deps)
 - `schmidispeech.user.js` — browser userscript
 - `candle-fork/` — vendored Candle
 - `README.private.md` — private deploy notes (gitignored)
+- `releases/` — local versioned binary copies (gitignored)
 
 # Versioning
 
