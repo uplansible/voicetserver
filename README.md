@@ -38,14 +38,6 @@ KEY="$CERT_DIR/$SERVER_HOST.key"
 WSS_URL="wss://$SERVER_HOST:8765/asr"
 ```
 
-> **Why variables?**
-> Every path and hostname appears in a dozen commands throughout this guide.
-> Defining them once at the top means you change one line instead of hunting
-> through every `scp`, `curl`, and `--tls-cert` flag when you move to a new
-> server or tailnet. It also makes copy-pasting commands safe — no risk of
-> accidentally leaving a placeholder like `gpu-server.your-tailnet.ts.net`
-> in a real command.
-
 ---
 
 ## Build
@@ -66,7 +58,7 @@ export CUDA_PATH=/usr/local/cuda
 export PATH=$CUDA_PATH/bin:$PATH
 CUDA_COMPUTE_CAP=89 cargo build --release --features cuda
 # Replace 89 with your GPU's compute capability:
-#   Ada Lovelace (RTX 4000/4090 etc) = 89
+#   Ada Lovelake (RTX 4000/4090 etc) = 89
 #   Ampere (RTX 3000 series)         = 86
 #   Turing (RTX 2000 series)         = 75
 ```
@@ -138,6 +130,30 @@ echo "0 3 * * 1 root tailscale cert $SERVER_HOST && chown $SERVER_USER:$SERVER_U
 
 ---
 
+## Config file
+
+All CLI flags can be set in `~/.config/voicetserver/config.toml` (created automatically
+with a commented template on first run). CLI flags override config file values.
+
+```toml
+model_dir  = "/path/to/Voxtral-Mini-4B-Realtime"
+bind_addr  = "0.0.0.0"
+tls_cert   = "/etc/tailscale/certs/host.crt"
+tls_key    = "/etc/tailscale/certs/host.key"
+venv_path  = "/path/to/voicetserver-venv"   # Python venv for LoRA training
+
+delay             = 6
+silence_threshold = 0.006
+silence_flush     = 20
+min_speech        = 15
+rms_ema           = 0.3
+```
+
+Runtime-adjustable without restart: `delay`, `silence_threshold`, `silence_flush`,
+`min_speech`, `rms_ema` (via `PATCH /config` or the Server tab in the browser UI).
+
+---
+
 ## Start the server
 
 **Development (no TLS, localhost only):**
@@ -178,13 +194,67 @@ curl https://"$SERVER_HOST":8765/health
    GM_setValue('server_url', 'wss://gpu-server.your-tailnet.ts.net:8765/asr');
    // Dev: GM_setValue('server_url', 'ws://127.0.0.1:8765/asr');
    ```
-   You only need to do this once — Violentmonkey stores the value permanently.
 4. A microphone button appears at the bottom-right of every page.
-5. Click to dictate. Partial results appear in a tooltip; final text is injected
-   into the active input field when a pause is detected.
+5. Click (or press `Ctrl+Shift+D`) to dictate. Partial results appear in an overlay;
+   final text is injected into the active input field when a pause is detected.
 
-**Audio format (Phase 1):** raw 16kHz mono f32 LE PCM over WebSocket.
-Opus/WebM support planned for Phase 3.
+**Right-click the button** to open the settings panel:
+- **Client tab** — server URL, hotkey
+- **Server tab** — live inference parameters, custom word corrections
+- **Training tab** — LoRA voice calibration (record sentences, trigger fine-tuning)
+
+---
+
+## LoRA voice calibration (Phase 2)
+
+Fine-tune the decoder on your own voice and vocabulary without retraining the full model.
+
+### 1. Install the Python venv (one-time, on the GPU server)
+
+Put the venv on a partition with sufficient free space (torch + CUDA libs ≈ 5 GB):
+
+```bash
+VENV="/path/to/voicetserver-venv"   # e.g. /mnt/data/voicetserver-venv
+python3 -m venv $VENV
+mkdir -p $VENV/tempdir
+TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir -r tools/requirements.txt
+```
+
+Add to `~/.config/voicetserver/config.toml`:
+```toml
+venv_path = "/path/to/voicetserver-venv"
+```
+
+### 2. Add calibration sentences
+
+Copy the sample sentences from the repo:
+```bash
+cp assets/training_sentences.txt ~/.config/voicetserver/training_sentences.txt
+```
+Edit the file to add your own domain-specific terms and phrases (one per line).
+
+### 3. Collect training pairs
+
+Open the **Training tab** in the browser UI:
+- Browse through sentences with Prev/Next
+- Click **Aufnehmen** to record yourself reading the sentence
+- Edit the transcript if needed, then click **Speichern**
+- Repeat for as many sentences as you like (20–50 pairs is a reasonable start)
+
+Audio is saved to `~/.config/voicetserver/training/`.
+
+### 4. Train
+
+Click **LoRA trainieren** in the Training tab (or `POST /training/run`).
+The server runs `tools/train_lora.py` and streams progress to the log area.
+The adapter is saved to `~/.config/voicetserver/lora_adapter/`.
+
+### 5. Load the adapter
+
+Add to `~/.config/voicetserver/config.toml` and restart the server:
+```toml
+lora_adapter = "/home/youruser/.config/voicetserver/lora_adapter"
+```
 
 ---
 
@@ -203,7 +273,8 @@ Opus/WebM support planned for Phase 3.
 | `--bind-addr` | `127.0.0.1` | Bind address (`0.0.0.0` for Tailscale) |
 | `--tls-cert` | *(none)* | Path to TLS cert — enables `wss://` |
 | `--tls-key` | *(none)* | Path to TLS private key |
-| `--lora-adapter` | *(none)* | LoRA adapter dir (Phase 3, not yet wired) |
+| `--lora-adapter` | *(none)* | Path to LoRA adapter directory |
+| `--venv-path` | *(none)* | Python venv for LoRA training |
 
 ---
 
@@ -219,7 +290,12 @@ voicetserver (Rust, headless, multi-connection)
   ├─ GPU lock: tokio::sync::Mutex<ModelInner> — serial forward passes
   ├─ Per-connection: StreamingState { KV caches, SilenceDetector, mel buffer }
   ├─ Mel + Voxtral inference (Candle, BF16, Flash Attention 2)
+  ├─ LoRA: optional decoder adapter (lora.rs) loaded at startup
   └─ WebSocket: {"type":"partial","text":"..."} / {"type":"final","text":"..."}
+
+Training pipeline (POST /training/run):
+  Browser Training tab → audio pairs → tools/train_lora.py (PyTorch)
+  → adapter_model.safetensors → reload server with lora_adapter config
 ```
 
 ---
@@ -230,9 +306,9 @@ voicetserver (Rust, headless, multi-connection)
 |-------|--------|-------------|
 | 0 | ✅ Done | Strip desktop GUI/input layer; dev build without CUDA |
 | 1 | ✅ Done | WebSocket server + TLS, raw PCM audio, Violentmonkey userscript |
-| 2 | Planned | Patient session vocabulary |
-| 3 | Planned | Voice calibration, correction dictionary, LoRA fine-tuning |
-| 4 | Planned | Macro expansion, review mode |
-| 5 | Ideas | Scaling, cert renewal automation, AMD fallback |
+| 2 | ✅ Done | LoRA adapter loading, training pipeline, custom word corrections |
+| 3 | Planned | Opus/WebM streaming, macro expansion |
+| 4 | Planned | Patient session vocabulary |
+| 5 | Ideas | Scaling, AMD fallback, automated cert renewal |
 
 See `TASKS.md` for detailed task tracking.
