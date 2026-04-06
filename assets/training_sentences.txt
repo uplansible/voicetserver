@@ -1,0 +1,24 @@
+# SCHMIDIspeech — Kalibrierungssätze (German medical)
+# Copy this file to ~/.config/voicetserver/training_sentences.txt to use it.
+# One sentence per line. Lines starting with # are ignored.
+
+Miktion, Defäkation und Miktionsbeschwerden
+Blutdruck einhundertdreißig zu achtzig Millimeter Quecksilber
+Herzfrequenz siebenundsechzig Schläge pro Minute
+Der Patient klagt über Dysurie und Pollakisurie
+Nierenfunktion mit einer Kreatinin von eins Komma zwei
+Echokardiographie zeigt eine gute linksventrikuläre Funktion
+Hämoglobin elf Komma vier Gramm pro Deziliter
+Die Abdomensonographie ergab keine pathologischen Befunde
+Bronchoskopie mit Lavage und Biopsieentnahme
+Arterieller Blutgasanalyse im Normbereich
+Elektrokardiogramm ohne Zeichen einer Ischämie
+Spirometrie ergibt eine leichte obstruktive Ventilationsstörung
+Computertomographie des Thorax mit Kontrastmittel
+Kolonoskopie bis zum Zökum problemlos durchführbar
+Magenspiegelung zeigt eine flache Erosion im Antrum
+Liquorpunktion ergab einen klaren Liquor ohne Pleozytose
+Schilddrüsenwerte TSH im Normbereich bei unauffälliger Sonographie
+Orthopädische Untersuchung der Lendenwirbelsäule mit Bewegungseinschränkung
+Neurologischer Status: Hirnnerven intakt, keine Paresen
+Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden

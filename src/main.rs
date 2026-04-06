@@ -778,28 +778,12 @@ mod server {
 
     // ---- Training data collection ----
 
-    // Default German medical sentences for voice calibration (written to disk on first request)
+    // Stub written to disk on first request — points user to the sample file in the repo
     const DEFAULT_TRAINING_SENTENCES: &str = "\
-Miktion, Defäkation und Miktionsbeschwerden
-Blutdruck einhundertdreißig zu achtzig Millimeter Quecksilber
-Herzfrequenz siebenundsechzig Schläge pro Minute
-Der Patient klagt über Dysurie und Pollakisurie
-Nierenfunktion mit einer Kreatinin von eins Komma zwei
-Echokardiographie zeigt eine gute linksventrikuläre Funktion
-Hämoglobin elf Komma vier Gramm pro Deziliter
-Die Abdomensonographie ergab keine pathologischen Befunde
-Bronchoskopie mit Lavage und Biopsieentnahme
-Arterieller Blutgasanalyse im Normbereich
-Elektrokardiogramm ohne Zeichen einer Ischämie
-Spirometrie ergibt eine leichte obstruktive Ventilationsstörung
-Computertomographie des Thorax mit Kontrastmittel
-Kolonoskopie bis zum Zökum problemlos durchführbar
-Magenspiegelung zeigt eine flache Erosion im Antrum
-Liquorpunktion ergab einen klaren Liquor ohne Pleozytose
-Schilddrüsenwerte TSH im Normbereich bei unauffälliger Sonographie
-Orthopädische Untersuchung der Lendenwirbelsäule mit Bewegungseinschränkung
-Neurologischer Status: Hirnnerven intakt, keine Paresen
-Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
+# SCHMIDIspeech — Kalibrierungssätze
+# Dies ist eine Stub-Datei. Beispielsätze findest du in:
+# assets/training_sentences.txt im GitHub-Repository
+# Füge eigene Sätze hier ein (einen pro Zeile, # für Kommentare).\
 ";
 
     /// GET /training/sentences — returns list of calibration sentences
