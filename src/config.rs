@@ -45,6 +45,7 @@ pub struct ConfigFile {
     pub tls_cert:     Option<String>,
     pub tls_key:      Option<String>,
     pub lora_adapter: Option<String>,
+    pub venv_path:    Option<String>,
     // Runtime-adjustable via PATCH /config
     pub delay:             Option<usize>,
     pub silence_threshold: Option<f32>,
@@ -71,6 +72,7 @@ pub struct MergedConfig {
     pub device:       usize,
     pub port:         u16,
     pub lora_adapter: Option<String>,
+    pub venv_path:    Option<String>,
     // Runtime-adjustable
     pub delay:             usize,
     pub silence_threshold: f32,
@@ -131,6 +133,7 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # tls_cert = "/etc/tailscale/certs/host.crt"
 # tls_key  = "/etc/tailscale/certs/host.key"
 # device = 0
+# venv_path = "/mnt/ssdupl/voicetserver-venv"   # Python venv for LoRA training
 
 # delay = 4
 # silence_threshold = 0.006
@@ -225,6 +228,7 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let (tls_cert_val, tls_cert_src) = merge_opt_str(&cli.tls_cert, &file.tls_cert);
     let (tls_key_val,  tls_key_src)  = merge_opt_str(&cli.tls_key,  &file.tls_key);
     let lora_adapter = cli.lora_adapter.clone().or_else(|| file.lora_adapter.clone());
+    let venv_path    = cli.venv_path.clone().or_else(|| file.venv_path.clone());
 
     MergedConfig {
         model_dir: Sourced { value: model_dir_val, source: model_dir_src },
@@ -234,6 +238,7 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         device,
         port,
         lora_adapter,
+        venv_path,
         delay,
         silence_threshold,
         silence_flush,

@@ -80,9 +80,13 @@ pub struct Cli {
     #[arg(long)]
     pub tls_key: Option<String>,
 
-    /// LoRA adapter directory (accepted and logged; not yet wired — Phase 3)
+    /// LoRA adapter directory
     #[arg(long)]
     pub lora_adapter: Option<String>,
+
+    /// Python venv for LoRA training (e.g. /mnt/ssdupl/voicetserver-venv)
+    #[arg(long)]
+    pub venv_path: Option<String>,
 
 }
 
@@ -434,6 +438,7 @@ mod server {
             bind_addr:    merged.bind_addr.value.clone(),
             tls_enabled,
             lora_adapter: merged.lora_adapter.clone(),
+            venv_path:    merged.venv_path.clone(),
         };
 
         let connection_count = Arc::new(AtomicUsize::new(0));
@@ -649,7 +654,8 @@ mod server {
             "bind_addr":         snap.bind_addr,
             "tls_enabled":       snap.tls_enabled,
             "lora_adapter":      snap.lora_adapter,
-            "_startup_only":     ["model_dir", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter"],
+            "venv_path":         snap.venv_path,
+            "_startup_only":     ["model_dir", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter", "venv_path"],
             "_note":             "Changing startup_only fields writes to config file but requires server restart."
         }))
     }
@@ -672,6 +678,7 @@ mod server {
         tls_cert:     Option<String>,
         tls_key:      Option<String>,
         lora_adapter: Option<String>,
+        venv_path:    Option<String>,
     }
 
     async fn config_patch_handler(
@@ -715,6 +722,7 @@ mod server {
             if patch.tls_cert.is_some()          { cfg.tls_cert          = patch.tls_cert; }
             if patch.tls_key.is_some()           { cfg.tls_key           = patch.tls_key; }
             if patch.lora_adapter.is_some()      { cfg.lora_adapter      = patch.lora_adapter; }
+            if patch.venv_path.is_some()         { cfg.venv_path         = patch.venv_path; }
 
             if let Err(e) = save_config_file(&cfg) {
                 return (StatusCode::INTERNAL_SERVER_ERROR,
@@ -917,9 +925,10 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
                 "tools/train_lora.py not found — run server from project root").into_response(),
         };
 
-        let data_dir  = crate::config::training_dir();
-        let model_dir = state.startup_snapshot.model_dir.clone();
+        let data_dir   = crate::config::training_dir();
+        let model_dir  = state.startup_snapshot.model_dir.clone();
         let output_dir = crate::config::lora_output_dir();
+        let venv_path  = state.startup_snapshot.venv_path.clone();
 
         // Ensure training dir exists before passing it to Python
         if !data_dir.exists() {
@@ -934,7 +943,7 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
 
         let training_status = Arc::clone(&state.training_status);
         tokio::spawn(async move {
-            run_training_subprocess(training_status, script, data_dir, model_dir, output_dir).await;
+            run_training_subprocess(training_status, script, data_dir, model_dir, output_dir, venv_path).await;
         });
 
         (StatusCode::ACCEPTED, "Training started").into_response()
@@ -972,34 +981,49 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
     }
 
     fn find_script(rel_path: &str) -> Option<std::path::PathBuf> {
-        // Try working directory first
-        let cwd_path = std::path::Path::new(rel_path);
-        if cwd_path.exists() { return Some(cwd_path.to_path_buf()); }
-        // Try directory of the current executable
+        // 1. Relative to cwd (dev: run from project root)
+        let p = std::path::Path::new(rel_path);
+        if p.exists() { return Some(p.to_path_buf()); }
+        // 2. Relative to binary dir (binary + tools/ deployed together)
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let p = dir.join(rel_path);
                 if p.exists() { return Some(p); }
             }
         }
+        // 3. ~/.config/voicetserver/tools/ (binary-only install)
+        let p = crate::config::config_dir().join(rel_path);
+        if p.exists() { return Some(p); }
         None
     }
 
     /// Locate the Python interpreter to use for training.
-    /// Prefers the venv at tools/.venv (relative to cwd or exe dir) over system python3.
-    fn find_python() -> String {
-        let candidates = [
-            "tools/.venv/bin/python3",
-            "tools/.venv/bin/python",
-        ];
-        for rel in &candidates {
-            if std::path::Path::new(rel).exists() { return rel.to_string(); }
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    let p = dir.join(rel);
-                    if p.exists() { return p.to_string_lossy().into_owned(); }
-                }
+    /// Search order:
+    ///   1. venv_path from config/CLI (explicit — preferred)
+    ///   2. tools/.venv/ relative to cwd  (dev: run from project root)
+    ///   3. tools/.venv/ relative to binary dir
+    ///   4. system python3
+    fn find_python(venv_path: Option<&str>) -> String {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+        // 1. Explicitly configured venv
+        if let Some(venv) = venv_path {
+            candidates.push(std::path::Path::new(venv).join("bin/python3"));
+            candidates.push(std::path::Path::new(venv).join("bin/python"));
+        }
+
+        // 2. tools/.venv relative to cwd (dev workflow)
+        candidates.push(std::path::Path::new("tools/.venv/bin/python3").to_path_buf());
+
+        // 3. tools/.venv relative to binary dir
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("tools/.venv/bin/python3"));
             }
+        }
+
+        for p in &candidates {
+            if p.exists() { return p.to_string_lossy().into_owned(); }
         }
         "python3".to_string()  // fall back to system python3
     }
@@ -1010,6 +1034,7 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
         data_dir: std::path::PathBuf,
         model_dir: String,
         output_dir: std::path::PathBuf,
+        venv_path: Option<String>,
     ) {
         use tokio::io::AsyncBufReadExt;
 
@@ -1018,7 +1043,7 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
             ts.log.push(line);
         };
 
-        let python = find_python();
+        let python = find_python(venv_path.as_deref());
         let mut child = match tokio::process::Command::new(&python)
             .args([
                 script.to_str().unwrap_or("tools/train_lora.py"),

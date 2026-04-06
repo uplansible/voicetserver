@@ -32,6 +32,7 @@ pub struct StartupSnapshot {
     pub bind_addr:    String,
     pub tls_enabled:  bool,
     pub lora_adapter: Option<String>,
+    pub venv_path:    Option<String>,
 }
 
 /// Inference parameters shared across all WebSocket connections.
