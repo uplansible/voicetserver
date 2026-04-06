@@ -118,36 +118,20 @@ def audio_to_mel(samples: np.ndarray, filters: np.ndarray) -> np.ndarray:
 # ---- Tokenizer ----
 
 def load_tokenizer(model_dir: str):
-    """Load SentencePiece tokenizer from tekken.json (Voxtral format)."""
+    """Load Tekken BPE tokenizer from tekken.json via mistral-common."""
     try:
-        import sentencepiece as spm
+        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
     except ImportError:
-        sys.exit("sentencepiece not installed — run: pip install sentencepiece")
-
-    # tekken.json contains the SentencePiece model as base64
-    tekken_path = Path(model_dir) / "tekken.json"
-    with open(tekken_path) as f:
-        tekken = json.load(f)
-
-    import base64, tempfile
-    sp_model_b64 = tekken.get("sp_model") or tekken.get("model")
-    if sp_model_b64 is None:
-        raise ValueError("tekken.json does not contain 'sp_model' or 'model' key")
-
-    with tempfile.NamedTemporaryFile(suffix=".model", delete=False) as tmp:
-        tmp.write(base64.b64decode(sp_model_b64))
-        tmp_path = tmp.name
-
-    sp = spm.SentencePieceProcessor()
-    sp.Load(tmp_path)
-    os.unlink(tmp_path)
-    return sp
+        sys.exit("mistral-common not installed — run: pip install mistral-common")
+    tekken_path = str(Path(model_dir) / "tekken.json")
+    tok = MistralTokenizer.from_file(tekken_path)
+    # Return the inner Tekken tokenizer that supports .encode(text, bos, eos)
+    return tok.instruct_tokenizer.tokenizer
 
 
-def tokenize(sp, text: str) -> list[int]:
-    """Tokenize text with BOS prepended (matching Voxtral streaming protocol)."""
-    ids = sp.EncodeAsIds(text)
-    return [1] + ids + [2]  # BOS=1, EOS=2
+def tokenize(tok, text: str) -> list[int]:
+    """Tokenize text with BOS=1 prepended and EOS=2 appended."""
+    return tok.encode(text, bos=True, eos=True)
 
 
 # ---- Deinterleave helper (must match Rust deinterleave_qk) ----

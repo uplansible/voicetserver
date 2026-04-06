@@ -142,7 +142,16 @@ Python venv install (run once — put venv on a large partition if root fs is ti
 VENV=/path/to/venv          # e.g. /mnt/ssdupl/voicetserver-venv
 python3 -m venv $VENV
 mkdir -p $VENV/tempdir
-TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir -r tools/requirements.txt
+# torch must come from the PyTorch CUDA index (replace cu128 with your CUDA version)
+TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir \
+  torch --index-url https://download.pytorch.org/whl/cu128
+# remaining deps from PyPI
+TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir \
+  safetensors mistral-common numpy tqdm packaging
+```
+Deploy training script next to the binary:
+```bash
+mkdir -p ~/.local/bin/tools && cp tools/train_lora.py ~/.local/bin/tools/
 ```
 Then set `venv_path = "/path/to/venv"` in `~/.config/voicetserver/config.toml`.
 

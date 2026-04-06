@@ -211,13 +211,28 @@ Fine-tune the decoder on your own voice and vocabulary without retraining the fu
 
 ### 1. Install the Python venv (one-time, on the GPU server)
 
-Put the venv on a partition with sufficient free space (torch + CUDA libs ≈ 5 GB):
+Put the venv on a partition with sufficient free space (torch + CUDA libs ≈ 5 GB).
+`torch` must be installed from the PyTorch CUDA index; everything else comes from PyPI.
 
 ```bash
 VENV="/path/to/voicetserver-venv"   # e.g. /mnt/data/voicetserver-venv
 python3 -m venv $VENV
 mkdir -p $VENV/tempdir
-TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir -r tools/requirements.txt
+
+# Install torch for your CUDA version (replace cu128 with cu121/cu118 if needed)
+TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir \
+  torch --index-url https://download.pytorch.org/whl/cu128
+
+# Install remaining dependencies from PyPI
+TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir \
+  safetensors mistral-common numpy tqdm packaging
+```
+
+Deploy the training script alongside the server binary:
+
+```bash
+mkdir -p ~/.local/bin/tools
+cp tools/train_lora.py ~/.local/bin/tools/
 ```
 
 Add to `~/.config/voicetserver/config.toml`:
