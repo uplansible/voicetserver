@@ -137,6 +137,15 @@ All endpoints support CORS (`allow_origin: *`).
 Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl`.
 LoRA adapter output: `~/.config/voicetserver/lora_adapter/` (set `lora_adapter` in config to load at startup).
 
+Python venv install (run once — put venv on a large partition if root fs is tight):
+```bash
+VENV=/path/to/venv          # e.g. /mnt/ssdupl/voicetserver-venv
+python3 -m venv $VENV
+mkdir -p $VENV/tempdir
+TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir -r tools/requirements.txt
+```
+Then set `venv_path = "/path/to/venv"` in `~/.config/voicetserver/config.toml`.
+
 ### LoRA adapter
 
 `src/lora.rs` — loads `adapter_model.safetensors` + `adapter_config.json` from the adapter dir.

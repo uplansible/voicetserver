@@ -2,11 +2,14 @@
 """
 train_lora.py — LoRA fine-tuning for the Voxtral Mini 4B Realtime decoder.
 
-Installation (run once, from the voicetserver project root):
-    python3 -m venv tools/.venv
-    tools/.venv/bin/pip install -r tools/requirements.txt
+Installation (run once — put venv on a large partition if root fs is tight):
+    VENV=/path/to/venv          # e.g. /mnt/ssdupl/voicetserver-venv
+    python3 -m venv $VENV
+    mkdir -p $VENV/tempdir
+    TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir -r tools/requirements.txt
 
-  The server auto-detects tools/.venv/bin/python3 when you click "Run LoRA".
+Then set venv_path = "/path/to/venv" in ~/.config/voicetserver/config.toml.
+The server auto-detects the interpreter from that path when you click "Run LoRA".
 
 Usage (called by the server on POST /training/run, or manually):
     python3 tools/train_lora.py \
