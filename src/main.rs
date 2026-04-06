@@ -4,6 +4,7 @@ mod common;
 mod config;
 mod decoder;
 mod encoder;
+mod lora;
 mod macros;
 mod mel;
 mod session;
@@ -121,9 +122,7 @@ async fn main() -> Result<()> {
     let file_config = config::load_config_file()?;
     let merged = config::merge(&cli, &file_config);
 
-    if let Some(ref adapter_dir) = merged.lora_adapter {
-        eprintln!("Note: --lora-adapter '{}' accepted but not yet wired (Phase 3)", adapter_dir);
-    }
+    // LoRA loading is deferred until after model init below.
 
     // Validate delay
     if merged.delay < 1 || merged.delay > 30 {
@@ -203,12 +202,25 @@ async fn main() -> Result<()> {
     let adapter = adapter::Adapter::load(&vb)?;
 
     println!("Loading decoder...");
-    let dec = decoder::TextDecoder::load(&vb, &device, dtype)?;
+    let mut dec = decoder::TextDecoder::load(&vb, &device, dtype)?;
 
     println!("Total model load: {:.2}s", t_total.elapsed().as_secs_f64());
     let _ = readahead.join();
 
     let filters = mel::mel_filters(&merged.model_dir.value);
+
+    // Apply LoRA adapter if configured (before server start, no contention yet)
+    if let Some(ref adapter_dir) = merged.lora_adapter {
+        println!("Applying LoRA adapter: {}", adapter_dir);
+        match lora::load_decoder_lora(std::path::Path::new(adapter_dir), &device, dtype) {
+            Ok(Some(dec_lora)) => {
+                dec.set_lora(&dec_lora);
+                println!("LoRA adapter applied.");
+            }
+            Ok(None) => eprintln!("Warning: --lora-adapter path does not exist: {}", adapter_dir),
+            Err(e)   => eprintln!("Warning: LoRA adapter load failed: {}", e),
+        }
+    }
 
     match cli.wav_file {
         Some(ref path) => {
@@ -366,16 +378,37 @@ mod server {
     use crate::settings::{IniValues, SharedSettings, StartupSnapshot, STATE_READY};
     use crate::words::WordsCorrector;
     use axum::{
-        extract::{State, WebSocketUpgrade},
+        extract::{Query, State, WebSocketUpgrade},
         http::StatusCode,
         response::{IntoResponse, Response},
         routing::get,
         Json, Router,
     };
     use axum::extract::ws::{Message, WebSocket};
+    use axum::body::Bytes;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower_http::cors::{Any, CorsLayer};
+
+    // ---- Training status ----
+
+    #[derive(Debug, Clone, serde::Serialize, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum TrainingStatusKind {
+        Idle,
+        Running,
+        Done,
+        Error,
+    }
+
+    struct TrainingStatus {
+        status: TrainingStatusKind,
+        log: Vec<String>,
+    }
+
+    impl TrainingStatus {
+        fn new() -> Self { Self { status: TrainingStatusKind::Idle, log: vec![] } }
+    }
 
     pub async fn run(
         model: Arc<VoxtralModel>,
@@ -409,6 +442,8 @@ mod server {
             WordsCorrector::load(&words_path)
         ));
 
+        let training_status = Arc::new(tokio::sync::Mutex::new(TrainingStatus::new()));
+
         let state = Arc::new(AppState {
             model,
             settings,
@@ -417,6 +452,7 @@ mod server {
             config_file,
             words_path,
             words,
+            training_status,
         });
 
         let cors = CorsLayer::new()
@@ -425,15 +461,22 @@ mod server {
                 axum::http::Method::GET,
                 axum::http::Method::PATCH,
                 axum::http::Method::POST,
+                axum::http::Method::DELETE,
                 axum::http::Method::OPTIONS,
             ])
             .allow_headers(Any);
 
         let app = Router::new()
-            .route("/health", get(health_handler))
-            .route("/asr",    get(ws_handler))
-            .route("/config", get(config_get_handler).patch(config_patch_handler))
-            .route("/words",  get(words_get_handler).post(words_post_handler))
+            .route("/health",  get(health_handler))
+            .route("/asr",     get(ws_handler))
+            .route("/config",  get(config_get_handler).patch(config_patch_handler))
+            .route("/words",   get(words_get_handler).post(words_post_handler))
+            // Training data collection (Phase 2)
+            .route("/training/sentences", get(training_sentences_handler))
+            .route("/training/pair",      axum::routing::post(training_pair_handler))
+            .route("/training",           get(training_get_handler).delete(training_delete_handler))
+            .route("/training/run",       axum::routing::post(training_run_handler))
+            .route("/training/status",    get(training_status_handler))
             .layer(cors)
             .with_state(state);
 
@@ -464,13 +507,14 @@ mod server {
 
     #[derive(Clone)]
     struct AppState {
-        model:            Arc<VoxtralModel>,
-        settings:         Arc<SharedSettings>,
-        connection_count: Arc<AtomicUsize>,
-        startup_snapshot: StartupSnapshot,
-        config_file:      SharedConfigFile,
-        words_path:       std::path::PathBuf,
-        words:            Arc<tokio::sync::RwLock<WordsCorrector>>,
+        model:             Arc<VoxtralModel>,
+        settings:          Arc<SharedSettings>,
+        connection_count:  Arc<AtomicUsize>,
+        startup_snapshot:  StartupSnapshot,
+        config_file:       SharedConfigFile,
+        words_path:        std::path::PathBuf,
+        words:             Arc<tokio::sync::RwLock<WordsCorrector>>,
+        training_status:   Arc<tokio::sync::Mutex<TrainingStatus>>,
     }
 
     // ---- /health ----
@@ -721,6 +765,310 @@ mod server {
                 Json(json!({ "words": raw_lines })).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    }
+
+    // ---- Training data collection ----
+
+    // Default German medical sentences for voice calibration (written to disk on first request)
+    const DEFAULT_TRAINING_SENTENCES: &str = "\
+Miktion, Defäkation und Miktionsbeschwerden
+Blutdruck einhundertdreißig zu achtzig Millimeter Quecksilber
+Herzfrequenz siebenundsechzig Schläge pro Minute
+Der Patient klagt über Dysurie und Pollakisurie
+Nierenfunktion mit einer Kreatinin von eins Komma zwei
+Echokardiographie zeigt eine gute linksventrikuläre Funktion
+Hämoglobin elf Komma vier Gramm pro Deziliter
+Die Abdomensonographie ergab keine pathologischen Befunde
+Bronchoskopie mit Lavage und Biopsieentnahme
+Arterieller Blutgasanalyse im Normbereich
+Elektrokardiogramm ohne Zeichen einer Ischämie
+Spirometrie ergibt eine leichte obstruktive Ventilationsstörung
+Computertomographie des Thorax mit Kontrastmittel
+Kolonoskopie bis zum Zökum problemlos durchführbar
+Magenspiegelung zeigt eine flache Erosion im Antrum
+Liquorpunktion ergab einen klaren Liquor ohne Pleozytose
+Schilddrüsenwerte TSH im Normbereich bei unauffälliger Sonographie
+Orthopädische Untersuchung der Lendenwirbelsäule mit Bewegungseinschränkung
+Neurologischer Status: Hirnnerven intakt, keine Paresen
+Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
+";
+
+    /// GET /training/sentences — returns list of calibration sentences
+    async fn training_sentences_handler(State(_state): State<Arc<AppState>>) -> Response {
+        let path = crate::config::training_sentences_path();
+        // Create default file if not present
+        if !path.exists() {
+            if let Err(e) = tokio::fs::write(&path, DEFAULT_TRAINING_SENTENCES).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create sentences file: {e}")).into_response();
+            }
+        }
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        let sentences: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .collect();
+        Json(json!({ "sentences": sentences })).into_response()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TrainingPairQuery {
+        text: String,
+    }
+
+    /// POST /training/pair?text=... — body is raw f32 LE PCM at 16kHz
+    async fn training_pair_handler(
+        State(_state): State<Arc<AppState>>,
+        Query(params): Query<TrainingPairQuery>,
+        body: Bytes,
+    ) -> Response {
+        let pcm = crate::audio::decode_audio_bytes(&body);
+        if pcm.is_empty() {
+            return (StatusCode::BAD_REQUEST, "Empty audio body").into_response();
+        }
+
+        let audio_dir = crate::config::training_audio_dir();
+        if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create training dir: {e}")).into_response();
+        }
+
+        let pairs_path = crate::config::training_pairs_path();
+
+        // Determine next ID from existing pair count
+        let count = count_pairs(&pairs_path).await;
+        let id = format!("{:04}", count + 1);
+        let wav_path = audio_dir.join(format!("{id}.wav"));
+        let duration_s = pcm.len() as f32 / 16000.0;
+
+        // Save WAV (16kHz mono i16)
+        if let Err(e) = save_training_wav(&wav_path, &pcm) {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAV write error: {e}")).into_response();
+        }
+
+        // Append JSONL entry
+        let entry = format!("{{\"id\":\"{id}\",\"text\":{},\"duration_s\":{:.3}}}\n",
+            serde_json::to_string(&params.text).unwrap_or_default(),
+            duration_s);
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut f = match tokio::fs::OpenOptions::new()
+                .create(true).append(true).open(&pairs_path).await
+            {
+                Ok(f) => f,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("JSONL open error: {e}")).into_response(),
+            };
+            if let Err(e) = f.write_all(entry.as_bytes()).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("JSONL write error: {e}")).into_response();
+            }
+        }
+
+        Json(json!({ "id": id, "duration_s": duration_s, "count": count + 1 })).into_response()
+    }
+
+    /// GET /training — summary of collected pairs
+    async fn training_get_handler(State(_state): State<Arc<AppState>>) -> Response {
+        let pairs_path = crate::config::training_pairs_path();
+        let content = tokio::fs::read_to_string(&pairs_path).await.unwrap_or_default();
+        let mut count = 0usize;
+        let mut duration_s = 0.0f64;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                count += 1;
+                duration_s += v["duration_s"].as_f64().unwrap_or(0.0);
+            }
+        }
+        Json(json!({ "count": count, "duration_sec": duration_s })).into_response()
+    }
+
+    /// DELETE /training/pairs — remove all collected training data
+    async fn training_delete_handler(State(_state): State<Arc<AppState>>) -> Response {
+        let dir = crate::config::training_dir();
+        if dir.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to delete training data: {e}")).into_response();
+            }
+        }
+        Json(json!({ "deleted": true })).into_response()
+    }
+
+    /// POST /training/run — spawn train_lora.py as a subprocess
+    async fn training_run_handler(State(state): State<Arc<AppState>>) -> Response {
+        {
+            let ts = state.training_status.lock().await;
+            if ts.status == TrainingStatusKind::Running {
+                return (StatusCode::CONFLICT, "Training already running").into_response();
+            }
+        }
+
+        // Locate train_lora.py: try cwd/tools/ then binary dir/tools/
+        let script = find_script("tools/train_lora.py");
+        let script = match script {
+            Some(p) => p,
+            None => return (StatusCode::UNPROCESSABLE_ENTITY,
+                "tools/train_lora.py not found — run server from project root").into_response(),
+        };
+
+        let data_dir  = crate::config::training_dir();
+        let model_dir = state.startup_snapshot.model_dir.clone();
+        let output_dir = crate::config::lora_output_dir();
+
+        // Ensure training dir exists before passing it to Python
+        if !data_dir.exists() {
+            return (StatusCode::UNPROCESSABLE_ENTITY,
+                "No training data yet — collect pairs first").into_response();
+        }
+
+        {
+            let mut ts = state.training_status.lock().await;
+            *ts = TrainingStatus { status: TrainingStatusKind::Running, log: vec![] };
+        }
+
+        let training_status = Arc::clone(&state.training_status);
+        tokio::spawn(async move {
+            run_training_subprocess(training_status, script, data_dir, model_dir, output_dir).await;
+        });
+
+        (StatusCode::ACCEPTED, "Training started").into_response()
+    }
+
+    /// GET /training/status — current training status + last log lines
+    async fn training_status_handler(State(state): State<Arc<AppState>>) -> Response {
+        let ts = state.training_status.lock().await;
+        Json(json!({
+            "status": ts.status,
+            "log": ts.log,
+        })).into_response()
+    }
+
+    // ---- Training helpers ----
+
+    async fn count_pairs(pairs_path: &std::path::Path) -> usize {
+        let content = tokio::fs::read_to_string(pairs_path).await.unwrap_or_default();
+        content.lines().filter(|l| !l.trim().is_empty()).count()
+    }
+
+    fn save_training_wav(path: &std::path::Path, pcm: &[f32]) -> anyhow::Result<()> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec)?;
+        for &s in pcm {
+            writer.write_sample((s * 32767.0).clamp(-32768.0, 32767.0) as i16)?;
+        }
+        writer.finalize()?;
+        Ok(())
+    }
+
+    fn find_script(rel_path: &str) -> Option<std::path::PathBuf> {
+        // Try working directory first
+        let cwd_path = std::path::Path::new(rel_path);
+        if cwd_path.exists() { return Some(cwd_path.to_path_buf()); }
+        // Try directory of the current executable
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let p = dir.join(rel_path);
+                if p.exists() { return Some(p); }
+            }
+        }
+        None
+    }
+
+    async fn run_training_subprocess(
+        training_status: Arc<tokio::sync::Mutex<TrainingStatus>>,
+        script: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+        model_dir: String,
+        output_dir: std::path::PathBuf,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+
+        let append_log = |ts: &mut TrainingStatus, line: String| {
+            if ts.log.len() >= 200 { ts.log.remove(0); }
+            ts.log.push(line);
+        };
+
+        let mut child = match tokio::process::Command::new("python3")
+            .args([
+                script.to_str().unwrap_or("tools/train_lora.py"),
+                "--data-dir",   data_dir.to_str().unwrap_or(""),
+                "--model-dir",  &model_dir,
+                "--output-dir", output_dir.to_str().unwrap_or(""),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let mut ts = training_status.lock().await;
+                ts.status = TrainingStatusKind::Error;
+                ts.log.push(format!("Failed to spawn python3: {e}"));
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().map(tokio::io::BufReader::new);
+        let stderr = child.stderr.take().map(tokio::io::BufReader::new);
+
+        let mut stdout_lines = stdout.map(|r| r.lines());
+        let mut stderr_lines = stderr.map(|r| r.lines());
+
+        loop {
+            let next_out = async {
+                if let Some(ref mut lines) = stdout_lines { lines.next_line().await }
+                else { Ok(None) }
+            };
+            let next_err = async {
+                if let Some(ref mut lines) = stderr_lines { lines.next_line().await }
+                else { Ok(None) }
+            };
+
+            tokio::select! {
+                line = next_out => {
+                    match line {
+                        Ok(Some(l)) => { let mut ts = training_status.lock().await; append_log(&mut ts, l); }
+                        Ok(None)    => { stdout_lines = None; }
+                        Err(_)      => { stdout_lines = None; }
+                    }
+                }
+                line = next_err => {
+                    match line {
+                        Ok(Some(l)) => { let mut ts = training_status.lock().await; append_log(&mut ts, l); }
+                        Ok(None)    => { stderr_lines = None; }
+                        Err(_)      => { stderr_lines = None; }
+                    }
+                }
+            }
+            if stdout_lines.is_none() && stderr_lines.is_none() { break; }
+        }
+
+        let exit_status = child.wait().await;
+        let mut ts = training_status.lock().await;
+        match exit_status {
+            Ok(s) if s.success() => {
+                ts.status = TrainingStatusKind::Done;
+                ts.log.push("Training complete.".to_string());
+            }
+            Ok(s) => {
+                ts.status = TrainingStatusKind::Error;
+                ts.log.push(format!("Training exited with status: {s}"));
+            }
+            Err(e) => {
+                ts.status = TrainingStatusKind::Error;
+                ts.log.push(format!("Wait error: {e}"));
+            }
         }
     }
 }

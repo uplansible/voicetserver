@@ -68,6 +68,12 @@ struct Attention {
     wk: Linear,
     wv: Linear,
     wo: Linear,
+    // Optional LoRA deltas (pre-composed: scale * lora_b @ lora_a).
+    // Applied as: proj_output += lora.forward(input)
+    lora_wq: Option<Linear>,
+    lora_wk: Option<Linear>,
+    lora_wv: Option<Linear>,
+    lora_wo: Option<Linear>,
 }
 
 impl Attention {
@@ -88,7 +94,7 @@ impl Attention {
         let wo_w = vb.get(&[HIDDEN_SIZE, NUM_HEADS * HEAD_DIM], &format!("{prefix}.wo.weight"))?;
         let wo = Linear::new(wo_w, None);
 
-        Ok(Self { wq, wk, wv, wo })
+        Ok(Self { wq, wk, wv, wo, lora_wq: None, lora_wk: None, lora_wv: None, lora_wo: None })
     }
 
     fn forward(
@@ -101,9 +107,18 @@ impl Attention {
         // Absolute position for RoPE (accounts for trimmed entries)
         let offset = cache.base_offset() + cache.current_len();
 
-        let q = self.wq.forward(x)?;
-        let k = self.wk.forward(x)?;
-        let v = self.wv.forward(x)?;
+        let q = {
+            let out = self.wq.forward(x)?;
+            match &self.lora_wq { Some(d) => (out + d.forward(x)?)?, None => out }
+        };
+        let k = {
+            let out = self.wk.forward(x)?;
+            match &self.lora_wk { Some(d) => (out + d.forward(x)?)?, None => out }
+        };
+        let v = {
+            let out = self.wv.forward(x)?;
+            match &self.lora_wv { Some(d) => (out + d.forward(x)?)?, None => out }
+        };
 
         // Reshape to [batch, seq_len, num_heads, head_dim] — flash attention layout
         let q = q.reshape((batch, seq_len, NUM_HEADS, HEAD_DIM))?;
@@ -140,7 +155,11 @@ impl Attention {
 
         // Reshape: [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, hidden]
         let out = out.reshape((batch, seq_len, NUM_HEADS * HEAD_DIM))?;
-        self.wo.forward(&out)
+        let wo_out = self.wo.forward(&out)?;
+        match &self.lora_wo {
+            Some(d) => wo_out + d.forward(&out)?,
+            None    => Ok(wo_out),
+        }
     }
 }
 
@@ -340,6 +359,18 @@ impl TextDecoder {
             .collect::<candle_core::Result<Vec<_>>>()?;
         self.ada_scales = Some(scales);
         Ok(())
+    }
+
+    /// Apply a LoRA adapter to all decoder attention layers.
+    /// Injects the pre-composed delta tensors into each Attention layer.
+    /// Call after model load, before inference.
+    pub fn set_lora(&mut self, lora: &crate::lora::DecoderLora) {
+        for (layer, lora_layer) in self.layers.iter_mut().zip(lora.layers.iter()) {
+            layer.attention.lora_wq = lora_layer.wq.as_ref().map(|l| Linear::new(l.0.weight().clone(), None));
+            layer.attention.lora_wk = lora_layer.wk.as_ref().map(|l| Linear::new(l.0.weight().clone(), None));
+            layer.attention.lora_wv = lora_layer.wv.as_ref().map(|l| Linear::new(l.0.weight().clone(), None));
+            layer.attention.lora_wo = lora_layer.wo.as_ref().map(|l| Linear::new(l.0.weight().clone(), None));
+        }
     }
 
     /// Build prefill embeddings: BOS + (LEFT_PAD_TOKENS + NUM_DELAY_TOKENS) PAD tokens,

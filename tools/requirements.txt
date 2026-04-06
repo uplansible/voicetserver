@@ -1,0 +1,5 @@
+torch>=2.3
+safetensors>=0.4
+sentencepiece>=0.2
+numpy>=1.26
+tqdm>=4.66

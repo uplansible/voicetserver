@@ -125,6 +125,25 @@ All endpoints support CORS (`allow_origin: *`).
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
 - `ws[s]://host:port/asr` — WebSocket audio stream (raw f32 LE PCM 16kHz mono)
 
+### Training (Phase 2 — LoRA voice calibration)
+
+- `GET /training/sentences` — returns calibration sentences as JSON array; auto-creates `~/.config/voicetserver/training_sentences.txt` with 20 German medical defaults on first call
+- `POST /training/pair?text=<url-encoded>` — body: OGG Vorbis / WAV (symphonia-decoded) or raw f32 LE PCM fallback; saves WAV + appends to `pairs.jsonl`; returns `{"id","duration_s","count"}`
+- `GET /training` — `{"count":N,"duration_sec":F}` summary of collected pairs
+- `DELETE /training/pairs` — remove all collected training data
+- `POST /training/run` — spawn `tools/train_lora.py` subprocess; 202 if started, 409 if already running
+- `GET /training/status` — `{"status":"idle"|"running"|"done"|"error","log":[...]}`
+
+Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl`.
+LoRA adapter output: `~/.config/voicetserver/lora_adapter/` (set `lora_adapter` in config to load at startup).
+
+### LoRA adapter
+
+`src/lora.rs` — loads `adapter_model.safetensors` + `adapter_config.json` from the adapter dir.
+Applied as runtime delta: `proj_output += scale * lora_b @ lora_a @ input` (no weight merging).
+Weight key format: `layers.{i}.attention.{wq,wk,wv,wo}.lora_{a,b}.weight`.
+Scale = `lora_alpha / r` from `adapter_config.json`.
+
 # Browser client
 
 `schmidispeech.user.js` — Violentmonkey userscript.

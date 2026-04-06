@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.5
+// @version      0.1.6
 // @description  Local GPU dictation — German medical (Voxtral Mini 4B Realtime)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -138,8 +138,9 @@
     configPanel.innerHTML = `
         <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech — Einstellungen</div>
         <div style="display:flex;gap:0;border-bottom:1px solid #444;margin-bottom:4px;">
-            <button id="schmidi-tab-client" style="background:none;border:none;border-bottom:2px solid #2980b9;color:#ddd;padding:4px 10px;cursor:pointer;font-size:12px;font-weight:bold;">Client</button>
-            <button id="schmidi-tab-server" style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 10px;cursor:pointer;font-size:12px;">Server</button>
+            <button id="schmidi-tab-client"   style="background:none;border:none;border-bottom:2px solid #2980b9;color:#ddd;padding:4px 10px;cursor:pointer;font-size:12px;font-weight:bold;">Client</button>
+            <button id="schmidi-tab-server"   style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 10px;cursor:pointer;font-size:12px;">Server</button>
+            <button id="schmidi-tab-training" style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 10px;cursor:pointer;font-size:12px;">Training</button>
         </div>
 
         <!-- Client tab -->
@@ -175,23 +176,56 @@
                 <button id="schmidi-save-server" style="${BTN_PRIMARY}">Params speichern</button>
             </div>
         </div>
+
+        <!-- Training tab -->
+        <div id="schmidi-pane-training" style="display:none;flex-direction:column;gap:6px;max-width:320px;">
+            <div style="${LABEL_STYLE}">Kalibrierungssatz lesen</div>
+            <div id="schmidi-training-sentence" style="background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:8px;font-size:13px;line-height:1.4;min-height:40px;color:#eee;">Lade...</div>
+            <div style="display:flex;gap:6px;align-items:center;">
+                <button id="schmidi-prev-sentence" style="${BTN_CANCEL}">◀</button>
+                <span id="schmidi-sentence-index" style="${LABEL_STYLE}">0/0</span>
+                <button id="schmidi-next-sentence" style="${BTN_CANCEL}">▶</button>
+            </div>
+            <div style="${LABEL_STYLE}">Transkript (editierbar vor dem Speichern)</div>
+            <input id="schmidi-training-text" type="text" style="${INPUT_STYLE}" placeholder="Aufnahme starten, dann hier korrigieren..."/>
+            <div style="display:flex;gap:6px;">
+                <button id="schmidi-training-record" style="${BTN_PRIMARY};flex:1;">⏺ Aufnehmen</button>
+                <button id="schmidi-training-save"   style="${BTN_CANCEL};flex:1;" disabled>💾 Speichern</button>
+            </div>
+            <div id="schmidi-training-count" style="${LABEL_STYLE}">— Paare gespeichert</div>
+            <div style="border-top:1px solid #444;margin:4px 0;"></div>
+            <button id="schmidi-training-run" style="${BTN_PRIMARY}">▶ LoRA trainieren</button>
+            <div id="schmidi-training-status" style="${LABEL_STYLE};min-height:14px;"></div>
+            <pre id="schmidi-training-log" style="background:#111;border:1px solid #333;border-radius:4px;padding:6px;font-size:10px;max-height:80px;overflow-y:auto;margin:0;display:none;color:#8f8;"></pre>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="schmidi-cancel3" style="${BTN_CANCEL}">Schließen</button>
+            </div>
+        </div>
     `;
     document.body.appendChild(configPanel);
 
     // ---- Tab switching ----
     function switchTab(tab) {
-        const isClient = (tab === 'client');
-        configPanel.querySelector('#schmidi-pane-client').style.display = isClient ? 'flex' : 'none';
-        configPanel.querySelector('#schmidi-pane-server').style.display = isClient ? 'none' : 'flex';
-        configPanel.querySelector('#schmidi-tab-client').style.borderBottomColor = isClient ? '#2980b9' : 'transparent';
-        configPanel.querySelector('#schmidi-tab-client').style.color = isClient ? '#ddd' : '#888';
-        configPanel.querySelector('#schmidi-tab-server').style.borderBottomColor = isClient ? 'transparent' : '#2980b9';
-        configPanel.querySelector('#schmidi-tab-server').style.color = isClient ? '#888' : '#ddd';
+        const tabs = ['client', 'server', 'training'];
+        tabs.forEach(t => {
+            const pane = configPanel.querySelector(`#schmidi-pane-${t}`);
+            const btn_ = configPanel.querySelector(`#schmidi-tab-${t}`);
+            if (!pane || !btn_) return;
+            const active = (t === tab);
+            pane.style.display = active ? 'flex' : 'none';
+            btn_.style.borderBottomColor = active ? '#2980b9' : 'transparent';
+            btn_.style.color = active ? '#ddd' : '#888';
+        });
     }
     configPanel.querySelector('#schmidi-tab-client').addEventListener('click', () => switchTab('client'));
     configPanel.querySelector('#schmidi-tab-server').addEventListener('click', () => {
         switchTab('server');
         loadServerConfig();
+    });
+    configPanel.querySelector('#schmidi-tab-training').addEventListener('click', () => {
+        switchTab('training');
+        loadTrainingSentences();
+        refreshTrainingCount();
     });
 
     // ---- HTTP helpers ----
@@ -306,6 +340,244 @@
 
     configPanel.querySelector('#schmidi-save-server').addEventListener('click', saveServerParams);
     configPanel.querySelector('#schmidi-save-words').addEventListener('click', saveWords);
+    configPanel.querySelector('#schmidi-cancel3').addEventListener('click', closeConfig);
+
+    // ---- Training tab state ----
+    let trainingSentences = [];
+    let trainingCurrentIdx = 0;
+    let trainingRecording = false;
+    let trainingPcmBuffers = [];
+    let trainingAudioCtx = null;
+    let trainingScriptProc = null;
+    let trainingMicStream = null;
+    let trainingStatusPoll = null;
+
+    function setTrainingStatus(msg, isError) {
+        const el = configPanel.querySelector('#schmidi-training-status');
+        if (el) { el.textContent = msg; el.style.color = isError ? '#e74c3c' : '#aaa'; }
+    }
+
+    async function loadTrainingSentences() {
+        try {
+            const res = await fetch(`${getHttpBase()}/training/sentences`);
+            if (!res.ok) throw new Error('GET /training/sentences: ' + res.status);
+            const data = await res.json();
+            trainingSentences = data.sentences || [];
+            trainingCurrentIdx = Math.min(trainingCurrentIdx, Math.max(0, trainingSentences.length - 1));
+            renderCurrentSentence();
+        } catch (e) {
+            setTrainingStatus('Fehler: ' + e.message, true);
+        }
+    }
+
+    function renderCurrentSentence() {
+        const sentEl = configPanel.querySelector('#schmidi-training-sentence');
+        const idxEl  = configPanel.querySelector('#schmidi-sentence-index');
+        const txtEl  = configPanel.querySelector('#schmidi-training-text');
+        if (!sentEl || !idxEl) return;
+        const total = trainingSentences.length;
+        if (total === 0) {
+            sentEl.textContent = 'Keine Sätze verfügbar';
+            idxEl.textContent = '0/0';
+            return;
+        }
+        const sentence = trainingSentences[trainingCurrentIdx] || '';
+        sentEl.textContent = sentence;
+        idxEl.textContent = `${trainingCurrentIdx + 1}/${total}`;
+        if (txtEl && !trainingRecording) txtEl.value = sentence;
+    }
+
+    async function refreshTrainingCount() {
+        try {
+            const res = await fetch(`${getHttpBase()}/training`);
+            if (!res.ok) return;
+            const data = await res.json();
+            const el = configPanel.querySelector('#schmidi-training-count');
+            if (el) el.textContent = `${data.count} Paar${data.count !== 1 ? 'e' : ''} gespeichert (${(data.duration_sec || 0).toFixed(1)}s)`;
+        } catch (_) {}
+    }
+
+    configPanel.querySelector('#schmidi-prev-sentence').addEventListener('click', () => {
+        if (trainingSentences.length === 0) return;
+        trainingCurrentIdx = (trainingCurrentIdx - 1 + trainingSentences.length) % trainingSentences.length;
+        renderCurrentSentence();
+    });
+    configPanel.querySelector('#schmidi-next-sentence').addEventListener('click', () => {
+        if (trainingSentences.length === 0) return;
+        trainingCurrentIdx = (trainingCurrentIdx + 1) % trainingSentences.length;
+        renderCurrentSentence();
+    });
+
+    configPanel.querySelector('#schmidi-training-record').addEventListener('click', () => {
+        if (trainingRecording) stopTrainingRecording();
+        else startTrainingRecording();
+    });
+
+    configPanel.querySelector('#schmidi-training-save').addEventListener('click', saveTrainingPair);
+
+    configPanel.querySelector('#schmidi-training-run').addEventListener('click', runLoraTraining);
+
+    // Detect best MediaRecorder format: OGG Vorbis (Firefox) → raw PCM fallback (Chrome)
+    function getTrainingMimeType() {
+        if (window.MediaRecorder) {
+            const candidates = ['audio/ogg;codecs=vorbis', 'audio/ogg', 'audio/webm;codecs=pcm'];
+            for (const mime of candidates) {
+                if (MediaRecorder.isTypeSupported(mime)) return mime;
+            }
+        }
+        return null;  // fall back to raw PCM via AudioWorklet
+    }
+
+    function startTrainingRecording() {
+        trainingPcmBuffers = [];
+        navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+            .then((stream) => {
+                trainingMicStream = stream;
+                trainingRecording = true;
+                const mimeType = getTrainingMimeType();
+
+                if (mimeType && window.MediaRecorder) {
+                    // Use MediaRecorder (OGG Vorbis on Firefox — lower bandwidth, server decodes with symphonia)
+                    const mr = new MediaRecorder(stream, { mimeType });
+                    mr.ondataavailable = (e) => {
+                        if (e.data && e.data.size > 0) trainingPcmBuffers.push(e.data);
+                    };
+                    mr.start(100);  // 100ms chunks
+                    trainingScriptProc = mr;  // reuse field to hold MediaRecorder ref
+                    setTrainingStatus(`Aufnahme (${mimeType})…`, false);
+                } else {
+                    // Fallback: raw f32 LE PCM via ScriptProcessor (Chrome)
+                    trainingAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    const source   = trainingAudioCtx.createMediaStreamSource(stream);
+                    const ratio    = trainingAudioCtx.sampleRate / SAMPLE_RATE;
+                    const proc     = trainingAudioCtx.createScriptProcessor(4096, 1, 1);
+                    source.connect(proc);
+                    proc.connect(trainingAudioCtx.destination);
+                    proc.onaudioprocess = (e) => {
+                        if (!trainingRecording) return;
+                        const input = e.inputBuffer.getChannelData(0);
+                        const outLen = Math.floor(input.length / ratio);
+                        const buf = new Float32Array(outLen);
+                        for (let i = 0; i < outLen; i++) buf[i] = input[Math.floor(i * ratio)];
+                        trainingPcmBuffers.push(buf);
+                    };
+                    trainingScriptProc = proc;
+                    setTrainingStatus('Aufnahme (raw PCM)…', false);
+                }
+
+                const recBtn = configPanel.querySelector('#schmidi-training-record');
+                if (recBtn) { recBtn.textContent = '⏹ Stop'; recBtn.style.background = '#c0392b'; }
+            })
+            .catch((err) => setTrainingStatus('Mikrofon: ' + err.message, true));
+    }
+
+    function stopTrainingRecording() {
+        trainingRecording = false;
+
+        // Stop MediaRecorder or ScriptProcessor
+        if (trainingScriptProc instanceof MediaRecorder) {
+            trainingScriptProc.stop();
+            // Wait briefly for final ondataavailable
+            setTimeout(finalizeTrainingRecording, 200);
+        } else {
+            if (trainingScriptProc) { trainingScriptProc.disconnect(); }
+            if (trainingAudioCtx)   { trainingAudioCtx.close(); trainingAudioCtx = null; }
+            trainingScriptProc = null;
+            finalizeTrainingRecording();
+        }
+        if (trainingMicStream) { trainingMicStream.getTracks().forEach(t => t.stop()); trainingMicStream = null; }
+    }
+
+    function finalizeTrainingRecording() {
+        const recBtn  = configPanel.querySelector('#schmidi-training-record');
+        const saveBtn = configPanel.querySelector('#schmidi-training-save');
+        if (recBtn)  { recBtn.textContent = '⏺ Aufnehmen'; recBtn.style.background = '#2980b9'; }
+        if (saveBtn) saveBtn.disabled = (trainingPcmBuffers.length === 0);
+        const dur = trainingPcmBuffers.length > 0 ? '…' : '0';
+        setTrainingStatus(`Aufnahme beendet (${trainingPcmBuffers.length} Blöcke)`, false);
+    }
+
+    async function saveTrainingPair() {
+        if (trainingPcmBuffers.length === 0) return;
+        const txtEl = configPanel.querySelector('#schmidi-training-text');
+        const text  = (txtEl ? txtEl.value : '').trim();
+        if (!text) { setTrainingStatus('Kein Transkript eingegeben', true); return; }
+
+        // Combine buffers: either Blobs (MediaRecorder) or Float32Arrays (raw PCM)
+        let body, contentType;
+        if (trainingPcmBuffers[0] instanceof Blob) {
+            // OGG Vorbis / WebM from MediaRecorder — server decodes with symphonia
+            body        = new Blob(trainingPcmBuffers, { type: trainingPcmBuffers[0].type });
+            contentType = trainingPcmBuffers[0].type || 'application/octet-stream';
+        } else {
+            // Raw f32 LE PCM buffers — server decodes with decode_pcm_f32
+            const totalLen = trainingPcmBuffers.reduce((s, b) => s + b.length, 0);
+            const combined = new Float32Array(totalLen);
+            let offset = 0;
+            for (const buf of trainingPcmBuffers) { combined.set(buf, offset); offset += buf.length; }
+            body        = combined.buffer;
+            contentType = 'application/octet-stream';
+        }
+
+        setTrainingStatus('Speichere…', false);
+        try {
+            const res = await fetch(`${getHttpBase()}/training/pair?text=${encodeURIComponent(text)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': contentType },
+                body,
+            });
+            if (!res.ok) throw new Error(await res.text());
+            const data = await res.json();
+            setTrainingStatus(`Gespeichert ✓ (Paar ${data.id}, ${data.duration_s.toFixed(1)}s)`, false);
+            trainingPcmBuffers = [];
+            const saveBtn = configPanel.querySelector('#schmidi-training-save');
+            if (saveBtn) saveBtn.disabled = true;
+            refreshTrainingCount();
+            // Advance to next sentence
+            if (trainingSentences.length > 1) {
+                trainingCurrentIdx = (trainingCurrentIdx + 1) % trainingSentences.length;
+                renderCurrentSentence();
+            }
+        } catch (e) {
+            setTrainingStatus('Fehler: ' + e.message, true);
+        }
+    }
+
+    async function runLoraTraining() {
+        setTrainingStatus('Starte Training…', false);
+        try {
+            const res = await fetch(`${getHttpBase()}/training/run`, { method: 'POST' });
+            if (res.status === 409) { setTrainingStatus('Training läuft bereits', false); return; }
+            if (!res.ok) throw new Error(await res.text());
+            setTrainingStatus('Training gestartet', false);
+            // Show log panel and start polling
+            const logEl = configPanel.querySelector('#schmidi-training-log');
+            if (logEl) logEl.style.display = 'block';
+            if (trainingStatusPoll) clearInterval(trainingStatusPoll);
+            trainingStatusPoll = setInterval(pollTrainingStatus, 2000);
+        } catch (e) {
+            setTrainingStatus('Fehler: ' + e.message, true);
+        }
+    }
+
+    async function pollTrainingStatus() {
+        try {
+            const res = await fetch(`${getHttpBase()}/training/status`);
+            if (!res.ok) return;
+            const data = await res.json();
+            const statusMap = { idle: 'Bereit', running: 'Training läuft…', done: 'Training abgeschlossen ✓', error: 'Training fehlgeschlagen' };
+            setTrainingStatus(statusMap[data.status] || data.status, data.status === 'error');
+            const logEl = configPanel.querySelector('#schmidi-training-log');
+            if (logEl && data.log && data.log.length > 0) {
+                logEl.textContent = data.log.join('\n');
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            if (data.status === 'done' || data.status === 'error') {
+                clearInterval(trainingStatusPoll);
+                trainingStatusPoll = null;
+            }
+        } catch (_) {}
+    }
 
     configPanel.querySelectorAll('input').forEach((input) => {
         input.addEventListener('keydown', (e) => {

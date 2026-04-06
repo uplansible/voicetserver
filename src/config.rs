@@ -96,6 +96,26 @@ pub fn custom_words_path() -> PathBuf {
     config_dir().join("custom_words.txt")
 }
 
+pub fn training_dir() -> PathBuf {
+    config_dir().join("training")
+}
+
+pub fn training_audio_dir() -> PathBuf {
+    training_dir().join("audio")
+}
+
+pub fn training_pairs_path() -> PathBuf {
+    training_dir().join("pairs.jsonl")
+}
+
+pub fn training_sentences_path() -> PathBuf {
+    config_dir().join("training_sentences.txt")
+}
+
+pub fn lora_output_dir() -> PathBuf {
+    config_dir().join("lora_adapter")
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap / load / save
 // ---------------------------------------------------------------------------

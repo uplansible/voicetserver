@@ -25,25 +25,25 @@
 - [x] 1.8 Rewrite README.md
 - [x] 1.9 Create stub src/session.rs (Phase 2 placeholder)
 - [x] 1.10 Create stub src/macros.rs (Phase 4 placeholder)
-- [ ] 1.11 cargo build --features cuda on GPU server + end-to-end browser test
+- [x] 1.11 cargo build --features cuda on GPU server + end-to-end browser test
 
-## Phase 2 — Patient session vocabulary (stub)
-- [ ] 2.1 Create docs/phase2_session_vocab.md
-- [ ] 2.2 Implement session.rs data structures and route handlers (feature-flagged)
+## Phase 2 — Voice calibration, correction layer, LoRA
+- [x] 2.3 Wire config/ custom_words.txt into correction automaton
+- [x] 2.5 Implement src/lora.rs (weight merge for fine-tuned adapters)
+- [x] 2.6 Training sentences served via GET /training/sentences in main binary
+- [x] 2.7 Create tools/train_lora.py + tools/requirements.txt
+- [x] 2.8 Multi-codec audio decode via symphonia (OGG Vorbis/WAV + raw PCM fallback)
 
-## Phase 3 — Voice calibration, correction layer, LoRA
-- [ ] 3.1 Create tools/calibrate_silence.py
-- [ ] 3.2 Implement src/correction.rs (Aho-Corasick, corrections.toml, SIGHUP reload)
-- [ ] 3.3 Wire config/medical_terms_de.txt into correction automaton
-- [ ] 3.4 Create tools/generate_corrections.py (Anthropic API)
-- [ ] 3.5 Implement src/lora.rs (weight merge for fine-tuned adapters)
-- [ ] 3.6 Create tools/generate_training_sentences.py
-- [ ] 3.7 Create tools/train_lora.py
-- [ ] 3.8 Replace raw PCM with Opus/WebM decode in audio.rs (audiopus + matroska)
+## Phase 3 — Post-processing and macros
+- [ ] 3.1 Create docs/phase4_macros.md
+- [ ] 3.2 Implement src/macros.rs (config/macros.json expansion)
 
-## Phase 4 — Post-processing and macros
-- [ ] 4.1 Create docs/phase4_macros.md
-- [ ] 4.2 Implement src/macros.rs (config/macros.json expansion)
+## Phase 4 — Patient session vocabulary (stub)
+- [ ] 4.1 Create docs/phase2_session_vocab.md
+- [ ] 4.2 Implement session.rs data structures and route handlers (feature-flagged)
 
 ## Phase 5 — Nice-to-haves (docs only)
 - [ ] 5.1 Create docs/phase5_ideas.md
+- [ ] 5.2 Create tools/calibrate_silence.py
+- [ ] 5.3 Implement src/correction.rs (Aho-Corasick, corrections.toml, SIGHUP reload)
+- [ ] 5.4 Create tools/generate_corrections.py (Anthropic API)
