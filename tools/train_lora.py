@@ -2,12 +2,11 @@
 """
 train_lora.py — LoRA fine-tuning for the Voxtral Mini 4B Realtime decoder.
 
-Installation (run once):
-    pip install uv                           # fast package installer
-    uv pip install -r tools/requirements.txt
-  or without uv:
-    python3 -m venv tools/.venv && source tools/.venv/bin/activate
-    pip install -r tools/requirements.txt
+Installation (run once, from the voicetserver project root):
+    python3 -m venv tools/.venv
+    tools/.venv/bin/pip install -r tools/requirements.txt
+
+  The server auto-detects tools/.venv/bin/python3 when you click "Run LoRA".
 
 Usage (called by the server on POST /training/run, or manually):
     python3 tools/train_lora.py \

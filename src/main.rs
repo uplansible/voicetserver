@@ -985,6 +985,25 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
         None
     }
 
+    /// Locate the Python interpreter to use for training.
+    /// Prefers the venv at tools/.venv (relative to cwd or exe dir) over system python3.
+    fn find_python() -> String {
+        let candidates = [
+            "tools/.venv/bin/python3",
+            "tools/.venv/bin/python",
+        ];
+        for rel in &candidates {
+            if std::path::Path::new(rel).exists() { return rel.to_string(); }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let p = dir.join(rel);
+                    if p.exists() { return p.to_string_lossy().into_owned(); }
+                }
+            }
+        }
+        "python3".to_string()  // fall back to system python3
+    }
+
     async fn run_training_subprocess(
         training_status: Arc<tokio::sync::Mutex<TrainingStatus>>,
         script: std::path::PathBuf,
@@ -999,7 +1018,8 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
             ts.log.push(line);
         };
 
-        let mut child = match tokio::process::Command::new("python3")
+        let python = find_python();
+        let mut child = match tokio::process::Command::new(&python)
             .args([
                 script.to_str().unwrap_or("tools/train_lora.py"),
                 "--data-dir",   data_dir.to_str().unwrap_or(""),
@@ -1014,7 +1034,7 @@ Postoperativ stabile Vitalparameter, Patient kann mobilisiert werden\
             Err(e) => {
                 let mut ts = training_status.lock().await;
                 ts.status = TrainingStatusKind::Error;
-                ts.log.push(format!("Failed to spawn python3: {e}"));
+                ts.log.push(format!("Failed to spawn {python}: {e}"));
                 return;
             }
         };
