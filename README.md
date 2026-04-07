@@ -258,6 +258,48 @@ Open the **Training tab** in the browser UI:
 
 Audio is saved to `~/.config/voicetserver/training/`.
 
+### Training data guidelines
+
+The LoRA adapts the model to your voice acoustics and domain vocabulary simultaneously.
+Data quality and diversity matter more than volume.
+
+**Sentences, not isolated words.**
+Isolated words are pronounced artificially — slower, more deliberate, without natural
+coarticulation. The model sees continuous speech at inference time, so train on it.
+
+**Optimal sentence length: 6–12 words.**
+- Too short (<5 words): unnatural prosody, minimal acoustic context
+- Too long (>15 words): breath sounds, uneven pacing, recording fatigue
+- ~8 words is the sweet spot — one breath, natural rhythm
+
+**Use contextual variations for rare or problematic terms.**
+Each variation teaches a different coarticulation context and sentence position.
+For a term like *Miktionssituation*:
+```
+"Die Miktionssituation ist unauffällig."                    # end position
+"Bezüglich der Miktionssituation keine Klagen."             # middle
+"Miktionsbeschwerden wurden vom Patienten verneint."        # derived form
+"Der Patient berichtet über eine normale Miktion."          # root form
+"Postoperativ zeigte sich eine problemlose Miktion."        # prefix context
+```
+5–8 variations per target term is effective; beyond 10 the acoustic diversity saturates.
+
+**Recommended dataset size: 60–100 pairs.**
+
+| Pairs | Expected effect |
+|-------|----------------|
+| 10–20 | Minimal; slight acoustic adaptation |
+| 30–60 | Noticeable improvement for targeted vocabulary |
+| 60–100 | Good speaker + domain adaptation |
+| 200+ | Diminishing returns; overfitting risk increases |
+
+**One recording per sentence is enough.**
+Re-recording the same sentence only helps if there is meaningful acoustic variation
+(different energy, pacing). Diversity of *sentences* matters more than repetition.
+
+**Speak at natural dictation pace** — not slow read-aloud mode.
+The model will be used during real dictation; train it on the same speech style.
+
 ### 4. Train
 
 Click **LoRA trainieren** in the Training tab (or `POST /training/run`).
