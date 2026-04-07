@@ -442,8 +442,10 @@
     let trainingAudioCtx   = null;
     let trainingScriptProc = null;
     let trainingMicStream  = null;
-    let trainingPreviewCtx = null;
-    let trainingPreviewSrc = null;
+    let trainingPreviewCtx  = null;
+    let trainingPreviewSrc  = null;
+    let paaresCurrentAudio  = null;
+    let paaresCurrentPlayId = null;
     let trainingPairs      = [];
     let trainingStatusPoll = null;
 
@@ -668,6 +670,16 @@
     }
 
     function previewRecording() {
+        const vorhörenBtn = configPanel.querySelector('#schmidi-training-vorhören');
+        // Toggle: if already playing, stop
+        if (trainingPreviewSrc) {
+            try { trainingPreviewSrc.stop(); } catch(_) {}
+            trainingPreviewSrc = null;
+            if (trainingPreviewCtx) { trainingPreviewCtx.close(); trainingPreviewCtx = null; }
+            if (vorhörenBtn) vorhörenBtn.textContent = '▶ Vorhören';
+            setAufnehmenStatus('', false);
+            return;
+        }
         if (trainingPcmBuffers.length === 0) return;
         const totalLen = trainingPcmBuffers.reduce((s, b) => s + b.length, 0);
         const combined = new Float32Array(totalLen);
@@ -683,8 +695,9 @@
             src.buffer = audioBuf;
             src.connect(ctx.destination);
             src.start();
+            if (vorhörenBtn) vorhörenBtn.textContent = '⏹ Stopp';
             setAufnehmenStatus('Wiedergabe…', false);
-            src.onended = () => { ctx.close(); trainingPreviewCtx = null; trainingPreviewSrc = null; setAufnehmenStatus('', false); };
+            src.onended = () => { ctx.close(); trainingPreviewCtx = null; trainingPreviewSrc = null; if (vorhörenBtn) vorhörenBtn.textContent = '▶ Vorhören'; setAufnehmenStatus('', false); };
         } catch (e) {
             setAufnehmenStatus('Wiedergabe: ' + e.message, true);
         }
@@ -739,6 +752,8 @@
     }
 
     function renderPairsList() {
+        // Stop any playback before rebuilding the list (button refs become stale)
+        if (paaresCurrentAudio) { paaresCurrentAudio.pause(); paaresCurrentAudio.src = ''; paaresCurrentAudio = null; paaresCurrentPlayId = null; }
         const listEl  = configPanel.querySelector('#schmidi-pairs-list');
         const countEl = configPanel.querySelector('#schmidi-paare-count');
         if (!listEl) return;
@@ -767,8 +782,34 @@
             const playBtn = e.target.closest('.sp-play');
             const delBtn  = e.target.closest('.sp-del');
             if (playBtn) {
-                const audio = new Audio(`${getHttpBase()}/training/audio/${playBtn.dataset.id}`);
-                audio.play().catch(err => setPaareStatus('Wiedergabe: ' + err.message, true));
+                const id = playBtn.dataset.id;
+                // Stop any currently playing pair
+                if (paaresCurrentAudio) {
+                    paaresCurrentAudio.pause();
+                    paaresCurrentAudio.src = '';
+                    const prevBtn = listEl.querySelector(`.sp-play[data-id="${paaresCurrentPlayId}"]`);
+                    if (prevBtn) prevBtn.textContent = '▶';
+                    const wasId = paaresCurrentPlayId;
+                    paaresCurrentAudio  = null;
+                    paaresCurrentPlayId = null;
+                    if (wasId === id) return; // toggle off
+                }
+                // Start new playback
+                const audio = new Audio(`${getHttpBase()}/training/audio/${id}`);
+                paaresCurrentAudio  = audio;
+                paaresCurrentPlayId = id;
+                playBtn.textContent = '⏹';
+                audio.play().catch(err => {
+                    paaresCurrentAudio  = null;
+                    paaresCurrentPlayId = null;
+                    playBtn.textContent = '▶';
+                    setPaareStatus('Wiedergabe: ' + err.message, true);
+                });
+                audio.addEventListener('ended', () => {
+                    paaresCurrentAudio  = null;
+                    paaresCurrentPlayId = null;
+                    playBtn.textContent = '▶';
+                });
             }
             if (delBtn) {
                 try {
