@@ -58,6 +58,12 @@ All settings can also be stored in `~/.config/voicetserver/config.toml` instead 
 All CUDA-only code gated behind `#[cfg(feature = "cuda")]` in source files.
 `build.rs` checks `CARGO_FEATURE_CUDA` env var (not `#[cfg]` — build scripts don't see feature flags).
 
+## Compute dtype
+
+`BF16` on CUDA, `F32` on CPU — selected automatically at runtime based on device.
+CPU candle backend does not support BF16 matmul; using BF16 on CPU causes
+`unsupported dtype BF16 for op matmul` on every ASR session.
+
 # Model files
 
 Required in `--model-dir`:
@@ -177,7 +183,7 @@ Scale = `lora_alpha / r` from `adapter_config.json`.
 
 `schmidispeech.user.js` — Violentmonkey userscript.
 Sends raw 16kHz mono f32 LE PCM over WebSocket binary frames.
-Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}`.
+Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}` / `{"type":"error","text":"..."}`.
 
 Server URL and hotkey stored via `GM_setValue` (`server_url`, `hotkey`).
 Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Client tab).

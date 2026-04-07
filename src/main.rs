@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
     candle_core::cuda_backend::set_gemm_reduced_precision_bf16(true);
 
     let device = Device::cuda_if_available(merged.device)?;
-    let dtype = DType::BF16;
+    let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
 
     let is_offline = cli.wav_file.is_some();
     let effective_delay = if is_offline { 20 } else { merged.delay };
@@ -550,6 +550,8 @@ mod server {
 
         if let Err(e) = handle_asr_session(&mut socket, &state).await {
             eprintln!("ASR session error: {}", e);
+            let msg = json!({ "type": "error", "text": e.to_string() }).to_string();
+            let _ = socket.send(Message::Text(msg.into())).await;
         }
 
         state.connection_count.fetch_sub(1, Ordering::Relaxed);
