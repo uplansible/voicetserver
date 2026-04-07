@@ -477,11 +477,17 @@ mod server {
             .route("/config",  get(config_get_handler).patch(config_patch_handler))
             .route("/words",   get(words_get_handler).post(words_post_handler))
             // Training data collection (Phase 2)
-            .route("/training/sentences", get(training_sentences_handler))
-            .route("/training/pair",      axum::routing::post(training_pair_handler))
-            .route("/training",           get(training_get_handler).delete(training_delete_handler))
-            .route("/training/run",       axum::routing::post(training_run_handler))
-            .route("/training/status",    get(training_status_handler))
+            .route("/training/sentences",   get(training_sentences_handler))
+            .route("/training/sentence",    axum::routing::post(training_sentence_add_handler)
+                                            .patch(training_sentence_edit_handler)
+                                            .delete(training_sentence_delete_handler))
+            .route("/training/pairs",       get(training_pairs_handler))
+            .route("/training/pair",        axum::routing::post(training_pair_handler))
+            .route("/training/pair/{id}",   axum::routing::delete(training_pair_delete_handler))
+            .route("/training/audio/{id}",  get(training_audio_handler))
+            .route("/training",             get(training_get_handler).delete(training_delete_handler))
+            .route("/training/run",         axum::routing::post(training_run_handler))
+            .route("/training/status",      get(training_status_handler))
             .layer(cors)
             .with_state(state);
 
@@ -786,7 +792,7 @@ mod server {
 # Füge eigene Sätze hier ein (einen pro Zeile, # für Kommentare).\
 ";
 
-    /// GET /training/sentences — returns list of calibration sentences
+    /// GET /training/sentences — returns calibration sentences annotated with recording status
     async fn training_sentences_handler(State(_state): State<Arc<AppState>>) -> Response {
         let path = crate::config::training_sentences_path();
         // Create default file if not present
@@ -800,11 +806,219 @@ mod server {
             Ok(c) => c,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
-        let sentences: Vec<&str> = content
+
+        // Build map: sentence text → list of pair IDs that recorded it
+        let pairs_path = crate::config::training_pairs_path();
+        let mut recorded: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        if let Ok(pairs_content) = tokio::fs::read_to_string(&pairs_path).await {
+            for line in pairs_content.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    let text = v["text"].as_str().unwrap_or("").to_string();
+                    let id   = v["id"].as_str().unwrap_or("").to_string();
+                    if !text.is_empty() && !id.is_empty() {
+                        recorded.entry(text).or_default().push(id);
+                    }
+                }
+            }
+        }
+
+        let sentences: Vec<serde_json::Value> = content
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|s| {
+                let pair_ids = recorded.get(s).cloned().unwrap_or_default();
+                let is_recorded = !pair_ids.is_empty();
+                json!({ "text": s, "recorded": is_recorded, "pair_ids": pair_ids })
+            })
             .collect();
         Json(json!({ "sentences": sentences })).into_response()
+    }
+
+    /// GET /training/audio/{id} — serve a recorded WAV file for playback
+    async fn training_audio_handler(
+        State(_state): State<Arc<AppState>>,
+        axum::extract::Path(id): axum::extract::Path<String>,
+    ) -> Response {
+        // Only allow numeric IDs to prevent path traversal
+        if !id.chars().all(|c| c.is_ascii_digit()) {
+            return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
+        }
+        let wav_path = crate::config::training_audio_dir().join(format!("{id}.wav"));
+        match tokio::fs::read(&wav_path).await {
+            Ok(bytes) => (
+                [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+                bytes,
+            ).into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    /// DELETE /training/pair/{id} — remove one recorded pair (WAV + JSONL entry)
+    async fn training_pair_delete_handler(
+        State(_state): State<Arc<AppState>>,
+        axum::extract::Path(id): axum::extract::Path<String>,
+    ) -> Response {
+        if !id.chars().all(|c| c.is_ascii_digit()) {
+            return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
+        }
+        let wav_path  = crate::config::training_audio_dir().join(format!("{id}.wav"));
+        let pairs_path = crate::config::training_pairs_path();
+
+        if !wav_path.exists() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if let Err(e) = tokio::fs::remove_file(&wav_path).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to remove WAV: {e}")).into_response();
+        }
+
+        // Rewrite pairs.jsonl without the deleted entry
+        if let Ok(content) = tokio::fs::read_to_string(&pairs_path).await {
+            let new_content: String = content
+                .lines()
+                .filter(|l| {
+                    if l.trim().is_empty() { return false; }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        return v["id"].as_str() != Some(id.as_str());
+                    }
+                    true
+                })
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let _ = tokio::fs::write(&pairs_path, new_content).await;
+        }
+
+        Json(json!({ "deleted": id })).into_response()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DeleteSentenceRequest {
+        text: String,
+    }
+
+    /// DELETE /training/sentence — remove one sentence from training_sentences.txt
+    async fn training_sentence_delete_handler(
+        State(_state): State<Arc<AppState>>,
+        Json(body): Json<DeleteSentenceRequest>,
+    ) -> Response {
+        let path = crate::config::training_sentences_path();
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+        let target = body.text.trim().to_string();
+        let mut found = false;
+        let new_content: String = content
+            .lines()
+            .filter(|l| {
+                if !found && l.trim() == target.as_str() {
+                    found = true;
+                    return false;
+                }
+                true
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+
+        if !found {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if let Err(e) = tokio::fs::write(&path, new_content).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        Json(json!({ "deleted": true })).into_response()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AddSentenceRequest {
+        text: String,
+    }
+
+    /// POST /training/sentence — append a new sentence to training_sentences.txt
+    async fn training_sentence_add_handler(
+        State(_state): State<Arc<AppState>>,
+        Json(body): Json<AddSentenceRequest>,
+    ) -> Response {
+        let text = body.text.trim().to_string();
+        if text.is_empty() {
+            return (StatusCode::BAD_REQUEST, "Empty sentence").into_response();
+        }
+        let path = crate::config::training_sentences_path();
+        // Ensure file exists (may create default stub first)
+        if !path.exists() {
+            let _ = tokio::fs::write(&path, DEFAULT_TRAINING_SENTENCES).await;
+        }
+        use tokio::io::AsyncWriteExt;
+        let mut f = match tokio::fs::OpenOptions::new()
+            .create(true).append(true).open(&path).await
+        {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        if let Err(e) = f.write_all(format!("{text}\n").as_bytes()).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        Json(json!({ "added": true })).into_response()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct EditSentenceRequest {
+        old: String,
+        new: String,
+    }
+
+    /// PATCH /training/sentence — replace one sentence in training_sentences.txt
+    async fn training_sentence_edit_handler(
+        State(_state): State<Arc<AppState>>,
+        Json(body): Json<EditSentenceRequest>,
+    ) -> Response {
+        let old_text = body.old.trim().to_string();
+        let new_text = body.new.trim().to_string();
+        if new_text.is_empty() {
+            return (StatusCode::BAD_REQUEST, "New text is empty").into_response();
+        }
+        let path = crate::config::training_sentences_path();
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+        let mut found = false;
+        let new_content: String = content
+            .lines()
+            .map(|l| {
+                if !found && l.trim() == old_text.as_str() {
+                    found = true;
+                    format!("{new_text}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+
+        if !found {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if let Err(e) = tokio::fs::write(&path, new_content).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        Json(json!({ "updated": true })).into_response()
+    }
+
+    /// GET /training/pairs — list all recorded pairs
+    async fn training_pairs_handler(State(_state): State<Arc<AppState>>) -> Response {
+        let pairs_path = crate::config::training_pairs_path();
+        let content = tokio::fs::read_to_string(&pairs_path).await.unwrap_or_default();
+        let mut pairs: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect();
+        // Sort by id for stable display order
+        pairs.sort_by(|a, b| {
+            a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+        });
+        Json(json!({ "pairs": pairs })).into_response()
     }
 
     #[derive(serde::Deserialize)]

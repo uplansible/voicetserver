@@ -127,10 +127,21 @@ All endpoints support CORS (`allow_origin: *`).
 
 ### Training (Phase 2 — LoRA voice calibration)
 
-- `GET /training/sentences` — returns calibration sentences as JSON array; auto-creates `~/.config/voicetserver/training_sentences.txt` with 20 German medical defaults on first call
-- `POST /training/pair?text=<url-encoded>` — body: OGG Vorbis / WAV (symphonia-decoded) or raw f32 LE PCM fallback; saves WAV + appends to `pairs.jsonl`; returns `{"id","duration_s","count"}`
-- `GET /training` — `{"count":N,"duration_sec":F}` summary of collected pairs
+**Sentence management:**
+- `GET /training/sentences` — returns `{"sentences":[{"text","recorded","pair_ids":[…]}]}` annotated with recording status; auto-creates `training_sentences.txt` on first call
+- `POST /training/sentence` — `{"text":"…"}` — append new sentence to file
+- `PATCH /training/sentence` — `{"old":"…","new":"…"}` — replace one sentence in file
+- `DELETE /training/sentence` — `{"text":"…"}` — remove one sentence from file
+
+**Pair collection:**
+- `POST /training/pair?text=<url-encoded>` — body: raw f32 LE PCM at 16kHz (always; MediaRecorder path dropped — container bytes caused static); saves 16-bit WAV + appends to `pairs.jsonl`; returns `{"id","duration_s","count"}`
+- `GET /training/pairs` — `{"pairs":[{"id","text","duration_s"}]}` sorted by id
+- `GET /training/audio/{id}` — serve recorded WAV for playback (numeric id only)
+- `DELETE /training/pair/{id}` — remove WAV file + JSONL entry
+- `GET /training` — `{"count":N,"duration_sec":F}` summary
 - `DELETE /training/pairs` — remove all collected training data
+
+**LoRA:**
 - `POST /training/run` — spawn `tools/train_lora.py` subprocess; 202 if started, 409 if already running
 - `GET /training/status` — `{"status":"idle"|"running"|"done"|"error","log":[...]}`
 
@@ -173,7 +184,11 @@ Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Client tab
 Text is inserted live at cursor on each `final`; trailing partial inserted on stop.
 Falls back to clipboard if no editable element was captured.
 
-Right-click → **Server tab**: edit runtime params and custom words directly from the browser.
+Right-click → four tabs: **Client** (URL, hotkey), **Server** (runtime params, custom words), **Aufnehmen** (record calibration sentences), **Paare** (review pairs, delete, launch LoRA).
+
+**Aufnehmen tab:** shows only unrecorded sentences (recorded ones are hidden). Navigate ◀/▶, edit/add/remove sentences inline, record via ScriptProcessor (raw f32 LE PCM, same as ASR path), preview recording client-side before saving (Web Audio API, no server round-trip), save to commit pair.
+
+**Paare tab:** scrollable list of all recorded pairs (id, text, duration) with per-pair ▶ playback and ✕ delete. LoRA training run + status log.
 
 ## Silence / final message behaviour
 
