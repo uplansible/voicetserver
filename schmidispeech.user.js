@@ -442,6 +442,8 @@
     let trainingAudioCtx   = null;
     let trainingScriptProc = null;
     let trainingMicStream  = null;
+    let trainingPreviewCtx = null;
+    let trainingPreviewSrc = null;
     let trainingPairs      = [];
     let trainingStatusPoll = null;
 
@@ -613,6 +615,9 @@
     configPanel.querySelector('#schmidi-training-save').addEventListener('click', saveTrainingPair);
 
     function startTrainingRecording() {
+        // Stop any in-progress preview playback before starting a new recording
+        if (trainingPreviewSrc) { try { trainingPreviewSrc.stop(); } catch(_) {} trainingPreviewSrc = null; }
+        if (trainingPreviewCtx) { trainingPreviewCtx.close(); trainingPreviewCtx = null; }
         trainingPcmBuffers = [];
         navigator.mediaDevices.getUserMedia({ audio: true, video: false })
             .then((stream) => {
@@ -669,15 +674,17 @@
         let offset = 0;
         for (const buf of trainingPcmBuffers) { combined.set(buf, offset); offset += buf.length; }
         try {
-            const ctx      = new AudioContext({ sampleRate: 16000 });
-            const audioBuf = ctx.createBuffer(1, combined.length, 16000);
+            trainingPreviewCtx = new AudioContext({ sampleRate: 16000 });
+            const ctx          = trainingPreviewCtx;
+            const audioBuf     = ctx.createBuffer(1, combined.length, 16000);
             audioBuf.copyToChannel(combined, 0);
-            const src = ctx.createBufferSource();
+            trainingPreviewSrc = ctx.createBufferSource();
+            const src          = trainingPreviewSrc;
             src.buffer = audioBuf;
             src.connect(ctx.destination);
             src.start();
             setAufnehmenStatus('Wiedergabe…', false);
-            src.onended = () => { ctx.close(); setAufnehmenStatus('', false); };
+            src.onended = () => { ctx.close(); trainingPreviewCtx = null; trainingPreviewSrc = null; setAufnehmenStatus('', false); };
         } catch (e) {
             setAufnehmenStatus('Wiedergabe: ' + e.message, true);
         }
