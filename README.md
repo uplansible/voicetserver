@@ -147,6 +147,9 @@ silence_threshold = 0.006
 silence_flush     = 20
 min_speech        = 15
 rms_ema           = 0.3
+
+# log_file      = "/path/to/voicetserver.log"  # default: ~/.config/voicetserver/logs/voicetserver.log
+# log_keep_days = 7                             # days to retain rotated log files
 ```
 
 Runtime-adjustable without restart: `delay`, `silence_threshold`, `silence_flush`,
@@ -156,21 +159,30 @@ Runtime-adjustable without restart: `delay`, `silence_threshold`, `silence_flush
 
 ## Start the server
 
-**Development (no TLS, localhost only):**
+**Foreground (logs stream to terminal):**
 ```bash
-./target/release/voicetserver --model-dir "$MODEL_DIR"
-# Listens on ws://127.0.0.1:8765/asr
+./target/release/voicetserver --model-dir "$MODEL_DIR" --bind-addr 0.0.0.0 --tls-cert "$CERT" --tls-key "$KEY"
+# Press 'd' to detach (logs switch to file, shell prompt returns)
+# Press Ctrl+C to stop
 ```
 
-**Production (TLS, Tailscale):**
+**Detached daemon (background, logs to file):**
 ```bash
-./target/release/voicetserver \
-  --model-dir "$MODEL_DIR" \
-  --bind-addr 0.0.0.0 \
-  --tls-cert "$CERT" \
-  --tls-key  "$KEY"
-# Listens on wss://$SERVER_HOST:8765/asr
+./target/release/voicetserver --model-dir "$MODEL_DIR" --bind-addr 0.0.0.0 --tls-cert "$CERT" --tls-key "$KEY" --detach
+# Prints: Detached. PID 12345. Log: ~/.config/voicetserver/logs/voicetserver.log
+
+# Stop the daemon:
+./target/release/voicetserver --stop
 ```
+
+**Log file** (default location, configurable):
+```
+~/.config/voicetserver/logs/voicetserver.log
+```
+Rotates at 20 MB; rotated files kept for 7 days (configurable via `log_keep_days`).
+
+**PID file:** `~/.config/voicetserver/voicetserver.pid` — written at startup, deleted on stop.
+Starting a second instance while one is running prints an error.
 
 **Health check:**
 ```bash
@@ -332,6 +344,10 @@ lora_adapter = "/home/youruser/.config/voicetserver/lora_adapter"
 | `--tls-key` | *(none)* | Path to TLS private key |
 | `--lora-adapter` | *(none)* | Path to LoRA adapter directory |
 | `--venv-path` | *(none)* | Python venv for LoRA training |
+| `--detach` | *(off)* | Daemonize: fork, log to file, return shell prompt |
+| `--stop` | *(off)* | Stop a running daemon (sends SIGTERM via PID file) |
+| `--log-file` | *see below* | Log file path (default: `~/.config/voicetserver/logs/voicetserver.log`) |
+| `--log-keep-days` | `7` | Days to retain rotated log files |
 
 ---
 

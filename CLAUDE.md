@@ -85,7 +85,7 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 
 # Architecture
 
-- `src/main.rs` — tokio entry point; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers
+- `src/main.rs` — sync `fn main()` → forks/daemonizes before tokio starts → `tokio::runtime::Builder::block_on(server::run(…))`; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers; detach/watchdog/PID/log helpers
 - `src/streaming.rs` — `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
 - `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
@@ -107,7 +107,37 @@ CLI args override config file values. Unknown fields in the config file are sile
 
 Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`.
 
-Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`.
+Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `log_file`, `log_keep_days`.
+
+# Daemon mode / detach / log file
+
+## Two-process watchdog (interactive mode)
+
+Fork happens **before** the tokio runtime starts (forking a multi-threaded process is unsafe).
+
+- **Parent (watchdog):** sets terminal input to raw-minus-OPOST mode (keeps `\n`→`\r\n` so child output renders correctly), spawns stdin-reading thread, watches for `d` / Ctrl+C. Exits when 'd' is pressed or Ctrl+C.
+- **Child (server):** runs normally; stdout/stderr go to the terminal. On SIGUSR1 (sent by parent on 'd') → `dup2` stdout/stderr to log file.
+
+Key: `OPOST` must NOT be cleared in the watchdog's termios setup. `cfmakeraw` clears it, which corrupts the child's output. Set `ICANON`, `ECHO`, `ISIG` flags manually.
+
+## --detach flag
+
+Pre-tokio `fork()` → parent prints "Detached. PID X." and exits → child calls `setsid()`, redirects stdin/stdout/stderr to log file, runs server.
+
+## PID file
+
+Written at `~/.config/voicetserver/voicetserver.pid` immediately after fork (before model loading). Deleted on SIGTERM. Prevents duplicate instances: startup checks PID file and errors if the process is still running.
+
+## --stop flag
+
+Reads PID file, sends SIGTERM, polls `/proc/<pid>` for up to 5 s, deletes PID file.
+
+## Log file
+
+- Default: `~/.config/voicetserver/logs/voicetserver.log`
+- Override: `--log-file <path>` or `log_file = "..."` in config.toml
+- Rotation: background tokio task checks size every 5 min; rotates at 20 MB → `voicetserver.log.<unix_ts>`
+- Pruning: rotated files older than `log_keep_days` days (default 7) are deleted on rotation
 
 # Custom words
 

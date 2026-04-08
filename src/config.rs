@@ -52,6 +52,9 @@ pub struct ConfigFile {
     pub silence_flush:     Option<usize>,
     pub min_speech:        Option<usize>,
     pub rms_ema:           Option<f32>,
+    // Log file settings
+    pub log_file:      Option<String>,
+    pub log_keep_days: Option<u32>,
 }
 
 /// Thread-safe handle to the on-disk config (for PATCH /config writes).
@@ -79,6 +82,9 @@ pub struct MergedConfig {
     pub silence_flush:     usize,
     pub min_speech:        usize,
     pub rms_ema:           f32,
+    // Log file settings
+    pub log_file:      Option<String>,
+    pub log_keep_days: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +124,10 @@ pub fn lora_output_dir() -> PathBuf {
     config_dir().join("lora_adapter")
 }
 
+pub fn pid_file_path() -> PathBuf {
+    config_dir().join("voicetserver.pid")
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap / load / save
 // ---------------------------------------------------------------------------
@@ -140,6 +150,9 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # silence_flush = 20
 # min_speech = 15
 # rms_ema = 0.3
+
+# log_file = "/path/to/voicetserver.log"   # default: ~/.config/voicetserver/logs/voicetserver.log
+# log_keep_days = 7
 "#;
 
 /// Create ~/.config/voicetserver/ and a commented config.toml template if not present.
@@ -229,6 +242,8 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let (tls_key_val,  tls_key_src)  = merge_opt_str(&cli.tls_key,  &file.tls_key);
     let lora_adapter = cli.lora_adapter.clone().or_else(|| file.lora_adapter.clone());
     let venv_path    = cli.venv_path.clone().or_else(|| file.venv_path.clone());
+    let log_file      = cli.log_file.clone().or_else(|| file.log_file.clone());
+    let log_keep_days = cli.log_keep_days.or(file.log_keep_days).unwrap_or(7);
 
     MergedConfig {
         model_dir: Sourced { value: model_dir_val, source: model_dir_src },
@@ -244,6 +259,8 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         silence_flush,
         min_speech,
         rms_ema,
+        log_file,
+        log_keep_days,
     }
 }
 

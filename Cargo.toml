@@ -1,6 +1,6 @@
 [package]
 name = "voicetserver"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 
 [features]
@@ -55,6 +55,9 @@ symphonia = { version = "0.5", features = ["mkv", "ogg", "vorbis", "pcm", "wav"]
 
 # Text correction (Phase 3)
 aho-corasick = "1"
+
+# UNIX process / signal / terminal helpers (detach / watchdog / log)
+nix = { version = "0.29", features = ["fs", "process", "signal", "term"] }
 
 [build-dependencies]
 # CUDA kernel compiler — always present as build-dep, but only invoked when cuda feature is enabled

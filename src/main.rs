@@ -20,6 +20,8 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use clap::Parser;
+use nix::sys::signal::{signal, SigHandler, Signal};
+use nix::unistd::{fork, ForkResult};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -88,6 +90,22 @@ pub struct Cli {
     #[arg(long)]
     pub venv_path: Option<String>,
 
+    /// Daemonize: fork at startup, log to file, return shell prompt immediately
+    #[arg(long)]
+    pub detach: bool,
+
+    /// Log file path [default: ~/.config/voicetserver/logs/voicetserver.log]
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<String>,
+
+    /// Days to retain rotated log files [default: 7]
+    #[arg(long, value_name = "DAYS")]
+    pub log_keep_days: Option<u32>,
+
+    /// Stop a running daemon (sends SIGTERM to PID from the PID file)
+    #[arg(long)]
+    pub stop: bool,
+
 }
 
 /// Mutable model components — serialised by a single tokio::sync::Mutex.
@@ -117,16 +135,27 @@ fn check_path(path: &str, source: ValueSource, field: &str) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    use std::io::IsTerminal;
+
     let cli = Cli::parse();
+
+    // Handle --stop before any config loading or forking
+    if cli.stop {
+        return stop_server();
+    }
 
     // Load config file and merge with CLI args (CLI overrides config overrides defaults).
     config::bootstrap_config_dir()?;
     let file_config = config::load_config_file()?;
     let merged = config::merge(&cli, &file_config);
-
-    // LoRA loading is deferred until after model init below.
 
     // Validate delay
     if merged.delay < 1 || merged.delay > 30 {
@@ -146,6 +175,53 @@ async fn main() -> Result<()> {
     }
     if let Some(ref key) = merged.tls_key.value {
         check_path(key, merged.tls_key.source, "tls_key")?;
+    }
+
+    // Guard against starting a second instance.
+    let is_server_mode = cli.wav_file.is_none();
+    if is_server_mode {
+        if let Some(pid) = read_pid_file() {
+            if is_process_running(pid) {
+                anyhow::bail!(
+                    "Server already running (PID {}). Use --stop to stop it.", pid
+                );
+            }
+            // Stale PID file from a previous crash — remove it
+            remove_pid_file();
+        }
+    }
+
+    // Resolve log path before forking (server mode only).
+    let log_path = if is_server_mode {
+        let p = resolve_log_path(&cli, &merged);
+        ensure_log_dir(&p);
+        Some(p)
+    } else {
+        None
+    };
+
+    // Fork / daemonize BEFORE tokio starts — forking a multi-threaded process is unsafe.
+    let mut watchdog_active = false;
+    if is_server_mode {
+        if cli.detach {
+            daemonize(log_path.as_ref().unwrap());
+            // Only child returns from daemonize()
+        } else if std::io::stdin().is_terminal() {
+            // Ignore SIGINT before fork so the child inherits the ignore.
+            // The watchdog parent handles Ctrl+C via raw byte 0x03 instead.
+            unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) }.ok();
+
+            if let Some(child_pid) = fork_watchdog() {
+                // Parent: watch for 'd' / Ctrl+C keypresses, then exit
+                watchdog_loop(child_pid, log_path.as_ref().unwrap());
+                std::process::exit(0);
+            }
+            // Child: redirect stdin to /dev/null (server doesn't need it)
+            redirect_stdin_to_null();
+            watchdog_active = true;
+        }
+        // Write PID file immediately after fork so --stop works during model loading
+        write_pid_file();
     }
 
     // mmap safetensors + spawn readahead (gives 0.5–1s head start before CUDA init)
@@ -187,6 +263,9 @@ async fn main() -> Result<()> {
         println!("{:<28} {}:{}", "Listen", merged.bind_addr.value, merged.port);
         let tls = merged.tls_cert.value.is_some() && merged.tls_key.value.is_some();
         println!("{:<28} {}", "TLS", if tls { "enabled (wss://)" } else { "disabled (ws://)" });
+        if let Some(ref lp) = log_path {
+            println!("{:<28} {}", "Log file", lp.display());
+        }
     }
     println!("{:<28} {}", "Config file", config::config_file_path().display());
     println!("{:<28} {}", "Custom words", config::custom_words_path().display());
@@ -240,7 +319,16 @@ async fn main() -> Result<()> {
                 dtype,
             });
             let shared_config = Arc::new(tokio::sync::Mutex::new(file_config));
-            server::run(model, merged, shared_config).await
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(server::run(
+                    model,
+                    merged,
+                    shared_config,
+                    log_path.unwrap_or_default(),
+                    watchdog_active,
+                ))
         }
     }
 }
@@ -375,6 +463,269 @@ fn load_wav(path: &str) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
+// ---- PID file helpers ----
+
+fn write_pid_file() {
+    std::fs::write(config::pid_file_path(), std::process::id().to_string()).ok();
+}
+
+fn read_pid_file() -> Option<u32> {
+    std::fs::read_to_string(config::pid_file_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+pub fn remove_pid_file() {
+    std::fs::remove_file(config::pid_file_path()).ok();
+}
+
+/// Check if a process with this PID is running (Linux: check /proc/<pid>).
+fn is_process_running(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+/// Send SIGTERM to the running daemon and wait for it to exit.
+fn stop_server() -> Result<()> {
+    let pid_path = config::pid_file_path();
+    let pid_str = std::fs::read_to_string(&pid_path)
+        .map_err(|_| anyhow::anyhow!(
+            "No PID file found ({}). Is the server running?", pid_path.display()
+        ))?;
+    let pid: i32 = pid_str.trim().parse()
+        .map_err(|_| anyhow::anyhow!("Invalid PID file: {}", pid_path.display()))?;
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    ).map_err(|e| anyhow::anyhow!("Failed to stop server (PID {}): {}", pid, e))?;
+
+    // Wait up to 5 s for the process to exit
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !is_process_running(pid as u32) {
+            break;
+        }
+    }
+
+    remove_pid_file();
+    println!("Server stopped (PID {}).", pid);
+    Ok(())
+}
+
+// ---- Detach / watchdog / log-file helpers ----
+
+fn resolve_log_path(cli: &Cli, cfg: &config::MergedConfig) -> std::path::PathBuf {
+    cli.log_file
+        .as_ref()
+        .or(cfg.log_file.as_ref())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config::config_dir().join("logs").join("voicetserver.log"))
+}
+
+fn ensure_log_dir(log_path: &std::path::Path) {
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+}
+
+/// Fork + setsid + redirect stdin/stdout/stderr to log file. Only the child returns.
+fn daemonize(log_path: &std::path::Path) {
+    use nix::unistd::setsid;
+    match unsafe { fork().expect("daemonize: fork failed") } {
+        ForkResult::Parent { child } => {
+            println!("Detached. PID {}. Log: {}", child, log_path.display());
+            std::process::exit(0);
+        }
+        ForkResult::Child => {
+            setsid().expect("daemonize: setsid failed");
+            redirect_stdin_to_null();
+            redirect_output_to_log(log_path);
+        }
+    }
+}
+
+/// Fork into a watchdog parent and a server child.
+/// Returns Some(child_pid) in the parent, None in the child.
+fn fork_watchdog() -> Option<nix::unistd::Pid> {
+    match unsafe { fork().expect("fork_watchdog: fork failed") } {
+        ForkResult::Parent { child } => Some(child),
+        ForkResult::Child => None,
+    }
+}
+
+/// Watchdog parent loop: child writes its logs directly to the terminal
+/// (inherited fds). Parent watches for 'd' or Ctrl+C and signals child accordingly.
+fn watchdog_loop(child_pid: nix::unistd::Pid, log_path: &std::path::Path) {
+    use nix::sys::termios::{self, SetArg};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus};
+    use std::os::unix::io::BorrowedFd;
+
+    // Set raw-ish terminal mode: character-by-character input, no echo, no signals.
+    // Intentionally keep OPOST set so the child's println! still translates \n → \r\n.
+    // cfmakeraw clears OPOST which corrupts the child's output since parent and child
+    // share the same tty fd.
+    let original_termios = nix::sys::termios::tcgetattr(
+        unsafe { BorrowedFd::borrow_raw(0) }
+    ).ok();
+    if let Some(ref t) = original_termios {
+        use nix::sys::termios::{InputFlags, LocalFlags, SpecialCharacterIndices as SCI};
+        let mut raw = t.clone();
+        raw.input_flags &= !(InputFlags::IGNBRK | InputFlags::BRKINT | InputFlags::PARMRK
+            | InputFlags::ISTRIP | InputFlags::INLCR | InputFlags::IGNCR
+            | InputFlags::ICRNL  | InputFlags::IXON);
+        // OPOST deliberately NOT cleared — keeps \n→\r\n for child's stdout
+        raw.local_flags &= !(LocalFlags::ECHO | LocalFlags::ECHONL | LocalFlags::ICANON
+            | LocalFlags::ISIG | LocalFlags::IEXTEN);
+        raw.control_chars[SCI::VMIN as usize]  = 1;
+        raw.control_chars[SCI::VTIME as usize] = 0;
+        termios::tcsetattr(unsafe { BorrowedFd::borrow_raw(0) }, SetArg::TCSANOW, &raw).ok();
+    }
+
+    // Spawn a thread that reads single bytes from stdin and sends them to the main loop.
+    let (tx, rx) = std::sync::mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::FromRawFd;
+        // ManuallyDrop prevents closing fd 0 when the File is dropped.
+        let mut stdin = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+        let mut buf = [0u8; 1];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(1) => { if tx.send(buf[0]).is_err() { break; } }
+                _ => break,
+            }
+        }
+    });
+
+    let restore = |orig: &Option<nix::sys::termios::Termios>| {
+        if let Some(t) = orig {
+            termios::tcsetattr(
+                unsafe { BorrowedFd::borrow_raw(0) },
+                SetArg::TCSANOW,
+                t,
+            ).ok();
+        }
+    };
+
+    loop {
+        // Check if child exited on its own.
+        match nix::sys::wait::waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => {
+                restore(&original_termios);
+                return;
+            }
+            _ => {}
+        }
+
+        // Check for keypress.
+        match rx.try_recv() {
+            Ok(b'd') | Ok(b'D') => {
+                // Signal child to redirect its output to the log file.
+                nix::sys::signal::kill(child_pid, Signal::SIGUSR1).ok();
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                restore(&original_termios);
+                println!("\nDetached. PID {}. Log: {}", child_pid, log_path.display());
+                return;
+            }
+            Ok(3) => {
+                // Ctrl+C in raw mode (byte 0x03 — terminal does not generate SIGINT in raw mode).
+                restore(&original_termios);
+                eprintln!("\nStopping server...");
+                nix::sys::signal::kill(child_pid, Signal::SIGTERM).ok();
+                nix::sys::wait::waitpid(child_pid, None).ok();
+                return;
+            }
+            _ => {}
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Redirect stdout and stderr to the log file (append mode).
+pub fn redirect_output_to_log(log_path: &std::path::Path) {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::IntoRawFd;
+
+    let log_fd = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .expect("redirect_output_to_log: cannot open log file")
+        .into_raw_fd();
+
+    nix::unistd::dup2(log_fd, 1).expect("dup2 stdout failed");
+    nix::unistd::dup2(log_fd, 2).expect("dup2 stderr failed");
+    nix::unistd::close(log_fd).ok();
+}
+
+/// Redirect stdin to /dev/null (server does not use stdin).
+fn redirect_stdin_to_null() {
+    use std::os::unix::io::IntoRawFd;
+    if let Ok(null) = std::fs::File::open("/dev/null") {
+        let fd = null.into_raw_fd();
+        nix::unistd::dup2(fd, 0).ok();
+        nix::unistd::close(fd).ok();
+    }
+}
+
+/// Rotate the log file if it exceeds 20 MB; prune rotated files older than keep_days.
+pub fn rotate_log_if_needed(log_path: &std::path::PathBuf, keep_days: u32) {
+    const MAX_SIZE: u64 = 20 * 1024 * 1024;
+
+    let len = match std::fs::metadata(log_path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if len <= MAX_SIZE {
+        return;
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let log_dir = log_path.parent().unwrap_or(std::path::Path::new("."));
+    let fname = log_path
+        .file_name()
+        .map_or("voicetserver.log".into(), |n| n.to_string_lossy().into_owned());
+    let rotated = log_dir.join(format!("{}.{}", fname, ts));
+
+    if std::fs::rename(log_path, &rotated).is_ok() {
+        prune_old_logs(log_dir, keep_days);
+    }
+}
+
+/// Delete rotated log files older than keep_days days.
+fn prune_old_logs(log_dir: &std::path::Path, keep_days: u32) {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(keep_days as u64 * 86400))
+        .unwrap_or(std::time::UNIX_EPOCH);
+
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // Only prune files that look like rotated logs: "voicetserver.log.<timestamp>"
+        if !name.starts_with("voicetserver.log.") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified < cutoff {
+                    std::fs::remove_file(&path).ok();
+                }
+            }
+        }
+    }
+}
+
 // ---- Server module (inline) ----
 mod server {
     use super::*;
@@ -418,6 +769,8 @@ mod server {
         model: Arc<VoxtralModel>,
         merged: MergedConfig,
         config_file: SharedConfigFile,
+        log_path: std::path::PathBuf,
+        watchdog_active: bool,
     ) -> Result<()> {
         let vals = IniValues {
             delay: merged.delay,
@@ -440,6 +793,42 @@ mod server {
             lora_adapter: merged.lora_adapter.clone(),
             venv_path:    merged.venv_path.clone(),
         };
+
+        // SIGUSR1: redirect stdout/stderr to log file (triggered by watchdog parent on 'd' press).
+        if watchdog_active {
+            if let Ok(mut stream) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::user_defined1()
+            ) {
+                let lp = log_path.clone();
+                tokio::spawn(async move {
+                    stream.recv().await;
+                    crate::redirect_output_to_log(&lp);
+                });
+            }
+        }
+        // SIGTERM: graceful exit (from watchdog Ctrl+C handler, --stop, or systemd stop).
+        if let Ok(mut stream) = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate()
+        ) {
+            tokio::spawn(async move {
+                stream.recv().await;
+                crate::remove_pid_file();
+                std::process::exit(0);
+            });
+        }
+        // Log rotation: check every 5 minutes, rotate at 20 MB, prune files older than log_keep_days.
+        if !log_path.as_os_str().is_empty() {
+            let lp = log_path.clone();
+            let keep_days = merged.log_keep_days;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                interval.tick().await; // skip the immediate first tick
+                loop {
+                    interval.tick().await;
+                    crate::rotate_log_if_needed(&lp, keep_days);
+                }
+            });
+        }
 
         let connection_count = Arc::new(AtomicUsize::new(0));
         let words_path = crate::config::custom_words_path();
@@ -502,12 +891,20 @@ mod server {
                 .map_err(|e| anyhow::anyhow!("TLS config error: {}", e))?;
             println!("=== SCHMIDIspeech server listening on wss://{}:{}/asr ===",
                 merged.bind_addr.value, merged.port);
+            if watchdog_active {
+                println!("Press 'd' to detach (log -> {}), Ctrl+C to stop",
+                    log_path.display());
+            }
             axum_server::bind_rustls(addr, tls_config)
                 .serve(app.into_make_service())
                 .await?;
         } else {
             println!("=== SCHMIDIspeech server listening on ws://{}:{}/asr (no TLS) ===",
                 merged.bind_addr.value, merged.port);
+            if watchdog_active {
+                println!("Press 'd' to detach (log -> {}), Ctrl+C to stop",
+                    log_path.display());
+            }
             axum_server::bind(addr)
                 .serve(app.into_make_service())
                 .await?;
