@@ -36,6 +36,7 @@
     let micStream = null;
     let recording = false;
     let reconnectAttempts = 0;
+    let reconnectTimer = null;
     const MAX_RECONNECT = 3;
     const SAMPLE_RATE = 16000;
 
@@ -1026,6 +1027,7 @@
     }
 
     function stopRecording() {
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         recording = false;
         if (scriptProcessor) {
             scriptProcessor.disconnect();
@@ -1089,7 +1091,7 @@
         ws.onerror = () => {
             if (reconnectAttempts < MAX_RECONNECT) {
                 reconnectAttempts++;
-                setTimeout(
+                reconnectTimer = setTimeout(
                     () => connectWS(null),
                     Math.pow(2, reconnectAttempts) * 500,
                 );
@@ -1102,10 +1104,13 @@
         ws.onclose = () => {
             if (recording && reconnectAttempts < MAX_RECONNECT) {
                 reconnectAttempts++;
-                setTimeout(
+                reconnectTimer = setTimeout(
                     () => connectWS(null),
                     Math.pow(2, reconnectAttempts) * 500,
                 );
+            } else if (recording) {
+                showToast("SCHMIDIspeech: Server nicht erreichbar — Aufnahme beendet");
+                stopRecording();
             }
         };
     }

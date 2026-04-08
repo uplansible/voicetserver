@@ -237,6 +237,16 @@ Right-click → four tabs: **Client** (URL, hotkey), **Server** (runtime params,
 
 **Paare tab:** scrollable list of all recorded pairs (id, text, duration) with per-pair ▶ playback and ✕ delete. LoRA training run + status log.
 
+## WebSocket reconnect / mic lifecycle
+
+`connectWS()` retries up to `MAX_RECONNECT` (3) times on `onerror` and `onclose`.
+`reconnectTimer` stores the pending `setTimeout` ID so `stopRecording()` can cancel it.
+`ws.onclose` has an `else if (recording)` branch that calls `stopRecording()` when retries
+are exhausted — without this, `micStream` tracks stay alive and the next `getUserMedia`
+fails with `NotFoundError: requested device not found` until browser restart.
+Closing the tab releases the mic automatically; the stuck-mic bug only manifests when
+staying on the page after a failed connection.
+
 ## Silence / final message behaviour
 
 `ChunkOutput::Silence` fires after silence threshold; server calls `take_text_buf()` which
