@@ -373,6 +373,16 @@ impl TextDecoder {
         }
     }
 
+    /// Remove all LoRA delta weights, reverting to base model behaviour.
+    pub fn clear_lora(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.attention.lora_wq = None;
+            layer.attention.lora_wk = None;
+            layer.attention.lora_wv = None;
+            layer.attention.lora_wo = None;
+        }
+    }
+
     /// Build prefill embeddings: BOS + (LEFT_PAD_TOKENS + NUM_DELAY_TOKENS) PAD tokens,
     /// each fused (element-wise add) with the corresponding adapter frame.
     /// Returns the fused embeddings tensor [1, PREFILL_LEN, HIDDEN_SIZE].

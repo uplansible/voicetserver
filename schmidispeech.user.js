@@ -242,6 +242,7 @@
             <div id="schmidi-paare-count" style="${LABEL_STYLE}">— Paare</div>
             <div style="border-top:1px solid #444;margin:4px 0;"></div>
             <button id="schmidi-training-run" style="${BTN_PRIMARY}">▶ LoRA trainieren</button>
+            <button id="schmidi-lora-reload" style="${BTN_CANCEL}">↺ LoRA neu laden</button>
             <div id="schmidi-paare-status" style="${LABEL_STYLE};min-height:14px;"></div>
             <pre id="schmidi-training-log" style="background:#111;border:1px solid #333;border-radius:4px;padding:6px;font-size:10px;max-height:80px;overflow-y:auto;margin:0;display:none;color:#8f8;"></pre>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
@@ -825,6 +826,7 @@
     }
 
     configPanel.querySelector('#schmidi-training-run').addEventListener('click', runLoraTraining);
+    configPanel.querySelector('#schmidi-lora-reload').addEventListener('click', reloadLora);
 
     async function runLoraTraining() {
         setPaareStatus('Starte Training…', false);
@@ -837,6 +839,19 @@
             if (logEl) logEl.style.display = 'block';
             if (trainingStatusPoll) clearInterval(trainingStatusPoll);
             trainingStatusPoll = setInterval(pollTrainingStatus, 2000);
+        } catch (e) {
+            setPaareStatus('Fehler: ' + e.message, true);
+        }
+    }
+
+    async function reloadLora() {
+        setPaareStatus('Lade LoRA neu…', false);
+        try {
+            const res = await fetch(`${getHttpBase()}/lora/reload`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || res.status);
+            const msg = data.action === 'applied' ? 'LoRA geladen ✓' : 'LoRA entfernt (kein Adapter)';
+            setPaareStatus(msg, false);
         } catch (e) {
             setPaareStatus('Fehler: ' + e.message, true);
         }

@@ -90,6 +90,11 @@ pub struct Cli {
     #[arg(long)]
     pub venv_path: Option<String>,
 
+    /// Base directory for custom_words.txt, training/, lora_adapter/, training_sentences.txt
+    /// [default: ~/.config/voicetserver/]
+    #[arg(long, value_name = "PATH")]
+    pub data_dir: Option<String>,
+
     /// Daemonize: fork at startup, log to file, return shell prompt immediately
     #[arg(long)]
     pub detach: bool,
@@ -156,6 +161,11 @@ fn run() -> Result<()> {
     config::bootstrap_config_dir()?;
     let file_config = config::load_config_file()?;
     let merged = config::merge(&cli, &file_config);
+
+    // Ensure data_dir exists (may differ from config_dir when --data-dir / data_dir is set).
+    if let Err(e) = std::fs::create_dir_all(&merged.data_dir) {
+        anyhow::bail!("Cannot create data_dir {}: {}", merged.data_dir.display(), e);
+    }
 
     // Validate delay
     if merged.delay < 1 || merged.delay > 30 {
@@ -268,7 +278,7 @@ fn run() -> Result<()> {
         }
     }
     println!("{:<28} {}", "Config file", config::config_file_path().display());
-    println!("{:<28} {}", "Custom words", config::custom_words_path().display());
+    println!("{:<28} {}", "Data dir", merged.data_dir.display());
     println!();
 
     let vb = VarBuilder::from_slice_safetensors(&st_data, dtype, &device)?;
@@ -784,6 +794,7 @@ mod server {
         settings.state.store(STATE_READY, Ordering::SeqCst);
 
         let tls_enabled = merged.tls_cert.value.is_some() && merged.tls_key.value.is_some();
+        let paths = crate::config::WorkspacePaths::new(&merged.data_dir);
         let snapshot = StartupSnapshot {
             model_dir:    merged.model_dir.value.clone(),
             device:       merged.device,
@@ -792,6 +803,7 @@ mod server {
             tls_enabled,
             lora_adapter: merged.lora_adapter.clone(),
             venv_path:    merged.venv_path.clone(),
+            data_dir:     merged.data_dir.to_string_lossy().into_owned(),
         };
 
         // SIGUSR1: redirect stdout/stderr to log file (triggered by watchdog parent on 'd' press).
@@ -831,12 +843,16 @@ mod server {
         }
 
         let connection_count = Arc::new(AtomicUsize::new(0));
-        let words_path = crate::config::custom_words_path();
+        let words_path = paths.custom_words.clone();
         let words = Arc::new(tokio::sync::RwLock::new(
             WordsCorrector::load(&words_path)
         ));
 
         let training_status = Arc::new(tokio::sync::Mutex::new(TrainingStatus::new()));
+
+        let lora_path = Arc::new(tokio::sync::RwLock::new(
+            snapshot.lora_adapter.as_ref().map(std::path::PathBuf::from)
+        ));
 
         let state = Arc::new(AppState {
             model,
@@ -847,6 +863,8 @@ mod server {
             words_path,
             words,
             training_status,
+            paths,
+            lora_path,
         });
 
         let cors = CorsLayer::new()
@@ -877,6 +895,7 @@ mod server {
             .route("/training",             get(training_get_handler).delete(training_delete_handler))
             .route("/training/run",         axum::routing::post(training_run_handler))
             .route("/training/status",      get(training_status_handler))
+            .route("/lora/reload",          axum::routing::post(lora_reload_handler))
             .layer(cors)
             .with_state(state);
 
@@ -923,6 +942,10 @@ mod server {
         words_path:        std::path::PathBuf,
         words:             Arc<tokio::sync::RwLock<WordsCorrector>>,
         training_status:   Arc<tokio::sync::Mutex<TrainingStatus>>,
+        paths:             crate::config::WorkspacePaths,
+        /// Currently active LoRA adapter path (None if no adapter loaded).
+        /// Updated by POST /lora/reload.
+        lora_path:         Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
     }
 
     // ---- /health ----
@@ -1192,22 +1215,22 @@ mod server {
 ";
 
     /// GET /training/sentences — returns calibration sentences annotated with recording status
-    async fn training_sentences_handler(State(_state): State<Arc<AppState>>) -> Response {
-        let path = crate::config::training_sentences_path();
+    async fn training_sentences_handler(State(state): State<Arc<AppState>>) -> Response {
+        let path = &state.paths.training_sentences;
         // Create default file if not present
         if !path.exists() {
-            if let Err(e) = tokio::fs::write(&path, DEFAULT_TRAINING_SENTENCES).await {
+            if let Err(e) = tokio::fs::write(path, DEFAULT_TRAINING_SENTENCES).await {
                 return (StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to create sentences file: {e}")).into_response();
             }
         }
-        let content = match tokio::fs::read_to_string(&path).await {
+        let content = match tokio::fs::read_to_string(path).await {
             Ok(c) => c,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
 
         // Build map: sentence text → list of pair IDs that recorded it
-        let pairs_path = crate::config::training_pairs_path();
+        let pairs_path = &state.paths.training_pairs;
         let mut recorded: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
         if let Ok(pairs_content) = tokio::fs::read_to_string(&pairs_path).await {
             for line in pairs_content.lines().filter(|l| !l.trim().is_empty()) {
@@ -1235,14 +1258,14 @@ mod server {
 
     /// GET /training/audio/{id} — serve a recorded WAV file for playback
     async fn training_audio_handler(
-        State(_state): State<Arc<AppState>>,
+        State(state): State<Arc<AppState>>,
         axum::extract::Path(id): axum::extract::Path<String>,
     ) -> Response {
         // Only allow numeric IDs to prevent path traversal
         if !id.chars().all(|c| c.is_ascii_digit()) {
             return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
         }
-        let wav_path = crate::config::training_audio_dir().join(format!("{id}.wav"));
+        let wav_path = state.paths.training_audio_dir.join(format!("{id}.wav"));
         match tokio::fs::read(&wav_path).await {
             Ok(bytes) => (
                 [(axum::http::header::CONTENT_TYPE, "audio/wav")],
@@ -1254,14 +1277,14 @@ mod server {
 
     /// DELETE /training/pair/{id} — remove one recorded pair (WAV + JSONL entry)
     async fn training_pair_delete_handler(
-        State(_state): State<Arc<AppState>>,
+        State(state): State<Arc<AppState>>,
         axum::extract::Path(id): axum::extract::Path<String>,
     ) -> Response {
         if !id.chars().all(|c| c.is_ascii_digit()) {
             return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
         }
-        let wav_path  = crate::config::training_audio_dir().join(format!("{id}.wav"));
-        let pairs_path = crate::config::training_pairs_path();
+        let wav_path  = state.paths.training_audio_dir.join(format!("{id}.wav"));
+        let pairs_path = &state.paths.training_pairs;
 
         if !wav_path.exists() {
             return StatusCode::NOT_FOUND.into_response();
@@ -1296,10 +1319,10 @@ mod server {
 
     /// DELETE /training/sentence — remove one sentence from training_sentences.txt
     async fn training_sentence_delete_handler(
-        State(_state): State<Arc<AppState>>,
+        State(state): State<Arc<AppState>>,
         Json(body): Json<DeleteSentenceRequest>,
     ) -> Response {
-        let path = crate::config::training_sentences_path();
+        let path = &state.paths.training_sentences;
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1335,14 +1358,14 @@ mod server {
 
     /// POST /training/sentence — append a new sentence to training_sentences.txt
     async fn training_sentence_add_handler(
-        State(_state): State<Arc<AppState>>,
+        State(state): State<Arc<AppState>>,
         Json(body): Json<AddSentenceRequest>,
     ) -> Response {
         let text = body.text.trim().to_string();
         if text.is_empty() {
             return (StatusCode::BAD_REQUEST, "Empty sentence").into_response();
         }
-        let path = crate::config::training_sentences_path();
+        let path = &state.paths.training_sentences;
         // Ensure file exists (may create default stub first)
         if !path.exists() {
             let _ = tokio::fs::write(&path, DEFAULT_TRAINING_SENTENCES).await;
@@ -1368,7 +1391,7 @@ mod server {
 
     /// PATCH /training/sentence — replace one sentence in training_sentences.txt
     async fn training_sentence_edit_handler(
-        State(_state): State<Arc<AppState>>,
+        State(state): State<Arc<AppState>>,
         Json(body): Json<EditSentenceRequest>,
     ) -> Response {
         let old_text = body.old.trim().to_string();
@@ -1376,7 +1399,7 @@ mod server {
         if new_text.is_empty() {
             return (StatusCode::BAD_REQUEST, "New text is empty").into_response();
         }
-        let path = crate::config::training_sentences_path();
+        let path = &state.paths.training_sentences;
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1405,8 +1428,8 @@ mod server {
     }
 
     /// GET /training/pairs — list all recorded pairs
-    async fn training_pairs_handler(State(_state): State<Arc<AppState>>) -> Response {
-        let pairs_path = crate::config::training_pairs_path();
+    async fn training_pairs_handler(State(state): State<Arc<AppState>>) -> Response {
+        let pairs_path = &state.paths.training_pairs;
         let content = tokio::fs::read_to_string(&pairs_path).await.unwrap_or_default();
         let mut pairs: Vec<serde_json::Value> = content
             .lines()
@@ -1427,7 +1450,7 @@ mod server {
 
     /// POST /training/pair?text=... — body is raw f32 LE PCM at 16kHz
     async fn training_pair_handler(
-        State(_state): State<Arc<AppState>>,
+        State(state): State<Arc<AppState>>,
         Query(params): Query<TrainingPairQuery>,
         body: Bytes,
     ) -> Response {
@@ -1436,13 +1459,13 @@ mod server {
             return (StatusCode::BAD_REQUEST, "Empty audio body").into_response();
         }
 
-        let audio_dir = crate::config::training_audio_dir();
-        if let Err(e) = tokio::fs::create_dir_all(&audio_dir).await {
+        let audio_dir = &state.paths.training_audio_dir;
+        if let Err(e) = tokio::fs::create_dir_all(audio_dir).await {
             return (StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to create training dir: {e}")).into_response();
         }
 
-        let pairs_path = crate::config::training_pairs_path();
+        let pairs_path = &state.paths.training_pairs;
 
         // Determine next ID from existing pair count
         let count = count_pairs(&pairs_path).await;
@@ -1479,8 +1502,8 @@ mod server {
     }
 
     /// GET /training — summary of collected pairs
-    async fn training_get_handler(State(_state): State<Arc<AppState>>) -> Response {
-        let pairs_path = crate::config::training_pairs_path();
+    async fn training_get_handler(State(state): State<Arc<AppState>>) -> Response {
+        let pairs_path = &state.paths.training_pairs;
         let content = tokio::fs::read_to_string(&pairs_path).await.unwrap_or_default();
         let mut count = 0usize;
         let mut duration_s = 0.0f64;
@@ -1494,8 +1517,8 @@ mod server {
     }
 
     /// DELETE /training/pairs — remove all collected training data
-    async fn training_delete_handler(State(_state): State<Arc<AppState>>) -> Response {
-        let dir = crate::config::training_dir();
+    async fn training_delete_handler(State(state): State<Arc<AppState>>) -> Response {
+        let dir = &state.paths.training_dir;
         if dir.exists() {
             if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                 return (StatusCode::INTERNAL_SERVER_ERROR,
@@ -1522,9 +1545,9 @@ mod server {
                 "tools/train_lora.py not found — run server from project root").into_response(),
         };
 
-        let data_dir   = crate::config::training_dir();
+        let data_dir   = state.paths.training_dir.clone();
         let model_dir  = state.startup_snapshot.model_dir.clone();
-        let output_dir = crate::config::lora_output_dir();
+        let output_dir = state.paths.lora_output_dir.clone();
         let venv_path  = state.startup_snapshot.venv_path.clone();
 
         // Ensure training dir exists before passing it to Python
@@ -1553,6 +1576,65 @@ mod server {
             "status": ts.status,
             "log": ts.log,
         })).into_response()
+    }
+
+    // ---- LoRA hot-reload ----
+
+    /// POST /lora/reload — reload (or swap) the LoRA adapter without restarting.
+    ///
+    /// Optional JSON body: `{"path": "/abs/path/to/adapter_dir"}`.
+    /// If omitted, reloads from the currently active path.
+    /// If the path does not contain adapter files, the LoRA is cleared (base model).
+    async fn lora_reload_handler(
+        State(state): State<Arc<AppState>>,
+        body: Option<Json<serde_json::Value>>,
+    ) -> impl IntoResponse {
+        let requested = body.as_ref()
+            .and_then(|b| b.get("path"))
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from);
+
+        let path = if let Some(p) = requested {
+            p
+        } else {
+            match state.lora_path.read().await.clone() {
+                Some(p) => p,
+                None => return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "no lora path configured"}))).into_response(),
+            }
+        };
+
+        let device = state.model.device.clone();
+        let dtype  = state.model.dtype;
+        let path2  = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::lora::load_decoder_lora(&path2, &device, dtype)
+        }).await;
+
+        let lora_opt = match result {
+            Ok(Ok(l))  => l,
+            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()}))).into_response(),
+            Err(e)     => return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()}))).into_response(),
+        };
+
+        let action = lora_opt.as_ref().map_or("cleared", |_| "applied");
+        {
+            let mut guard = state.model.inner.lock().await;
+            match lora_opt {
+                Some(ref lora) => guard.dec.set_lora(lora),
+                None           => guard.dec.clear_lora(),
+            }
+        }
+
+        *state.lora_path.write().await = Some(path.clone());
+        eprintln!("LoRA hot-reload {}: {}", action, path.display());
+        (StatusCode::OK, Json(json!({
+            "status": "ok",
+            "action": action,
+            "path":   path.to_string_lossy(),
+        }))).into_response()
     }
 
     // ---- Training helpers ----

@@ -141,6 +141,8 @@ bind_addr  = "0.0.0.0"
 tls_cert   = "/etc/tailscale/certs/host.crt"
 tls_key    = "/etc/tailscale/certs/host.key"
 venv_path  = "/path/to/voicetserver-venv"   # Python venv for LoRA training
+data_dir   = "/path/to/data"                # base for training/, lora_adapter/, custom_words.txt
+                                            # default: ~/.config/voicetserver/
 
 delay             = 6
 silence_threshold = 0.006
@@ -213,7 +215,8 @@ curl https://"$SERVER_HOST":8765/health
 **Right-click the button** to open the settings panel:
 - **Client tab** — server URL, hotkey
 - **Server tab** — live inference parameters, custom word corrections
-- **Training tab** — LoRA voice calibration (record sentences, trigger fine-tuning)
+- **Aufnehmen tab** — record calibration sentences for LoRA training
+- **Paare tab** — review recorded pairs, trigger LoRA training, **reload the active adapter** (↺ LoRA neu laden)
 
 ---
 
@@ -268,7 +271,7 @@ Open the **Training tab** in the browser UI:
 - Edit the transcript if needed, then click **Speichern**
 - Repeat for as many sentences as you like (20–50 pairs is a reasonable start)
 
-Audio is saved to `~/.config/voicetserver/training/`.
+Audio is saved to `{data_dir}/training/` (defaults to `~/.config/voicetserver/training/`).
 
 ### Training data guidelines
 
@@ -316,13 +319,19 @@ The model will be used during real dictation; train it on the same speech style.
 
 Click **LoRA trainieren** in the Training tab (or `POST /training/run`).
 The server runs `tools/train_lora.py` and streams progress to the log area.
-The adapter is saved to `~/.config/voicetserver/lora_adapter/`.
+The adapter is saved to `{data_dir}/lora_adapter/`.
 
 ### 5. Load the adapter
 
 Add to `~/.config/voicetserver/config.toml` and restart the server:
 ```toml
-lora_adapter = "/home/youruser/.config/voicetserver/lora_adapter"
+lora_adapter = "/path/to/data/lora_adapter"
+```
+
+After training completes you can reload the adapter **without restarting** from the
+**Paare tab** (↺ LoRA neu laden button) or via curl:
+```bash
+curl -X POST https://$SERVER_HOST:8765/lora/reload
 ```
 
 ---
@@ -342,8 +351,9 @@ lora_adapter = "/home/youruser/.config/voicetserver/lora_adapter"
 | `--bind-addr` | `127.0.0.1` | Bind address (`0.0.0.0` for Tailscale) |
 | `--tls-cert` | *(none)* | Path to TLS cert — enables `wss://` |
 | `--tls-key` | *(none)* | Path to TLS private key |
-| `--lora-adapter` | *(none)* | Path to LoRA adapter directory |
+| `--lora-adapter` | *(none)* | Path to LoRA adapter directory (loaded at startup) |
 | `--venv-path` | *(none)* | Python venv for LoRA training |
+| `--data-dir` | `~/.config/voicetserver/` | Base dir for training data, LoRA output, custom words |
 | `--detach` | *(off)* | Daemonize: fork, log to file, return shell prompt |
 | `--stop` | *(off)* | Stop a running daemon (sends SIGTERM via PID file) |
 | `--log-file` | *see below* | Log file path (default: `~/.config/voicetserver/logs/voicetserver.log`) |
@@ -363,12 +373,12 @@ voicetserver (Rust, headless, multi-connection)
   ├─ GPU lock: tokio::sync::Mutex<ModelInner> — serial forward passes
   ├─ Per-connection: StreamingState { KV caches, SilenceDetector, mel buffer }
   ├─ Mel + Voxtral inference (Candle, BF16, Flash Attention 2)
-  ├─ LoRA: optional decoder adapter (lora.rs) loaded at startup
+  ├─ LoRA: optional decoder adapter (lora.rs); hot-reload via POST /lora/reload
   └─ WebSocket: {"type":"partial","text":"..."} / {"type":"final","text":"..."}
 
 Training pipeline (POST /training/run):
-  Browser Training tab → audio pairs → tools/train_lora.py (PyTorch)
-  → adapter_model.safetensors → reload server with lora_adapter config
+  Browser Paare tab → audio pairs → tools/train_lora.py (PyTorch)
+  → adapter_model.safetensors → POST /lora/reload (no restart needed)
 ```
 
 ---

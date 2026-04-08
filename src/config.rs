@@ -1,11 +1,11 @@
 // Config file loading, merging, and persistence for voicetserver.
 //
 // Config file:  ~/.config/voicetserver/config.toml
-// Custom words: ~/.config/voicetserver/custom_words.txt
+// Custom words: {data_dir}/custom_words.txt  (data_dir defaults to ~/.config/voicetserver/)
 //
 // Priority: CLI arg > config file value > compiled default
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -46,6 +46,7 @@ pub struct ConfigFile {
     pub tls_key:      Option<String>,
     pub lora_adapter: Option<String>,
     pub venv_path:    Option<String>,
+    pub data_dir:     Option<String>,
     // Runtime-adjustable via PATCH /config
     pub delay:             Option<usize>,
     pub silence_threshold: Option<f32>,
@@ -76,6 +77,9 @@ pub struct MergedConfig {
     pub port:         u16,
     pub lora_adapter: Option<String>,
     pub venv_path:    Option<String>,
+    /// Base directory for custom_words.txt, training/, lora_adapter/, training_sentences.txt.
+    /// Defaults to config_dir() (~/.config/voicetserver/) when not set.
+    pub data_dir: PathBuf,
     // Runtime-adjustable
     pub delay:             usize,
     pub silence_threshold: f32,
@@ -100,32 +104,45 @@ pub fn config_file_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-pub fn custom_words_path() -> PathBuf {
-    config_dir().join("custom_words.txt")
-}
-
-pub fn training_dir() -> PathBuf {
-    config_dir().join("training")
-}
-
-pub fn training_audio_dir() -> PathBuf {
-    training_dir().join("audio")
-}
-
-pub fn training_pairs_path() -> PathBuf {
-    training_dir().join("pairs.jsonl")
-}
-
-pub fn training_sentences_path() -> PathBuf {
-    config_dir().join("training_sentences.txt")
-}
-
-pub fn lora_output_dir() -> PathBuf {
-    config_dir().join("lora_adapter")
-}
-
 pub fn pid_file_path() -> PathBuf {
     config_dir().join("voicetserver.pid")
+}
+
+// ---------------------------------------------------------------------------
+// Workspace paths (data dir — configurable base for user data files)
+// ---------------------------------------------------------------------------
+
+/// All data-file paths derived from a single configurable base directory.
+///
+/// The base defaults to `config_dir()` (~/.config/voicetserver/) so existing
+/// setups are fully backward compatible.  Set `data_dir` in config.toml or
+/// `--data-dir` on the CLI to move training data, LoRA adapter output,
+/// custom_words.txt, and training_sentences.txt to a different location.
+///
+/// Server-internal files (config.toml, voicetserver.pid, logs/) always live
+/// in `config_dir()` regardless of this setting.
+#[derive(Clone, Debug)]
+pub struct WorkspacePaths {
+    pub custom_words:       PathBuf,  // {data_dir}/custom_words.txt
+    pub training_dir:       PathBuf,  // {data_dir}/training/
+    pub training_audio_dir: PathBuf,  // {data_dir}/training/audio/
+    pub training_pairs:     PathBuf,  // {data_dir}/training/pairs.jsonl
+    pub training_sentences: PathBuf,  // {data_dir}/training_sentences.txt
+    pub lora_output_dir:    PathBuf,  // {data_dir}/lora_adapter/
+}
+
+impl WorkspacePaths {
+    pub fn new(data_dir: &Path) -> Self {
+        let training = data_dir.join("training");
+        WorkspacePaths {
+            custom_words:       data_dir.join("custom_words.txt"),
+            training_dir:       training.clone(),
+            training_audio_dir: training.join("audio"),
+            training_pairs:     training.join("pairs.jsonl"),
+            training_sentences: data_dir.join("training_sentences.txt"),
+            lora_output_dir:    data_dir.join("lora_adapter"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +161,8 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # tls_key  = "/etc/tailscale/certs/host.key"
 # device = 0
 # venv_path = "/mnt/ssdupl/voicetserver-venv"   # Python venv for LoRA training
+# data_dir = "/path/to/data"   # base for custom_words.txt, training/, lora_adapter/, training_sentences.txt
+#                               # defaults to ~/.config/voicetserver/ when unset
 
 # delay = 4
 # silence_threshold = 0.006
@@ -244,6 +263,10 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let venv_path    = cli.venv_path.clone().or_else(|| file.venv_path.clone());
     let log_file      = cli.log_file.clone().or_else(|| file.log_file.clone());
     let log_keep_days = cli.log_keep_days.or(file.log_keep_days).unwrap_or(7);
+    let data_dir = cli.data_dir.clone()
+        .or_else(|| file.data_dir.clone())
+        .map(PathBuf::from)
+        .unwrap_or_else(config_dir);
 
     MergedConfig {
         model_dir: Sourced { value: model_dir_val, source: model_dir_src },
@@ -254,6 +277,7 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         port,
         lora_adapter,
         venv_path,
+        data_dir,
         delay,
         silence_threshold,
         silence_flush,

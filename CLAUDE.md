@@ -1,6 +1,14 @@
 # Build
 
-## Dev (Docker, no GPU)
+> **Dev server has CUDA installed** — always use the CUDA build command below.
+
+```bash
+export CUDA_PATH=/usr/local/cuda && export PATH=$CUDA_PATH/bin:$PATH && CUDA_COMPUTE_CAP=89 cargo build --release --features cuda 2>&1
+```
+
+`cargo check` still works for fast syntax checking without full compile.
+
+## Without CUDA (Docker / no GPU)
 
 ```bash
 apt install -y pkg-config build-essential libssl-dev
@@ -8,7 +16,7 @@ cargo build
 cargo check   # fast syntax check
 ```
 
-## Production (GPU server, Ubuntu + CUDA 12.x)
+## CUDA (GPU server, Ubuntu + CUDA 12.x)
 
 ```bash
 apt install -y pkg-config build-essential libssl-dev
@@ -107,7 +115,9 @@ CLI args override config file values. Unknown fields in the config file are sile
 
 Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`.
 
-Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `log_file`, `log_keep_days`.
+Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `data_dir`, `log_file`, `log_keep_days`.
+
+`data_dir` — base directory for `custom_words.txt`, `training/`, `lora_adapter/`, `training_sentences.txt`. Defaults to `~/.config/voicetserver/`. Config file and PID file always stay in `~/.config/voicetserver/` regardless of this setting.
 
 # Daemon mode / detach / log file
 
@@ -155,10 +165,11 @@ Example: add `Migration=Miktion` to correct a model phonetic confusion.
 All endpoints support CORS (`allow_origin: *`).
 
 - `GET /health` — `{"status":"ready","connections":N}`
-- `GET /config` — current settings (runtime + startup snapshot)
+- `GET /config` — current settings (runtime + startup snapshot); includes `data_dir`
 - `PATCH /config` — update settings; runtime params apply immediately, startup params written to file
 - `GET /words` — `{"words":[...]}`
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
+- `POST /lora/reload` — hot-reload LoRA adapter without restart; optional JSON body `{"path":"..."}` to specify dir (omit to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
 - `ws[s]://host:port/asr` — WebSocket audio stream (raw f32 LE PCM 16kHz mono)
 
 ### Training (Phase 2 — LoRA voice calibration)
@@ -249,3 +260,46 @@ Custom word correction is applied to the text returned by `take_text_buf()` befo
 # Versioning
 
 Semantic versioning in `Cargo.toml`. Increment patch on each push.
+
+# Multi-User Architecture (Exploration Notes)
+
+Not yet implemented — single-user server. Notes for future reference.
+
+## Shared LoRA adapter for two users
+
+Train a single LoRA on both speakers' audio combined. Both have the same vocabulary; the adapter mainly corrects phonetic patterns. Start with a combined adapter — if quality is unacceptable for one user, train separate adapters and use `POST /lora/reload` to switch.
+
+## Concurrent sessions
+
+**Same LoRA adapter:** Already works. LoRA weights are read-only during inference; all WebSocket sessions serialize on the single `Mutex<ModelInner>` GPU lock.
+
+**Different LoRA adapters concurrently:** Not supported without architectural change. Would require per-session LoRA deltas applied at inference time inside `process_chunk_sync()` — moving LoRA from `TextDecoder` fields into `StreamingState`. Deferred until needed.
+
+## Proposed per-user folder layout (when `--data-dir` is used)
+
+```
+{data_dir}/
+├── custom_words.txt            # global fallback
+├── training_sentences.txt      # shared sentence pool
+├── users/
+│   ├── alice/
+│   │   ├── custom_words.txt
+│   │   ├── lora_adapter/
+│   │   └── training/
+│   │       ├── audio/*.wav
+│   │       └── pairs.jsonl
+│   └── bob/
+│       ├── custom_words.txt
+│       ├── lora_adapter/
+│       └── training/
+│           ├── audio/*.wav
+│           └── pairs.jsonl
+```
+
+## Key files to modify for full per-user support
+
+- `src/config.rs` — parameterise `WorkspacePaths::new(user_id)` → user-specific sub-paths
+- `src/settings.rs` — add `StartupSnapshot.user_id`; extend API with user-scoped endpoints
+- `src/main.rs` — `AppState.paths` → per-user lookup; training/words handlers accept `?user=` query param
+- `src/streaming.rs` — `StreamingState` carries per-session `WordsCorrector` + optional LoRA delta
+- `src/decoder.rs` — separate LoRA application from `set_lora()` (currently mutates global decoder) into per-call delta in `forward()`
