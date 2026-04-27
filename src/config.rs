@@ -129,6 +129,7 @@ pub struct WorkspacePaths {
     pub training_pairs:     PathBuf,  // {data_dir}/training/pairs.jsonl
     pub training_sentences: PathBuf,  // {data_dir}/training_sentences.txt
     pub lora_output_dir:    PathBuf,  // {data_dir}/lora_adapter/
+    pub edit_log:           PathBuf,  // {data_dir}/edit_log.jsonl
 }
 
 impl WorkspacePaths {
@@ -141,6 +142,7 @@ impl WorkspacePaths {
             training_pairs:     training.join("pairs.jsonl"),
             training_sentences: data_dir.join("training_sentences.txt"),
             lora_output_dir:    data_dir.join("lora_adapter"),
+            edit_log:           data_dir.join("edit_log.jsonl"),
         }
     }
 }

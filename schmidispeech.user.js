@@ -16,18 +16,11 @@
     const DEFAULT_SERVER = "ws://127.0.0.1:8765/asr";
     const DEFAULT_HOTKEY = "ctrl+shift+d";
 
-    function getServerUrl() {
-        return GM_getValue("server_url", DEFAULT_SERVER);
-    }
-    function setServerUrl(url) {
-        GM_setValue("server_url", url);
-    }
-    function getHotkey() {
-        return GM_getValue("hotkey", DEFAULT_HOTKEY);
-    }
-    function setHotkey(k) {
-        GM_setValue("hotkey", k.toLowerCase().trim());
-    }
+    function getServerUrl() { return GM_getValue("server_url", DEFAULT_SERVER); }
+    function setServerUrl(url) { GM_setValue("server_url", url); }
+    function getHotkey() { return GM_getValue("hotkey", DEFAULT_HOTKEY); }
+    function setHotkey(k) { GM_setValue("hotkey", k.toLowerCase().trim()); }
+    function isCommitMode() { return GM_getValue("commit_mode", false); }
 
     // ---- State ----
     let ws = null;
@@ -40,10 +33,12 @@
     const MAX_RECONNECT = 3;
     const SAMPLE_RATE = 16000;
 
-    // Target element for text injection — captured when dictation starts
     let targetEl = null;
-    let accumulatedText = ""; // displayed in overlay (finals seen so far)
-    let currentPartial = ""; // current unfinalized partial (overlay only)
+    let accumulatedText = "";      // live mode: displayed in overlay (finals seen so far)
+    let currentPartial = "";       // current unfinalized partial (overlay only)
+    let pendingText = "";          // commit mode: accumulated text not yet injected
+    let originalTranscribed = "";  // commit mode: model output snapshot for edit-log diff
+    let overlayUserEdited = false; // commit mode: user has started editing the overlay div
 
     // ---- Styles ----
     const style = document.createElement("style");
@@ -53,6 +48,20 @@
             50%      { box-shadow: 0 0 0 10px rgba(192,57,43,0); }
         }
         #schmidi-overlay-partial { color: #aaa; }
+        #schmidi-overlay-text {
+            white-space: pre-wrap; word-break: break-word;
+            outline: none; min-height: 1.5em; caret-color: #fff;
+        }
+        #schmidi-word-menu {
+            position: fixed; background: #1e1e1e; border: 1px solid #555;
+            border-radius: 6px; padding: 4px 0; z-index: 2147483647;
+            font-size: 13px; color: #ddd; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            min-width: 180px;
+        }
+        #schmidi-word-menu .sp-menu-item {
+            padding: 7px 14px; cursor: pointer; white-space: nowrap;
+        }
+        #schmidi-word-menu .sp-menu-item:hover { background: #2a2a2a; }
     `;
     document.head.appendChild(style);
 
@@ -60,23 +69,12 @@
     const btn = document.createElement("div");
     btn.id = "schmidispeech-btn";
     Object.assign(btn.style, {
-        position: "fixed",
-        bottom: "24px",
-        right: "24px",
-        width: "56px",
-        height: "56px",
-        borderRadius: "50%",
-        background: "#555",
-        cursor: "pointer",
-        zIndex: "2147483647",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
-        userSelect: "none",
-        transition: "background 0.2s",
-        fontSize: "24px",
-        color: "#fff",
+        position: "fixed", bottom: "24px", right: "24px",
+        width: "56px", height: "56px", borderRadius: "50%",
+        background: "#555", cursor: "pointer", zIndex: "2147483647",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        boxShadow: "0 2px 8px rgba(0,0,0,0.4)", userSelect: "none",
+        transition: "background 0.2s", fontSize: "24px", color: "#fff",
     });
     btn.textContent = "🎤";
     btn.title = `SCHMIDIspeech — ${getHotkey()} zum Diktieren, Rechtsklick konfigurieren`;
@@ -85,36 +83,229 @@
     // ---- Transcript overlay ----
     const overlay = document.createElement("div");
     Object.assign(overlay.style, {
-        position: "fixed",
-        bottom: "90px",
-        right: "24px",
-        maxWidth: "360px",
-        minWidth: "180px",
-        background: "rgba(20,20,20,0.93)",
-        color: "#eee",
-        padding: "10px 14px",
-        borderRadius: "10px",
-        fontSize: "14px",
-        lineHeight: "1.5",
-        zIndex: "2147483647",
-        display: "none",
-        wordBreak: "break-word",
-        pointerEvents: "none",
+        position: "fixed", bottom: "90px", right: "24px",
+        maxWidth: "360px", minWidth: "180px",
+        background: "rgba(20,20,20,0.93)", color: "#eee",
+        padding: "10px 14px", borderRadius: "10px",
+        fontSize: "14px", lineHeight: "1.5", zIndex: "2147483647",
+        display: "none", wordBreak: "break-word", pointerEvents: "none",
         boxShadow: "0 2px 12px rgba(0,0,0,0.5)",
     });
+
+    // Live mode — readonly text display
+    const overlayLive = document.createElement("div");
+    overlay.appendChild(overlayLive);
+
+    // Commit mode — editable div + partial span + toolbar
+    const overlayCommit = document.createElement("div");
+    overlayCommit.style.display = "none";
+
+    const overlayTextDiv = document.createElement("div");
+    overlayTextDiv.id = "schmidi-overlay-text";
+    overlayTextDiv.contentEditable = "true";
+    overlayTextDiv.spellcheck = false;
+    overlayTextDiv.addEventListener("input", () => { overlayUserEdited = true; });
+
+    const overlayCommitPartial = document.createElement("span");
+    overlayCommitPartial.style.cssText = "color:#aaa;pointer-events:none;user-select:none;";
+
+    const overlayToolbar = document.createElement("div");
+    overlayToolbar.style.cssText =
+        "display:flex;justify-content:flex-end;gap:8px;margin-top:8px;" +
+        "border-top:1px solid #333;padding-top:6px;";
+
+    const commitBtn = document.createElement("button");
+    commitBtn.textContent = "↵";
+    commitBtn.title = "Einfügen";
+    commitBtn.style.cssText =
+        "background:#2980b9;color:#fff;border:none;border-radius:6px;" +
+        "padding:4px 14px;cursor:pointer;font-size:16px;line-height:1;";
+
+    const cancelOverlayBtn = document.createElement("button");
+    cancelOverlayBtn.textContent = "✕";
+    cancelOverlayBtn.title = "Verwerfen";
+    cancelOverlayBtn.style.cssText =
+        "background:#333;color:#aaa;border:1px solid #555;border-radius:6px;" +
+        "padding:4px 12px;cursor:pointer;font-size:14px;line-height:1;";
+
+    overlayToolbar.append(commitBtn, cancelOverlayBtn);
+    overlayCommit.append(overlayTextDiv, overlayCommitPartial, overlayToolbar);
+    overlay.append(overlayLive, overlayCommit);
     document.body.appendChild(overlay);
 
+    // ---- Right-click word correction on overlay text ----
+    overlayTextDiv.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        let word = "";
+        const sel = window.getSelection();
+        if (sel && sel.toString().trim()) {
+            word = sel.toString().trim();
+        } else {
+            let range;
+            if (document.caretRangeFromPoint) {
+                range = document.caretRangeFromPoint(e.clientX, e.clientY);
+            } else if (document.caretPositionFromPoint) {
+                const pos = document.caretPositionFromPoint(e.clientX, e.clientY);
+                if (pos) { range = document.createRange(); range.setStart(pos.offsetNode, pos.offset); }
+            }
+            if (range && range.startContainer && range.startContainer.nodeType === Node.TEXT_NODE) {
+                const text = range.startContainer.textContent || "";
+                const off  = range.startOffset;
+                const pre  = (text.slice(0, off).match(/[\wäöüÄÖÜß\-]+$/) || [""])[0];
+                const post = (text.slice(off).match(/^[\wäöüÄÖÜß\-]+/) || [""])[0];
+                word = pre + post;
+            }
+        }
+        word = word.replace(/[^\wäöüÄÖÜß\-]/g, "").trim();
+        if (!word) return;
+        showWordMenu(e.clientX, e.clientY, word);
+    });
+
+    // ---- Word correction context menu ----
+    let wordMenuEl = null;
+
+    function showWordMenu(x, y, word) {
+        closeWordMenu();
+        wordMenuEl = document.createElement("div");
+        wordMenuEl.id = "schmidi-word-menu";
+        const item = document.createElement("div");
+        item.className = "sp-menu-item";
+        item.textContent = `Korrigieren: "${word}"`;
+        item.addEventListener("click", () => {
+            closeWordMenu();
+            const repl = window.prompt(`Ersatzwort für "${word}":`, "");
+            if (repl && repl.trim()) addWordPair(word, repl.trim());
+        });
+        wordMenuEl.appendChild(item);
+        document.body.appendChild(wordMenuEl);
+        wordMenuEl.style.left = Math.min(x, window.innerWidth  - 210) + "px";
+        wordMenuEl.style.top  = Math.min(y, window.innerHeight - 60)  + "px";
+        setTimeout(() => document.addEventListener("click", closeWordMenu, { once: true }), 0);
+    }
+
+    function closeWordMenu() {
+        if (wordMenuEl) { wordMenuEl.remove(); wordMenuEl = null; }
+    }
+
+    async function addWordPair(wrong, correct) {
+        try {
+            await fetch(`${getHttpBase()}/words`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ add: [`${wrong}=${correct}`], remove: [] }),
+            });
+            const woerterPane = configPanel.querySelector("#schmidi-pane-woerter");
+            if (woerterPane && woerterPane.style.display !== "none") loadWords();
+            showToast(`Korrektur gespeichert: ${wrong} → ${correct}`);
+        } catch (e) {
+            showToast("Fehler beim Speichern: " + e.message);
+        }
+    }
+
+    // ---- Overlay commit / cancel ----
+
+    function clearOverlay() {
+        pendingText = "";
+        originalTranscribed = "";
+        overlayUserEdited = false;
+        overlayTextDiv.textContent = "";
+        overlayCommitPartial.textContent = "";
+        accumulatedText = "";
+        currentPartial = "";
+        overlay.style.pointerEvents = "none";
+        removeOutsideClickHandler();
+        updateOverlay();
+    }
+
+    function cancelOverlayWithConfirm() {
+        const hasText = pendingText || overlayTextDiv.textContent.trim();
+        if (!hasText || window.confirm("Diktat verwerfen? Der transkribierte Text geht verloren.")) {
+            clearOverlay();
+        }
+    }
+
+    commitBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const text = overlayTextDiv.textContent.trimEnd();
+        if (text) {
+            injectAtCursor(text);
+            if (originalTranscribed && text !== originalTranscribed) {
+                fetch(`${getHttpBase()}/log/edit`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        original: originalTranscribed,
+                        edited: text,
+                        timestamp: new Date().toISOString(),
+                    }),
+                }).catch(() => {});
+            }
+        }
+        clearOverlay();
+    });
+
+    cancelOverlayBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        cancelOverlayWithConfirm();
+    });
+
+    // Outside-click dismissal for commit overlay
+    let outsideClickHandler = null;
+
+    function addOutsideClickHandler() {
+        if (outsideClickHandler) return;
+        outsideClickHandler = (e) => {
+            if (!overlay.contains(e.target) && e.target !== btn) {
+                cancelOverlayWithConfirm();
+            }
+        };
+        document.addEventListener("pointerdown", outsideClickHandler);
+    }
+
+    function removeOutsideClickHandler() {
+        if (outsideClickHandler) {
+            document.removeEventListener("pointerdown", outsideClickHandler);
+            outsideClickHandler = null;
+        }
+    }
+
+    // ---- updateOverlay ----
     function updateOverlay() {
-        if (!recording && !accumulatedText && !currentPartial) {
+        const hasContent = recording || currentPartial || accumulatedText || pendingText ||
+            (isCommitMode() && overlayTextDiv.textContent.trim());
+
+        if (!hasContent) {
             overlay.style.display = "none";
+            overlay.style.pointerEvents = "none";
+            overlayLive.style.display = "none";
+            overlayCommit.style.display = "none";
             return;
         }
+
         overlay.style.display = "block";
-        overlay.innerHTML =
-            escapeHtml(accumulatedText) +
-            '<span id="schmidi-overlay-partial">' +
-            escapeHtml(currentPartial) +
-            "</span>";
+
+        if (isCommitMode()) {
+            overlayLive.style.display = "none";
+            overlayCommit.style.display = "block";
+            overlay.style.pointerEvents = "auto";
+            if (!overlayUserEdited) {
+                overlayTextDiv.textContent = pendingText;
+            }
+            overlayCommitPartial.textContent = currentPartial;
+            if (pendingText || overlayTextDiv.textContent.trim()) {
+                addOutsideClickHandler();
+            }
+        } else {
+            overlayLive.style.display = "block";
+            overlayCommit.style.display = "none";
+            overlay.style.pointerEvents = "none";
+            overlayLive.innerHTML =
+                escapeHtml(accumulatedText) +
+                '<span id="schmidi-overlay-partial">' +
+                escapeHtml(currentPartial) +
+                "</span>";
+        }
     }
 
     function escapeHtml(s) {
@@ -127,71 +318,41 @@
     // ---- Config panel ----
     const configPanel = document.createElement("div");
     Object.assign(configPanel.style, {
-        position: "fixed",
-        bottom: "90px",
-        right: "24px",
-        background: "#1e1e1e",
-        border: "1px solid #444",
-        color: "#ddd",
-        padding: "12px",
-        borderRadius: "10px",
-        zIndex: "2147483647",
-        display: "none",
-        flexDirection: "column",
-        gap: "8px",
-        minWidth: "300px",
-        boxShadow: "0 4px 16px rgba(0,0,0,0.5)",
-        fontSize: "13px",
+        position: "fixed", bottom: "90px", right: "24px",
+        background: "#1e1e1e", border: "1px solid #444", color: "#ddd",
+        padding: "12px", borderRadius: "10px", zIndex: "2147483647",
+        display: "none", flexDirection: "column", gap: "8px",
+        minWidth: "300px", boxShadow: "0 4px 16px rgba(0,0,0,0.5)", fontSize: "13px",
     });
 
     const INPUT_STYLE =
-        "background:#2a2a2a;color:#ddd;border:1px solid #555;border-radius:6px;padding:6px 8px;font-size:13px;width:100%;box-sizing:border-box;outline:none;";
+        "background:#2a2a2a;color:#ddd;border:1px solid #555;border-radius:6px;" +
+        "padding:6px 8px;font-size:13px;width:100%;box-sizing:border-box;outline:none;";
     const LABEL_STYLE = "color:#aaa;font-size:11px;";
     const BTN_CANCEL =
-        "background:#333;color:#aaa;border:1px solid #555;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;";
+        "background:#333;color:#aaa;border:1px solid #555;border-radius:6px;" +
+        "padding:4px 12px;cursor:pointer;font-size:12px;";
     const BTN_PRIMARY =
-        "background:#2980b9;color:#fff;border:none;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12px;";
+        "background:#2980b9;color:#fff;border:none;border-radius:6px;" +
+        "padding:4px 12px;cursor:pointer;font-size:12px;";
 
     configPanel.innerHTML = `
-        <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech — Einstellungen</div>
+        <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech</div>
         <div style="display:flex;gap:0;border-bottom:1px solid #444;margin-bottom:4px;">
-            <button id="schmidi-tab-client"    style="background:none;border:none;border-bottom:2px solid #2980b9;color:#ddd;padding:4px 10px;cursor:pointer;font-size:12px;font-weight:bold;">Client</button>
-            <button id="schmidi-tab-server"    style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 10px;cursor:pointer;font-size:12px;">Server</button>
-            <button id="schmidi-tab-aufnehmen" style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 10px;cursor:pointer;font-size:12px;">Aufnehmen</button>
-            <button id="schmidi-tab-paare"     style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 10px;cursor:pointer;font-size:12px;">Paare</button>
+            <button id="schmidi-tab-woerter"       style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Eigene Wörter</button>
+            <button id="schmidi-tab-aufnehmen"     style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Aufnehmen</button>
+            <button id="schmidi-tab-training"         style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Training</button>
+            <button id="schmidi-tab-einstellungen" style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Einstellungen</button>
         </div>
 
-        <!-- Client tab -->
-        <div id="schmidi-pane-client" style="display:flex;flex-direction:column;gap:8px;">
-            <div style="${LABEL_STYLE}">Server URL</div>
-            <input id="schmidi-url-input" type="text" style="${INPUT_STYLE}"/>
-            <div style="${LABEL_STYLE}">Tastenkürzel (z.B. ctrl+shift+d, alt+s)</div>
-            <input id="schmidi-hotkey-input" type="text" style="${INPUT_STYLE}"/>
+        <!-- Eigene Wörter tab -->
+        <div id="schmidi-pane-woerter" style="display:none;flex-direction:column;gap:6px;">
+            <div style="${LABEL_STYLE}">Eigene Wörter (ein Wort pro Zeile; falsch=richtig für Ersetzungen)</div>
+            <textarea id="schmidi-words" rows="8" style="${INPUT_STYLE}font-family:monospace;resize:vertical;"></textarea>
+            <div id="schmidi-words-status" style="color:#aaa;font-size:11px;min-height:14px;"></div>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
-                <button id="schmidi-cancel" style="${BTN_CANCEL}">Abbrechen</button>
-                <button id="schmidi-save-client" style="${BTN_PRIMARY}">Speichern</button>
-            </div>
-        </div>
-
-        <!-- Server tab -->
-        <div id="schmidi-pane-server" style="display:none;flex-direction:column;gap:6px;">
-            <div style="${LABEL_STYLE}">Delay tokens (1–30, je 80ms)</div>
-            <input id="schmidi-delay" type="number" min="1" max="30" style="${INPUT_STYLE}"/>
-            <div style="${LABEL_STYLE}">Silence threshold (RMS)</div>
-            <input id="schmidi-silence-threshold" type="number" step="0.001" min="0" style="${INPUT_STYLE}"/>
-            <div style="${LABEL_STYLE}">Silence detection chunks (je 80ms)</div>
-            <input id="schmidi-silence-flush" type="number" min="1" style="${INPUT_STYLE}"/>
-            <div style="${LABEL_STYLE}">Min speech chunks (je 80ms)</div>
-            <input id="schmidi-min-speech" type="number" min="1" style="${INPUT_STYLE}"/>
-            <div style="${LABEL_STYLE}">RMS EMA alpha (0.0–1.0)</div>
-            <input id="schmidi-rms-ema" type="number" step="0.01" min="0" max="1" style="${INPUT_STYLE}"/>
-            <div style="${LABEL_STYLE};margin-top:4px;">Eigene Wörter (ein Wort pro Zeile)</div>
-            <textarea id="schmidi-words" rows="5" style="${INPUT_STYLE}font-family:monospace;resize:vertical;"></textarea>
-            <div id="schmidi-server-status" style="color:#aaa;font-size:11px;min-height:14px;"></div>
-            <div style="display:flex;gap:8px;justify-content:flex-end;">
-                <button id="schmidi-cancel2" style="${BTN_CANCEL}">Abbrechen</button>
-                <button id="schmidi-save-words" style="${BTN_CANCEL}">Wörter speichern</button>
-                <button id="schmidi-save-server" style="${BTN_PRIMARY}">Params speichern</button>
+                <button id="schmidi-cancel-woerter" style="${BTN_CANCEL}">Schließen</button>
+                <button id="schmidi-save-words"     style="${BTN_PRIMARY}">Speichern</button>
             </div>
         </div>
 
@@ -203,7 +364,6 @@
                 <button id="schmidi-next-sentence" style="${BTN_CANCEL}">▶</button>
             </div>
             <div id="schmidi-training-sentence" style="background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:8px;font-size:13px;line-height:1.4;min-height:40px;color:#eee;">Lade...</div>
-            <!-- Inline edit area (hidden by default) -->
             <div id="schmidi-edit-area" style="display:none;flex-direction:column;gap:4px;">
                 <input id="schmidi-edit-input" type="text" style="${INPUT_STYLE}"/>
                 <div style="display:flex;gap:6px;">
@@ -211,7 +371,6 @@
                     <button id="schmidi-edit-cancel" style="${BTN_CANCEL};flex:1;">Abbrechen</button>
                 </div>
             </div>
-            <!-- Add sentence area (hidden by default) -->
             <div id="schmidi-add-area" style="display:none;flex-direction:column;gap:4px;">
                 <input id="schmidi-add-input" type="text" style="${INPUT_STYLE}" placeholder="Neuer Kalibrierungssatz…"/>
                 <div style="display:flex;gap:6px;">
@@ -236,18 +395,46 @@
         </div>
 
         <!-- Paare tab -->
-        <div id="schmidi-pane-paare" style="display:none;flex-direction:column;gap:6px;max-width:340px;">
+        <div id="schmidi-pane-training" style="display:none;flex-direction:column;gap:6px;max-width:340px;">
             <div id="schmidi-pairs-list" style="max-height:200px;overflow-y:auto;border:1px solid #333;border-radius:6px;">
                 <div style="padding:8px;color:#666;font-size:12px;">Lade…</div>
             </div>
-            <div id="schmidi-paare-count" style="${LABEL_STYLE}">— Paare</div>
+            <div id="schmidi-training-count" style="${LABEL_STYLE}">— Paare</div>
             <div style="border-top:1px solid #444;margin:4px 0;"></div>
-            <button id="schmidi-training-run" style="${BTN_PRIMARY}">▶ LoRA trainieren</button>
-            <button id="schmidi-lora-reload" style="${BTN_CANCEL}">↺ LoRA neu laden</button>
-            <div id="schmidi-paare-status" style="${LABEL_STYLE};min-height:14px;"></div>
+            <button id="schmidi-training-run"  style="${BTN_PRIMARY}">▶ LoRA trainieren</button>
+            <button id="schmidi-lora-reload"   style="${BTN_CANCEL}">↺ LoRA neu laden</button>
+            <div id="schmidi-training-status" style="${LABEL_STYLE};min-height:14px;"></div>
             <pre id="schmidi-training-log" style="background:#111;border:1px solid #333;border-radius:4px;padding:6px;font-size:10px;max-height:80px;overflow-y:auto;margin:0;display:none;color:#8f8;"></pre>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
-                <button id="schmidi-cancel-paare" style="${BTN_CANCEL}">Schließen</button>
+                <button id="schmidi-cancel-training" style="${BTN_CANCEL}">Schließen</button>
+            </div>
+        </div>
+
+        <!-- Einstellungen tab (Client + Server merged, last) -->
+        <div id="schmidi-pane-einstellungen" style="display:none;flex-direction:column;gap:6px;">
+            <div style="${LABEL_STYLE}">Server URL</div>
+            <input id="schmidi-url-input" type="text" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Tastenkürzel (z.B. ctrl+shift+d, alt+s)</div>
+            <input id="schmidi-hotkey-input" type="text" style="${INPUT_STYLE}"/>
+            <div style="border-top:1px solid #333;margin:2px 0;"></div>
+            <div style="${LABEL_STYLE}">Delay tokens (1–30, je 80ms)</div>
+            <input id="schmidi-delay" type="number" min="1" max="30" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Silence threshold (RMS)</div>
+            <input id="schmidi-silence-threshold" type="number" step="0.001" min="0" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Silence detection chunks (je 80ms)</div>
+            <input id="schmidi-silence-flush" type="number" min="1" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">Min speech chunks (je 80ms)</div>
+            <input id="schmidi-min-speech" type="number" min="1" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">RMS EMA alpha (0.0–1.0)</div>
+            <input id="schmidi-rms-ema" type="number" step="0.01" min="0" max="1" style="${INPUT_STYLE}"/>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:2px;">
+                <input type="checkbox" id="schmidi-commit-mode" style="cursor:pointer;"/>
+                <label for="schmidi-commit-mode" style="${LABEL_STYLE}cursor:pointer;">Diktat bestätigen (↵) statt sofort einfügen</label>
+            </div>
+            <div id="schmidi-einstellungen-status" style="color:#aaa;font-size:11px;min-height:14px;"></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="schmidi-cancel-einstellungen" style="${BTN_CANCEL}">Abbrechen</button>
+                <button id="schmidi-save-einstellungen"   style="${BTN_PRIMARY}">Speichern</button>
             </div>
         </div>
     `;
@@ -255,21 +442,21 @@
 
     // ---- Tab switching ----
     function switchTab(tab) {
-        const tabs = ["client", "server", "aufnehmen", "paare"];
-        tabs.forEach((t) => {
-            const pane = configPanel.querySelector(`#schmidi-pane-${t}`);
-            const btn_ = configPanel.querySelector(`#schmidi-tab-${t}`);
-            if (!pane || !btn_) return;
+        ["woerter", "aufnehmen", "training", "einstellungen"].forEach((t) => {
+            const pane   = configPanel.querySelector(`#schmidi-pane-${t}`);
+            const tabBtn = configPanel.querySelector(`#schmidi-tab-${t}`);
+            if (!pane || !tabBtn) return;
             const active = t === tab;
-            pane.style.display = active ? "flex" : "none";
-            btn_.style.borderBottomColor = active ? "#2980b9" : "transparent";
-            btn_.style.color = active ? "#ddd" : "#888";
+            pane.style.display         = active ? "flex" : "none";
+            tabBtn.style.borderBottomColor = active ? "#2980b9" : "transparent";
+            tabBtn.style.color         = active ? "#ddd" : "#888";
+            tabBtn.style.fontWeight    = active ? "bold" : "normal";
         });
     }
-    configPanel.querySelector("#schmidi-tab-client").addEventListener("click", () => switchTab("client"));
-    configPanel.querySelector("#schmidi-tab-server").addEventListener("click", () => { switchTab("server"); loadServerConfig(); });
+    configPanel.querySelector("#schmidi-tab-woerter").addEventListener("click", () => { switchTab("woerter"); loadWords(); });
     configPanel.querySelector("#schmidi-tab-aufnehmen").addEventListener("click", () => { switchTab("aufnehmen"); loadTrainingSentences(); });
-    configPanel.querySelector("#schmidi-tab-paare").addEventListener("click", () => { switchTab("paare"); loadTrainingPairs(); });
+    configPanel.querySelector("#schmidi-tab-training").addEventListener("click", () => { switchTab("training"); loadTrainingPairs(); });
+    configPanel.querySelector("#schmidi-tab-einstellungen").addEventListener("click", () => { switchTab("einstellungen"); loadServerParams(); });
 
     // ---- HTTP helpers ----
     function getHttpBase() {
@@ -278,73 +465,58 @@
             .replace(/\/asr$/, "");
     }
 
-    function setServerStatus(msg, isError) {
-        const el = configPanel.querySelector("#schmidi-server-status");
-        if (el) {
-            el.textContent = msg;
-            el.style.color = isError ? "#e74c3c" : "#aaa";
+    function setWordsStatus(msg, isError) {
+        const el = configPanel.querySelector("#schmidi-words-status");
+        if (el) { el.textContent = msg; el.style.color = isError ? "#e74c3c" : "#aaa"; }
+    }
+
+    function setEinstellungenStatus(msg, isError) {
+        const el = configPanel.querySelector("#schmidi-einstellungen-status");
+        if (el) { el.textContent = msg; el.style.color = isError ? "#e74c3c" : "#aaa"; }
+    }
+
+    // ---- Load functions ----
+
+    async function loadWords() {
+        setWordsStatus("Lade Wörter…", false);
+        try {
+            const res = await fetch(`${getHttpBase()}/words`);
+            if (!res.ok) throw new Error("GET /words: " + res.status);
+            const data = await res.json();
+            configPanel.querySelector("#schmidi-words").value = (data.words || []).join("\n");
+            setWordsStatus("", false);
+        } catch (e) {
+            setWordsStatus("Fehler: " + e.message, true);
         }
     }
 
-    async function loadServerConfig() {
-        setServerStatus("Lade Server-Einstellungen…", false);
+    async function loadServerParams() {
+        setEinstellungenStatus("Lade Einstellungen…", false);
         try {
-            const [cfgRes, wordsRes] = await Promise.all([
-                fetch(`${getHttpBase()}/config`),
-                fetch(`${getHttpBase()}/words`),
-            ]);
-            if (!cfgRes.ok) throw new Error("GET /config: " + cfgRes.status);
-            const cfg = await cfgRes.json();
-            configPanel.querySelector("#schmidi-delay").value = cfg.delay ?? "";
-            configPanel.querySelector("#schmidi-silence-threshold").value =
-                cfg.silence_threshold ?? "";
-            configPanel.querySelector("#schmidi-silence-flush").value =
-                cfg.silence_flush ?? "";
-            configPanel.querySelector("#schmidi-min-speech").value =
-                cfg.min_speech ?? "";
-            configPanel.querySelector("#schmidi-rms-ema").value =
-                cfg.rms_ema ?? "";
-
-            if (wordsRes.ok) {
-                const w = await wordsRes.json();
-                configPanel.querySelector("#schmidi-words").value = (
-                    w.words || []
-                ).join("\n");
-            }
-            setServerStatus("", false);
+            const res = await fetch(`${getHttpBase()}/config`);
+            if (!res.ok) throw new Error("GET /config: " + res.status);
+            const cfg = await res.json();
+            configPanel.querySelector("#schmidi-delay").value             = cfg.delay ?? "";
+            configPanel.querySelector("#schmidi-silence-threshold").value = cfg.silence_threshold ?? "";
+            configPanel.querySelector("#schmidi-silence-flush").value     = cfg.silence_flush ?? "";
+            configPanel.querySelector("#schmidi-min-speech").value        = cfg.min_speech ?? "";
+            configPanel.querySelector("#schmidi-rms-ema").value           = cfg.rms_ema ?? "";
+            setEinstellungenStatus("", false);
         } catch (e) {
-            setServerStatus("Fehler: " + e.message, true);
+            setEinstellungenStatus("Fehler: " + e.message, true);
         }
     }
 
     async function saveServerParams() {
         const patch = {
-            delay:
-                parseInt(configPanel.querySelector("#schmidi-delay").value) ||
-                undefined,
-            silence_threshold:
-                parseFloat(
-                    configPanel.querySelector("#schmidi-silence-threshold")
-                        .value,
-                ) || undefined,
-            silence_flush:
-                parseInt(
-                    configPanel.querySelector("#schmidi-silence-flush").value,
-                ) || undefined,
-            min_speech:
-                parseInt(
-                    configPanel.querySelector("#schmidi-min-speech").value,
-                ) || undefined,
-            rms_ema:
-                parseFloat(
-                    configPanel.querySelector("#schmidi-rms-ema").value,
-                ) || undefined,
+            delay:             parseInt(configPanel.querySelector("#schmidi-delay").value) || undefined,
+            silence_threshold: parseFloat(configPanel.querySelector("#schmidi-silence-threshold").value) || undefined,
+            silence_flush:     parseInt(configPanel.querySelector("#schmidi-silence-flush").value) || undefined,
+            min_speech:        parseInt(configPanel.querySelector("#schmidi-min-speech").value) || undefined,
+            rms_ema:           parseFloat(configPanel.querySelector("#schmidi-rms-ema").value) || undefined,
         };
-        // Remove undefined keys
-        Object.keys(patch).forEach(
-            (k) => patch[k] === undefined && delete patch[k],
-        );
-        setServerStatus("Speichere…", false);
+        Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
+        setEinstellungenStatus("Speichere…", false);
         try {
             const res = await fetch(`${getHttpBase()}/config`, {
                 method: "PATCH",
@@ -352,89 +524,95 @@
                 body: JSON.stringify(patch),
             });
             if (!res.ok) throw new Error(await res.text());
-            setServerStatus("Gespeichert ✓", false);
+            setEinstellungenStatus("Gespeichert ✓", false);
         } catch (e) {
-            setServerStatus("Fehler: " + e.message, true);
+            setEinstellungenStatus("Fehler: " + e.message, true);
         }
     }
 
     async function saveWords() {
-        const lines = configPanel
+        const rawLines = configPanel
             .querySelector("#schmidi-words")
             .value.split("\n")
             .map((s) => s.trim())
             .filter(Boolean);
-        setServerStatus("Speichere Wörter…", false);
+
+        // Duplicate check (skip comment lines)
+        const lhsSet   = new Set();
+        const plainSet = new Set();
+        for (const line of rawLines) {
+            if (line.startsWith("#")) continue;
+            if (line.includes("=")) {
+                const lhs = line.split("=")[0].trim().toLowerCase();
+                if (lhsSet.has(lhs)) {
+                    setWordsStatus(`Doppelter Eintrag: "${lhs}" — bitte korrigieren`, true);
+                    return;
+                }
+                lhsSet.add(lhs);
+            } else {
+                const low = line.toLowerCase();
+                if (plainSet.has(low)) {
+                    setWordsStatus(`Doppelter Eintrag: "${line}" — bitte korrigieren`, true);
+                    return;
+                }
+                plainSet.add(low);
+            }
+        }
+
+        setWordsStatus("Speichere Wörter…", false);
         try {
-            // Compute diff against current state: fetch current list, then add/remove
             const wordsRes = await fetch(`${getHttpBase()}/words`);
-            const current = wordsRes.ok
-                ? (await wordsRes.json()).words || []
-                : [];
-            const newSet = new Set(lines);
-            const curSet = new Set(current);
-            const add = lines.filter((w) => !curSet.has(w));
-            const remove = current.filter((w) => !newSet.has(w));
+            const current  = wordsRes.ok ? (await wordsRes.json()).words || [] : [];
+            const newSet   = new Set(rawLines);
+            const curSet   = new Set(current);
+            const add      = rawLines.filter((w) => !curSet.has(w));
+            const remove   = current.filter((w) => !newSet.has(w));
             const res = await fetch(`${getHttpBase()}/words`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ add, remove }),
             });
             if (!res.ok) throw new Error(await res.text());
-            setServerStatus(
-                `Wörter gespeichert ✓ (${lines.length} Einträge)`,
-                false,
-            );
+            setWordsStatus(`Gespeichert ✓ (${rawLines.length} Einträge)`, false);
         } catch (e) {
-            setServerStatus("Fehler: " + e.message, true);
+            setWordsStatus("Fehler: " + e.message, true);
         }
+    }
+
+    async function saveEinstellungen() {
+        const url = configPanel.querySelector("#schmidi-url-input").value.trim();
+        const hk  = configPanel.querySelector("#schmidi-hotkey-input").value.trim();
+        const cm  = configPanel.querySelector("#schmidi-commit-mode").checked;
+        if (url) setServerUrl(url);
+        if (hk)  setHotkey(hk);
+        GM_setValue("commit_mode", cm);
+        btn.title = `SCHMIDIspeech — ${getHotkey()} zum Diktieren, Rechtsklick konfigurieren`;
+        await saveServerParams();
     }
 
     // ---- Config panel actions ----
 
     function openConfig() {
-        configPanel.querySelector("#schmidi-url-input").value = getServerUrl();
+        configPanel.querySelector("#schmidi-url-input").value    = getServerUrl();
         configPanel.querySelector("#schmidi-hotkey-input").value = getHotkey();
-        switchTab("client");
+        configPanel.querySelector("#schmidi-commit-mode").checked = isCommitMode();
+        switchTab("einstellungen");
+        loadServerParams();
         configPanel.style.display = "flex";
         configPanel.querySelector("#schmidi-url-input").focus();
         configPanel.querySelector("#schmidi-url-input").select();
     }
+
     function closeConfig() {
         configPanel.style.display = "none";
     }
 
-    configPanel
-        .querySelector("#schmidi-cancel")
-        .addEventListener("click", closeConfig);
-    configPanel
-        .querySelector("#schmidi-cancel2")
-        .addEventListener("click", closeConfig);
-
-    configPanel
-        .querySelector("#schmidi-save-client")
-        .addEventListener("click", () => {
-            const url = configPanel
-                .querySelector("#schmidi-url-input")
-                .value.trim();
-            const hk = configPanel
-                .querySelector("#schmidi-hotkey-input")
-                .value.trim();
-            if (url) setServerUrl(url);
-            if (hk) setHotkey(hk);
-            btn.title = `SCHMIDIspeech — ${getHotkey()} zum Diktieren, Rechtsklick konfigurieren`;
-            showToast("Einstellungen gespeichert");
-            closeConfig();
-        });
-
-    configPanel
-        .querySelector("#schmidi-save-server")
-        .addEventListener("click", saveServerParams);
-    configPanel
-        .querySelector("#schmidi-save-words")
-        .addEventListener("click", saveWords);
+    configPanel.querySelector("#schmidi-cancel-woerter").addEventListener("click", closeConfig);
     configPanel.querySelector("#schmidi-cancel-aufnehmen").addEventListener("click", closeConfig);
-    configPanel.querySelector("#schmidi-cancel-paare").addEventListener("click", closeConfig);
+    configPanel.querySelector("#schmidi-cancel-training").addEventListener("click", closeConfig);
+    configPanel.querySelector("#schmidi-cancel-einstellungen").addEventListener("click", closeConfig);
+    configPanel.querySelector("#schmidi-save-words").addEventListener("click", saveWords);
+    configPanel.querySelector("#schmidi-save-einstellungen").addEventListener("click", saveEinstellungen);
 
     // ---- Aufnehmen / Paare state ----
     let trainingSentences  = [];
@@ -456,7 +634,7 @@
         if (el) { el.textContent = msg; el.style.color = isError ? '#e74c3c' : '#aaa'; }
     }
     function setPaareStatus(msg, isError) {
-        const el = configPanel.querySelector('#schmidi-paare-status');
+        const el = configPanel.querySelector('#schmidi-training-status');
         if (el) { el.textContent = msg; el.style.color = isError ? '#e74c3c' : '#aaa'; }
     }
 
@@ -467,7 +645,6 @@
             const res = await fetch(`${getHttpBase()}/training/sentences`);
             if (!res.ok) throw new Error('GET /training/sentences: ' + res.status);
             const data = await res.json();
-            // Only show sentences that have not been recorded yet
             trainingSentences = (data.sentences || []).filter(s => !s.recorded);
             trainingCurrentIdx = Math.min(trainingCurrentIdx, Math.max(0, trainingSentences.length - 1));
             renderCurrentSentence();
@@ -479,7 +656,6 @@
     function renderCurrentSentence() {
         const sentEl = configPanel.querySelector('#schmidi-training-sentence');
         const idxEl  = configPanel.querySelector('#schmidi-sentence-index');
-        const recEl  = configPanel.querySelector('#schmidi-sentence-recorded');
         if (!sentEl || !idxEl) return;
         const total = trainingSentences.length;
         if (total === 0) {
@@ -492,7 +668,6 @@
         sentEl.style.borderColor = '#555';
         sentEl.style.background  = '#2a2a2a';
         idxEl.textContent = `${trainingCurrentIdx + 1}/${total}`;
-        if (recEl) recEl.textContent = '';
     }
 
     configPanel.querySelector('#schmidi-prev-sentence').addEventListener('click', () => {
@@ -509,12 +684,12 @@
     // ---- Aufnehmen: sentence edit ----
 
     function startEditSentence() {
-        const entry    = trainingSentences[trainingCurrentIdx] || {};
-        const editArea = configPanel.querySelector('#schmidi-edit-area');
+        const entry     = trainingSentences[trainingCurrentIdx] || {};
+        const editArea  = configPanel.querySelector('#schmidi-edit-area');
         const editInput = configPanel.querySelector('#schmidi-edit-input');
-        const sentEl   = configPanel.querySelector('#schmidi-training-sentence');
-        if (editArea)  editArea.style.display  = 'flex';
-        if (sentEl)    sentEl.style.display    = 'none';
+        const sentEl    = configPanel.querySelector('#schmidi-training-sentence');
+        if (editArea)  editArea.style.display = 'flex';
+        if (sentEl)    sentEl.style.display   = 'none';
         if (editInput) { editInput.value = entry.text || ''; editInput.focus(); editInput.select(); }
     }
     function cancelEditSentence() {
@@ -524,10 +699,10 @@
         if (sentEl)   sentEl.style.display   = 'block';
     }
     async function saveEditedSentence() {
-        const entry    = trainingSentences[trainingCurrentIdx] || {};
-        const oldText  = entry.text || '';
+        const entry     = trainingSentences[trainingCurrentIdx] || {};
+        const oldText   = entry.text || '';
         const editInput = configPanel.querySelector('#schmidi-edit-input');
-        const newText  = (editInput ? editInput.value : '').trim();
+        const newText   = (editInput ? editInput.value : '').trim();
         if (!newText) { setAufnehmenStatus('Leerer Text', true); return; }
         if (newText === oldText) { cancelEditSentence(); return; }
         try {
@@ -619,7 +794,6 @@
     configPanel.querySelector('#schmidi-training-save').addEventListener('click', saveTrainingPair);
 
     function startTrainingRecording() {
-        // Stop any in-progress preview playback before starting a new recording
         if (trainingPreviewSrc) { try { trainingPreviewSrc.stop(); } catch(_) {} trainingPreviewSrc = null; }
         if (trainingPreviewCtx) { trainingPreviewCtx.close(); trainingPreviewCtx = null; }
         trainingPcmBuffers = [];
@@ -627,9 +801,6 @@
             .then((stream) => {
                 trainingMicStream = stream;
                 trainingRecording = true;
-                // Always raw f32 LE PCM via ScriptProcessor — same as ASR path.
-                // MediaRecorder (OGG/WebM) produced static: container bytes were
-                // misinterpreted as raw f32 PCM on the server.
                 trainingAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
                 const source = trainingAudioCtx.createMediaStreamSource(stream);
                 const ratio  = trainingAudioCtx.sampleRate / SAMPLE_RATE;
@@ -666,14 +837,13 @@
         const vorhörenBtn = configPanel.querySelector('#schmidi-training-vorhören');
         if (recBtn) { recBtn.textContent = '⏺ Aufnehmen'; recBtn.style.background = '#2980b9'; }
         const hasAudio = trainingPcmBuffers.length > 0;
-        if (saveBtn)      saveBtn.disabled      = !hasAudio;
-        if (vorhörenBtn)  vorhörenBtn.disabled  = !hasAudio;
+        if (saveBtn)     saveBtn.disabled     = !hasAudio;
+        if (vorhörenBtn) vorhörenBtn.disabled = !hasAudio;
         setAufnehmenStatus(hasAudio ? 'Aufnahme beendet' : 'Keine Daten', !hasAudio);
     }
 
     function previewRecording() {
         const vorhörenBtn = configPanel.querySelector('#schmidi-training-vorhören');
-        // Toggle: if already playing, stop
         if (trainingPreviewSrc) {
             try { trainingPreviewSrc.stop(); } catch(_) {}
             trainingPreviewSrc = null;
@@ -689,17 +859,21 @@
         for (const buf of trainingPcmBuffers) { combined.set(buf, offset); offset += buf.length; }
         try {
             trainingPreviewCtx = new AudioContext({ sampleRate: 16000 });
-            const ctx          = trainingPreviewCtx;
-            const audioBuf     = ctx.createBuffer(1, combined.length, 16000);
+            const ctx      = trainingPreviewCtx;
+            const audioBuf = ctx.createBuffer(1, combined.length, 16000);
             audioBuf.copyToChannel(combined, 0);
             trainingPreviewSrc = ctx.createBufferSource();
-            const src          = trainingPreviewSrc;
+            const src = trainingPreviewSrc;
             src.buffer = audioBuf;
             src.connect(ctx.destination);
             src.start();
             if (vorhörenBtn) vorhörenBtn.textContent = '⏹ Stopp';
             setAufnehmenStatus('Wiedergabe…', false);
-            src.onended = () => { ctx.close(); trainingPreviewCtx = null; trainingPreviewSrc = null; if (vorhörenBtn) vorhörenBtn.textContent = '▶ Vorhören'; setAufnehmenStatus('', false); };
+            src.onended = () => {
+                ctx.close(); trainingPreviewCtx = null; trainingPreviewSrc = null;
+                if (vorhörenBtn) vorhörenBtn.textContent = '▶ Vorhören';
+                setAufnehmenStatus('', false);
+            };
         } catch (e) {
             setAufnehmenStatus('Wiedergabe: ' + e.message, true);
         }
@@ -754,10 +928,9 @@
     }
 
     function renderPairsList() {
-        // Stop any playback before rebuilding the list (button refs become stale)
         if (paaresCurrentAudio) { paaresCurrentAudio.pause(); paaresCurrentAudio.src = ''; paaresCurrentAudio = null; paaresCurrentPlayId = null; }
         const listEl  = configPanel.querySelector('#schmidi-pairs-list');
-        const countEl = configPanel.querySelector('#schmidi-paare-count');
+        const countEl = configPanel.querySelector('#schmidi-training-count');
         if (!listEl) return;
         if (trainingPairs.length === 0) {
             listEl.innerHTML = '<div style="padding:8px;color:#666;font-size:12px;">Keine Aufnahmen</div>';
@@ -765,7 +938,7 @@
         } else {
             const totalDur = trainingPairs.reduce((s, p) => s + (p.duration_s || 0), 0);
             listEl.innerHTML = trainingPairs.map(p => {
-                const t = (p.text || '');
+                const t     = (p.text || '');
                 const short = t.length > 38 ? t.slice(0, 36) + '…' : t;
                 const safe  = t.replace(/"/g, '&quot;').replace(/</g, '&lt;');
                 const dur   = (p.duration_s || 0).toFixed(1);
@@ -779,13 +952,11 @@
             }).join('');
             if (countEl) countEl.textContent = `${trainingPairs.length} Paar${trainingPairs.length !== 1 ? 'e' : ''} · ${totalDur.toFixed(1)}s gesamt`;
         }
-        // Event delegation for play/delete
         listEl.onclick = async (e) => {
             const playBtn = e.target.closest('.sp-play');
             const delBtn  = e.target.closest('.sp-del');
             if (playBtn) {
                 const id = playBtn.dataset.id;
-                // Stop any currently playing pair
                 if (paaresCurrentAudio) {
                     paaresCurrentAudio.pause();
                     paaresCurrentAudio.src = '';
@@ -794,9 +965,8 @@
                     const wasId = paaresCurrentPlayId;
                     paaresCurrentAudio  = null;
                     paaresCurrentPlayId = null;
-                    if (wasId === id) return; // toggle off
+                    if (wasId === id) return;
                 }
-                // Start new playback
                 const audio = new Audio(`${getHttpBase()}/training/audio/${id}`);
                 paaresCurrentAudio  = audio;
                 paaresCurrentPlayId = id;
@@ -848,11 +1018,10 @@
     async function reloadLora() {
         setPaareStatus('Lade LoRA neu…', false);
         try {
-            const res = await fetch(`${getHttpBase()}/lora/reload`, { method: 'POST' });
+            const res  = await fetch(`${getHttpBase()}/lora/reload`, { method: 'POST' });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || res.status);
-            const msg = data.action === 'applied' ? 'LoRA geladen ✓' : 'LoRA entfernt (kein Adapter)';
-            setPaareStatus(msg, false);
+            setPaareStatus(data.action === 'applied' ? 'LoRA geladen ✓' : 'LoRA entfernt (kein Adapter)', false);
         } catch (e) {
             setPaareStatus('Fehler: ' + e.message, true);
         }
@@ -860,7 +1029,7 @@
 
     async function pollTrainingStatus() {
         try {
-            const res = await fetch(`${getHttpBase()}/training/status`);
+            const res  = await fetch(`${getHttpBase()}/training/status`);
             if (!res.ok) return;
             const data = await res.json();
             const statusMap = { idle: 'Bereit', running: 'Training läuft…', done: 'Training abgeschlossen ✓', error: 'Training fehlgeschlagen' };
@@ -883,39 +1052,40 @@
             e.stopPropagation();
         });
     });
-    configPanel
-        .querySelector("#schmidi-words")
-        .addEventListener("keydown", (e) => {
-            e.stopPropagation();
-        });
+    configPanel.querySelector("#schmidi-words").addEventListener("keydown", (e) => {
+        e.stopPropagation();
+    });
+    configPanel.querySelector("#schmidi-words").addEventListener("input", () => {
+        setWordsStatus("", false);
+    });
+
     document.addEventListener("click", (e) => {
-        if (!configPanel.contains(e.target) && e.target !== btn) closeConfig();
+        if (!configPanel.contains(e.target) && e.target !== btn && !overlay.contains(e.target)) {
+            closeConfig();
+        }
     });
 
     // ---- Hotkey handling ----
     function matchesHotkey(e, hotkeyStr) {
-        // hotkeyStr format: "ctrl+shift+d", "alt+s", "ctrl+alt+m", etc.
-        const parts = hotkeyStr.toLowerCase().split("+");
-        const key = parts[parts.length - 1];
-        const needCtrl = parts.includes("ctrl");
-        const needAlt = parts.includes("alt");
+        const parts     = hotkeyStr.toLowerCase().split("+");
+        const key       = parts[parts.length - 1];
+        const needCtrl  = parts.includes("ctrl");
+        const needAlt   = parts.includes("alt");
         const needShift = parts.includes("shift");
         return (
-            e.ctrlKey === needCtrl &&
-            e.altKey === needAlt &&
+            e.ctrlKey  === needCtrl  &&
+            e.altKey   === needAlt   &&
             e.shiftKey === needShift &&
             e.key.toLowerCase() === key
         );
     }
 
-    // Capture phase so we fire before page handlers; stopPropagation prevents page from acting on it
     document.addEventListener(
         "keydown",
         (e) => {
             if (!matchesHotkey(e, getHotkey())) return;
             e.preventDefault();
             e.stopPropagation();
-            // Capture focused element now — user is still in the field when pressing the hotkey
             const active = document.activeElement;
             if (active && active !== document.body && active !== btn)
                 targetEl = active;
@@ -925,7 +1095,6 @@
         true,
     );
 
-    // Capture focused element on mousedown (before button steals focus) — fallback for mouse users
     btn.addEventListener("mousedown", (e) => {
         if (e.button !== 0) return;
         const active = document.activeElement;
@@ -936,11 +1105,8 @@
 
     btn.addEventListener("click", () => {
         closeConfig();
-        if (recording) {
-            stopRecording();
-        } else {
-            startRecording();
-        }
+        if (recording) stopRecording();
+        else startRecording();
     });
 
     btn.addEventListener("contextmenu", (e) => {
@@ -952,30 +1118,24 @@
     // ---- State helpers ----
     function setIdle() {
         btn.style.background = "#555";
-        btn.style.animation = "";
-        btn.textContent = "🎤";
+        btn.style.animation  = "";
+        btn.textContent      = "🎤";
     }
     function setListening() {
         btn.style.background = "#c0392b";
-        btn.style.animation = "schmidipulse 1s infinite";
-        btn.textContent = "⏹";
+        btn.style.animation  = "schmidipulse 1s infinite";
+        btn.textContent      = "⏹";
     }
 
     // ---- Toast ----
     function showToast(msg, duration = 3000) {
         const toast = document.createElement("div");
         Object.assign(toast.style, {
-            position: "fixed",
-            bottom: "90px",
-            right: "90px",
-            background: "rgba(30,30,30,0.95)",
-            color: "#fff",
-            padding: "10px 16px",
-            borderRadius: "8px",
-            zIndex: "2147483647",
-            fontSize: "14px",
-            maxWidth: "280px",
-            pointerEvents: "none",
+            position: "fixed", bottom: "90px", right: "90px",
+            background: "rgba(30,30,30,0.95)", color: "#fff",
+            padding: "10px 16px", borderRadius: "8px",
+            zIndex: "2147483647", fontSize: "14px",
+            maxWidth: "280px", pointerEvents: "none",
         });
         toast.textContent = msg;
         document.body.appendChild(toast);
@@ -984,8 +1144,11 @@
 
     // ---- Audio capture ----
     function startRecording() {
-        accumulatedText = "";
-        currentPartial = "";
+        accumulatedText     = "";
+        currentPartial      = "";
+        pendingText         = "";
+        originalTranscribed = "";
+        overlayUserEdited   = false;
         navigator.mediaDevices
             .getUserMedia({ audio: true, video: false })
             .then((stream) => {
@@ -999,26 +1162,24 @@
                 });
             })
             .catch((err) => {
-                showToast(
-                    "SCHMIDIspeech: Mikrofon nicht erlaubt — " + err.message,
-                );
+                showToast("SCHMIDIspeech: Mikrofon nicht erlaubt — " + err.message);
             });
     }
 
     function setupAudio(stream) {
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const source = audioContext.createMediaStreamSource(stream);
+        const source     = audioContext.createMediaStreamSource(stream);
         const nativeRate = audioContext.sampleRate;
-        const bufSize = 4096;
-        scriptProcessor = audioContext.createScriptProcessor(bufSize, 1, 1);
+        const bufSize    = 4096;
+        scriptProcessor  = audioContext.createScriptProcessor(bufSize, 1, 1);
         source.connect(scriptProcessor);
         scriptProcessor.connect(audioContext.destination);
 
         const ratio = nativeRate / SAMPLE_RATE;
         scriptProcessor.onaudioprocess = (e) => {
             if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
-            const input = e.inputBuffer.getChannelData(0);
-            const outLen = Math.floor(input.length / ratio);
+            const input      = e.inputBuffer.getChannelData(0);
+            const outLen     = Math.floor(input.length / ratio);
             const downsampled = new Float32Array(outLen);
             for (let i = 0; i < outLen; i++)
                 downsampled[i] = input[Math.floor(i * ratio)];
@@ -1029,28 +1190,28 @@
     function stopRecording() {
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         recording = false;
-        if (scriptProcessor) {
-            scriptProcessor.disconnect();
-            scriptProcessor = null;
-        }
-        if (audioContext) {
-            audioContext.close();
-            audioContext = null;
-        }
-        if (micStream) {
-            micStream.getTracks().forEach((t) => t.stop());
-            micStream = null;
-        }
+        if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
+        if (audioContext)    { audioContext.close(); audioContext = null; }
+        if (micStream)       { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
         if (ws && ws.readyState === WebSocket.OPEN) ws.close();
 
-        // Insert any trailing partial that hadn't been finalized yet
-        if (currentPartial) injectAtCursor(currentPartial);
-
-        accumulatedText = "";
-        currentPartial = "";
-        setIdle();
-        // Keep overlay visible briefly so user can see what was inserted
-        setTimeout(() => updateOverlay(), 2000);
+        if (isCommitMode()) {
+            // Add trailing partial to pending text; snapshot for edit-log
+            if (currentPartial) pendingText += currentPartial;
+            currentPartial      = "";
+            originalTranscribed = pendingText;
+            overlayUserEdited   = false;
+            overlayTextDiv.textContent = pendingText;
+            setIdle();
+            updateOverlay();
+        } else {
+            // Live mode: inject any trailing partial, briefly keep overlay
+            if (currentPartial) injectAtCursor(currentPartial);
+            accumulatedText = "";
+            currentPartial  = "";
+            setIdle();
+            setTimeout(() => updateOverlay(), 2000);
+        }
     }
 
     // ---- WebSocket ----
@@ -1066,22 +1227,24 @@
 
         ws.onmessage = (e) => {
             let msg;
-            try {
-                msg = JSON.parse(e.data);
-            } catch (_) {
-                return;
-            }
+            try { msg = JSON.parse(e.data); } catch (_) { return; }
 
             if (msg.type === "partial") {
                 currentPartial = msg.text || "";
                 updateOverlay();
             } else if (msg.type === "final") {
-                // Fallback to currentPartial if server sends empty final (e.g. silence detected
-                // before model committed tokens to text_buf)
+                // Fallback to currentPartial if server sends empty final
                 const text = msg.text || currentPartial;
                 if (text) {
-                    injectAtCursor(text);
-                    accumulatedText += text;
+                    if (isCommitMode()) {
+                        pendingText += text;
+                        if (!overlayUserEdited) {
+                            overlayTextDiv.textContent = pendingText;
+                        }
+                    } else {
+                        injectAtCursor(text);
+                        accumulatedText += text;
+                    }
                 }
                 currentPartial = "";
                 updateOverlay();
@@ -1118,43 +1281,32 @@
     // ---- Text injection — insert at current cursor position in targetEl ----
     function injectAtCursor(text) {
         const el = targetEl;
-
         if (!el || (!isEditable(el) && !isContentEditable(el))) {
             navigator.clipboard.writeText(text).catch(() => {});
             showToast("SCHMIDIspeech: Text in Zwischenablage kopiert");
             return;
         }
-
         if (isContentEditable(el)) {
             el.focus();
             document.execCommand("insertText", false, text);
         } else {
-            // input / textarea — insert at current cursor position
-            const start = el.selectionStart;
-            const end = el.selectionEnd;
+            const start  = el.selectionStart;
+            const end    = el.selectionEnd;
             const before = el.value.substring(0, start);
-            const after = el.value.substring(end);
+            const after  = el.value.substring(end);
             el.value = before + text + after;
             const newPos = start + text.length;
             el.setSelectionRange(newPos, newPos);
-            el.dispatchEvent(
-                new InputEvent("input", {
-                    bubbles: true,
-                    cancelable: true,
-                    inputType: "insertText",
-                    data: text,
-                }),
-            );
+            el.dispatchEvent(new InputEvent("input", {
+                bubbles: true, cancelable: true, inputType: "insertText", data: text,
+            }));
         }
     }
 
     function isEditable(el) {
-        return (
-            el &&
+        return el &&
             (el.tagName === "INPUT" || el.tagName === "TEXTAREA") &&
-            !el.readOnly &&
-            !el.disabled
-        );
+            !el.readOnly && !el.disabled;
     }
     function isContentEditable(el) {
         return el && el.isContentEditable;

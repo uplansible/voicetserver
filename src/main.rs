@@ -896,6 +896,7 @@ mod server {
             .route("/training/run",         axum::routing::post(training_run_handler))
             .route("/training/status",      get(training_status_handler))
             .route("/lora/reload",          axum::routing::post(lora_reload_handler))
+            .route("/log/edit",             axum::routing::post(log_edit_handler))
             .layer(cors)
             .with_state(state);
 
@@ -1635,6 +1636,37 @@ mod server {
             "action": action,
             "path":   path.to_string_lossy(),
         }))).into_response()
+    }
+
+    // ---- POST /log/edit ----
+
+    #[derive(serde::Deserialize)]
+    struct EditLogEntry {
+        original:  String,
+        edited:    String,
+        timestamp: String,
+    }
+
+    async fn log_edit_handler(
+        State(state): State<Arc<AppState>>,
+        Json(body): Json<EditLogEntry>,
+    ) -> Response {
+        use tokio::io::AsyncWriteExt;
+        let line = format!("{}\n", serde_json::to_string(&json!({
+            "original":  body.original,
+            "edited":    body.edited,
+            "timestamp": body.timestamp,
+        })).unwrap_or_default());
+        let mut f = match tokio::fs::OpenOptions::new()
+            .create(true).append(true).open(&state.paths.edit_log).await
+        {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        if let Err(e) = f.write_all(line.as_bytes()).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        Json(json!({ "status": "ok" })).into_response()
     }
 
     // ---- Training helpers ----
