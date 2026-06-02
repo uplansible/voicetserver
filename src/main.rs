@@ -31,7 +31,7 @@ use common::MEL_FRAMES_PER_TOKEN;
 use config::{MergedConfig, ValueSource};
 
 #[derive(Parser, Clone)]
-#[command(name = "voicetserver", about = "SCHMIDIspeech — real-time German medical dictation server")]
+#[command(name = "voicetserver", about = "SCHMIDIspeech — real-time German medical dictation server", version)]
 pub struct Cli {
     /// WAV file for offline transcription (omit for server mode)
     pub wav_file: Option<String>,
@@ -261,6 +261,7 @@ fn run() -> Result<()> {
 
     println!("\n{:<28} {}", "Parameter", "Value");
     println!("{:-<28} {:-<32}", "", "");
+    println!("{:<28} {}", "Version", env!("CARGO_PKG_VERSION"));
     println!("{:<28} {} ({}ms){}",
         "Delay tokens", effective_delay, effective_delay * 80,
         if is_offline { " (offline max accuracy)" } else { "" });
@@ -1070,6 +1071,7 @@ mod server {
         let s = &state.settings;
         let snap = &state.startup_snapshot;
         Json(json!({
+            "version":           env!("CARGO_PKG_VERSION"),
             // Runtime-adjustable — live values from atomics
             "delay":             s.delay_tokens.load(Ordering::Relaxed),
             "silence_threshold": s.silence_threshold.load(Ordering::Relaxed),

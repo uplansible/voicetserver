@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.7
+// @version      0.1.8
 // @description  Local GPU dictation — German medical (Voxtral Mini 4B Realtime)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -195,6 +195,12 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ add: [`${wrong}=${correct}`], remove: [] }),
             });
+            const current = overlayTextDiv.textContent;
+            if (current.includes(wrong)) {
+                const updated = current.split(wrong).join(correct);
+                overlayTextDiv.textContent = updated;
+                pendingText = updated;
+            }
             const woerterPane = configPanel.querySelector("#schmidi-pane-woerter");
             if (woerterPane && woerterPane.style.display !== "none") loadWords();
             showToast(`Korrektur gespeichert: ${wrong} → ${correct}`);
@@ -214,7 +220,6 @@
         accumulatedText = "";
         currentPartial = "";
         overlay.style.pointerEvents = "none";
-        removeOutsideClickHandler();
         updateOverlay();
     }
 
@@ -250,26 +255,6 @@
         cancelOverlayWithConfirm();
     });
 
-    // Outside-click dismissal for commit overlay
-    let outsideClickHandler = null;
-
-    function addOutsideClickHandler() {
-        if (outsideClickHandler) return;
-        outsideClickHandler = (e) => {
-            if (!overlay.contains(e.target) && e.target !== btn) {
-                cancelOverlayWithConfirm();
-            }
-        };
-        document.addEventListener("pointerdown", outsideClickHandler);
-    }
-
-    function removeOutsideClickHandler() {
-        if (outsideClickHandler) {
-            document.removeEventListener("pointerdown", outsideClickHandler);
-            outsideClickHandler = null;
-        }
-    }
-
     // ---- updateOverlay ----
     function updateOverlay() {
         const hasContent = recording || currentPartial || accumulatedText || pendingText ||
@@ -293,9 +278,6 @@
                 overlayTextDiv.textContent = pendingText;
             }
             overlayCommitPartial.textContent = currentPartial;
-            if (pendingText || overlayTextDiv.textContent.trim()) {
-                addOutsideClickHandler();
-            }
         } else {
             overlayLive.style.display = "block";
             overlayCommit.style.display = "none";
@@ -337,7 +319,7 @@
         "padding:4px 12px;cursor:pointer;font-size:12px;";
 
     configPanel.innerHTML = `
-        <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech</div>
+        <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech <span id="schmidi-server-version" style="color:#888;font-weight:normal;font-size:11px;"></span></div>
         <div style="display:flex;gap:0;border-bottom:1px solid #444;margin-bottom:4px;">
             <button id="schmidi-tab-woerter"       style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Eigene Wörter</button>
             <button id="schmidi-tab-aufnehmen"     style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Aufnehmen</button>
@@ -501,6 +483,8 @@
             configPanel.querySelector("#schmidi-silence-flush").value     = cfg.silence_flush ?? "";
             configPanel.querySelector("#schmidi-min-speech").value        = cfg.min_speech ?? "";
             configPanel.querySelector("#schmidi-rms-ema").value           = cfg.rms_ema ?? "";
+            const vEl = configPanel.querySelector("#schmidi-server-version");
+            if (vEl) vEl.textContent = cfg.version ? "v" + cfg.version : "";
             setEinstellungenStatus("", false);
         } catch (e) {
             setEinstellungenStatus("Fehler: " + e.message, true);
