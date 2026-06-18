@@ -30,8 +30,15 @@ use std::time::Instant;
 use common::MEL_FRAMES_PER_TOKEN;
 use config::{MergedConfig, ValueSource};
 
+/// `--version` output: package version plus build variant (e.g. "0.1.10 (CUDA 12.6)" or
+/// "0.1.10 (CPU)"). VOICETSERVER_BUILD_VARIANT is emitted by build.rs. With cudarc's
+/// dynamic-loading the GPU driver is only opened on first inference, so this prints fine
+/// even on a machine with no GPU/driver present.
+const LONG_VERSION: &str =
+    concat!(env!("CARGO_PKG_VERSION"), " (", env!("VOICETSERVER_BUILD_VARIANT"), ")");
+
 #[derive(Parser, Clone)]
-#[command(name = "voicetserver", about = "SCHMIDIspeech — real-time German medical dictation server", version)]
+#[command(name = "voicetserver", about = "SCHMIDIspeech — real-time German medical dictation server", version = LONG_VERSION)]
 pub struct Cli {
     /// WAV file for offline transcription (omit for server mode)
     pub wav_file: Option<String>,

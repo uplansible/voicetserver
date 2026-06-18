@@ -28,7 +28,56 @@ CUDA_COMPUTE_CAP=89 cargo build --release --features cuda
 
 Binary: `target/release/voicetserver`
 
+## CUDA driver loading (cudarc `dynamic-loading`)
+
+`candle-fork/Cargo.toml` uses cudarc's **`dynamic-loading`** feature (not `dynamic-linking`):
+the GPU driver (`libcuda.so.1`) is `dlopen`ed lazily on first inference rather than linked at
+load time. This lets a CUDA build run `--version` / `--help` and start far enough to print
+errors on a machine with no GPU/driver. Only the toolkit runtime (`libcudart.so.12`) remains a
+load-time dependency, so the CUDA toolkit must still be installed where the binary runs.
+
+Because `dynamic-loading` no longer emits the CUDA library search path, `build.rs`
+(`emit_cuda_link_search()`) re-adds `$CUDA_PATH/lib64` (and `/lib`) so candle-kernels /
+flash-attn can still resolve `-lcudart`.
+
+`--version` prints `voicetserver <ver> (CUDA <toolkit-ver>)` for CUDA builds or
+`voicetserver <ver> (CPU)` for CPU builds. The variant comes from `VOICETSERVER_BUILD_VARIANT`,
+emitted by `build.rs` (CUDA version parsed from `nvcc --version`).
+
 Versioned local copies: `releases/v<version>/voicetserver` (not committed, gitignored)
+
+## Updating prebuilt binaries in tools/
+
+After building, copy the binary to `tools/` so the installer can offer it as a prebuilt
+option. Currently only the CUDA (GPU) binary is shipped; add `tools/voicetserver` for a CPU
+prebuilt if/when needed.
+
+```bash
+# CUDA prebuilt (run on this machine)
+export CUDA_PATH=/usr/local/cuda && export PATH=$CUDA_PATH/bin:$PATH
+CUDA_COMPUTE_CAP=89 cargo build --release --features cuda
+cp target/release/voicetserver tools/voicetserver-cuda
+git add tools/voicetserver-cuda && git commit -m "chore: update prebuilt CUDA binary (vX.Y.Z)"
+```
+
+# Install
+
+`tools/install.sh` — interactive installer. Clone the repo and run it:
+
+```bash
+git clone <repo> && cd voicetserver
+./tools/install.sh
+```
+
+It: creates a Python venv (for LoRA training), installs torch (auto-detects the CUDA index
+tag) + `safetensors mistral-common numpy tqdm packaging`, deploys `train_lora.py` to
+`~/.config/voicetserver/tools/` (a `find_script()` fallback), downloads the model files
+(`tekken.json`, `consolidated.safetensors`) from `mistralai/Voxtral-Mini-4B-Realtime-2602`,
+copies `assets/mel_filters.bin` into the model dir (not on HuggingFace), installs the binary to
+`~/.local/bin/voicetserver` (prebuilt **gpu** from `tools/voicetserver-cuda`, prebuilt **cpu**
+if present, or **compile** from source), ensures `~/.local/bin` is on PATH, and provisions a
+Tailscale TLS cert + weekly systemd renewal timer. All choices have sensible defaults; existing
+model/venv/config are detected and skipped. Writes/updates `~/.config/voicetserver/config.toml`.
 
 # Test
 
