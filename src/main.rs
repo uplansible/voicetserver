@@ -129,13 +129,42 @@ pub struct ModelInner {
 
 /// All model components shared across WebSocket connections.
 /// `inner` is locked per-chunk; `adapter`, `tok`, `filters`, `device`, `dtype` are read-only.
+///
+/// `inner` is an `Option` so the GPU-resident encoder+decoder (~8 GB) can be temporarily
+/// unloaded to free VRAM for the LoRA training subprocess, then reloaded from `model_dir`
+/// when training finishes. While unloaded, ASR sessions return a "training in progress" error.
 pub struct VoxtralModel {
-    pub inner: tokio::sync::Mutex<ModelInner>,
+    pub inner: tokio::sync::Mutex<Option<ModelInner>>,
     pub adapter: adapter::Adapter,
     pub tok: tokenizer::Tokenizer,
     pub filters: Vec<f32>,
     pub device: Device,
     pub dtype: DType,
+    /// Model directory — used to rebuild enc+dec when reloading after training.
+    pub model_dir: String,
+}
+
+/// Rebuild the GPU-resident encoder + decoder from `consolidated.safetensors`, optionally
+/// re-applying a LoRA adapter. Used to reload the model after it was unloaded for training.
+fn load_enc_dec(
+    model_dir: &str,
+    device: &Device,
+    dtype: DType,
+    lora_path: Option<&Path>,
+) -> Result<ModelInner> {
+    let st_path = format!("{model_dir}/consolidated.safetensors");
+    let st_data = unsafe { memmap2::Mmap::map(&fs::File::open(&st_path)?)? };
+    let vb = VarBuilder::from_slice_safetensors(&st_data, dtype, device)?;
+    let enc = encoder::AudioEncoder::load(&vb, device, dtype)?;
+    let mut dec = decoder::TextDecoder::load(&vb, device, dtype)?;
+    if let Some(p) = lora_path {
+        match lora::load_decoder_lora(p, device, dtype) {
+            Ok(Some(dec_lora)) => dec.set_lora(&dec_lora),
+            Ok(None) => eprintln!("Warning: LoRA path no longer exists on reload: {}", p.display()),
+            Err(e)   => eprintln!("Warning: LoRA reload failed: {e}"),
+        }
+    }
+    Ok(ModelInner { enc, dec })
 }
 
 /// Validate that a path exists; emit a source-tagged error if not.
@@ -329,12 +358,13 @@ fn run() -> Result<()> {
         }
         None => {
             let model = Arc::new(VoxtralModel {
-                inner: tokio::sync::Mutex::new(ModelInner { enc, dec }),
+                inner: tokio::sync::Mutex::new(Some(ModelInner { enc, dec })),
                 adapter,
                 tok,
                 filters,
                 device,
                 dtype,
+                model_dir: merged.model_dir.value.clone(),
             });
             let shared_config = Arc::new(tokio::sync::Mutex::new(file_config));
             tokio::runtime::Builder::new_multi_thread()
@@ -997,7 +1027,8 @@ mod server {
         // Startup prefill: acquire model lock, run synchronously, release before any await.
         let mut stream_state = {
             let mut guard = model.inner.lock().await;
-            let inner = &mut *guard; // plain &mut ModelInner — enables disjoint field borrows
+            let inner = guard.as_mut().ok_or_else(|| // None while model is unloaded for LoRA training
+                anyhow::anyhow!("Server is training a new voice model — please try again in a few minutes"))?;
             StreamingState::new_sync(
                 &mut inner.enc,
                 &model.adapter,
@@ -1020,7 +1051,8 @@ mod server {
                     // Process: acquire GPU lock, do all sync work, release before send
                     let outputs = {
                         let mut guard = model.inner.lock().await;
-                        let inner = &mut *guard; // plain &mut ModelInner — enables disjoint field borrows
+                        let inner = guard.as_mut().ok_or_else(|| // None while model is unloaded for LoRA training
+                            anyhow::anyhow!("Server is training a new voice model — please try again in a few minutes"))?;
                         stream_state.process_chunk_sync(
                             &pcm,
                             &mut inner.enc,
@@ -1571,9 +1603,40 @@ mod server {
             *ts = TrainingStatus { status: TrainingStatusKind::Running, log: vec![] };
         }
 
+        // Free the GPU for the training subprocess: drop the resident encoder+decoder
+        // (~8 GB) so a single 16 GB card can hold the training copy of the model. ASR
+        // sessions return a "training in progress" error until the model is reloaded.
+        {
+            let mut guard = state.model.inner.lock().await;
+            *guard = None; // drop enc+dec → frees their VRAM
+        }
+        // Return the freed pool memory to the OS so the separate training process sees it.
+        {
+            let model = Arc::clone(&state.model);
+            let _ = tokio::task::spawn_blocking(move || model.device.synchronize()).await;
+        }
+        eprintln!("Model unloaded from VRAM for training.");
+
         let training_status = Arc::clone(&state.training_status);
+        let model           = Arc::clone(&state.model);
+        let lora_path       = Arc::clone(&state.lora_path);
         tokio::spawn(async move {
             run_training_subprocess(training_status, script, data_dir, model_dir, output_dir, venv_path).await;
+
+            // Reload the model regardless of training outcome, re-applying the active LoRA.
+            let lora = lora_path.read().await.clone();
+            let m = Arc::clone(&model);
+            let reloaded = tokio::task::spawn_blocking(move || {
+                load_enc_dec(&m.model_dir, &m.device, m.dtype, lora.as_deref())
+            }).await;
+            match reloaded {
+                Ok(Ok(inner)) => {
+                    *model.inner.lock().await = Some(inner);
+                    eprintln!("Model reloaded into VRAM after training.");
+                }
+                Ok(Err(e)) => eprintln!("ERROR: model reload after training failed: {e}"),
+                Err(e)     => eprintln!("ERROR: model reload task panicked: {e}"),
+            }
         });
 
         (StatusCode::ACCEPTED, "Training started").into_response()
@@ -1632,9 +1695,14 @@ mod server {
         let action = lora_opt.as_ref().map_or("cleared", |_| "applied");
         {
             let mut guard = state.model.inner.lock().await;
-            match lora_opt {
-                Some(ref lora) => guard.dec.set_lora(lora),
-                None           => guard.dec.clear_lora(),
+            match guard.as_mut() {
+                Some(inner) => match lora_opt {
+                    Some(ref lora) => inner.dec.set_lora(lora),
+                    None           => inner.dec.clear_lora(),
+                },
+                // Model is unloaded for training; still record the path below so it is
+                // re-applied automatically when the model reloads.
+                None => {}
             }
         }
 

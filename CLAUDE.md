@@ -153,9 +153,29 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 - `src/macros.rs` — Phase 4 stub (macro expansion)
 - `candle-fork/` — vendored Candle ML framework; do not update without reason
 
-GPU lock: single `tokio::sync::Mutex<ModelInner>` wrapping both enc and dec.
-Acquire → do all sync Candle work → release before every `.await`.
-Use `let inner = &mut *guard;` to enable disjoint field borrows (enc, dec).
+GPU lock: single `tokio::sync::Mutex<Option<ModelInner>>` wrapping both enc and dec.
+Acquire → `guard.as_mut()` → do all sync Candle work → release before every `.await`.
+Disjoint field borrows (enc, dec) work through the `&mut ModelInner` from `as_mut()`.
+
+`inner` is `Option` so the encoder+decoder (~8 GB VRAM) can be **unloaded during LoRA
+training** (see below) and reloaded afterward. While `None`, ASR sessions return a
+"Server is training…" error (surfaced to the client as a `{"type":"error"}` frame).
+`load_enc_dec()` rebuilds enc+dec from `consolidated.safetensors` and re-applies the
+active LoRA on reload.
+
+## Auto-unload for training (single-GPU VRAM reuse)
+
+A 4B model needs ~8 GB resident; a second copy for `train_lora.py` does not fit on a 16 GB
+card. So `POST /training/run` **unloads** the model before spawning the trainer:
+1. `*model.inner.lock() = None` drops enc+dec → frees ~8 GB.
+2. `model.device.synchronize()` returns the freed CUDA pool memory to the OS so the separate
+   Python process can allocate it (candle/cudarc use the stream-ordered allocator with the
+   default release-threshold of 0, so a sync releases unused pool memory).
+3. After the subprocess exits (success or failure), a spawned task reloads the model via
+   `load_enc_dec()`, re-applying the LoRA path from `state.lora_path`.
+
+Transcription is unavailable for the duration of training + reload (model is re-read from
+disk, ~10–30 s).
 
 # Config file
 
@@ -238,7 +258,7 @@ All endpoints support CORS (`allow_origin: *`).
 - `DELETE /training/pairs` — remove all collected training data
 
 **LoRA:**
-- `POST /training/run` — spawn `tools/train_lora.py` subprocess; 202 if started, 409 if already running
+- `POST /training/run` — unloads the model from VRAM (frees ~8 GB for the trainer), then spawns `tools/train_lora.py`; 202 if started, 409 if already running. Model is reloaded automatically when training finishes. ASR requests error with "Server is training…" until reload.
 - `GET /training/status` — `{"status":"idle"|"running"|"done"|"error","log":[...]}`
 
 Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl`.
@@ -330,7 +350,7 @@ Train a single LoRA on both speakers' audio combined. Both have the same vocabul
 
 ## Concurrent sessions
 
-**Same LoRA adapter:** Already works. LoRA weights are read-only during inference; all WebSocket sessions serialize on the single `Mutex<ModelInner>` GPU lock.
+**Same LoRA adapter:** Already works. LoRA weights are read-only during inference; all WebSocket sessions serialize on the single `Mutex<Option<ModelInner>>` GPU lock.
 
 **Different LoRA adapters concurrently:** Not supported without architectural change. Would require per-session LoRA deltas applied at inference time inside `process_chunk_sync()` — moving LoRA from `TextDecoder` fields into `StreamingState`. Deferred until needed.
 
