@@ -167,6 +167,31 @@ fn load_enc_dec(
     Ok(ModelInner { enc, dec })
 }
 
+/// Return the CUDA stream-ordered memory pool to the OS after the model is dropped.
+///
+/// cudarc allocates with `cuMemAllocAsync` and frees with `cuMemFreeAsync`, so dropped
+/// tensors return memory to the device's default memory pool — but the pool *retains* it
+/// in-process, so a separate process (train_lora.py) still sees the GPU as full.
+/// `cuMemPoolTrimTo(pool, 0)` forces the pool to release all unused memory to the OS.
+/// Caller must `device.synchronize()` first so the async frees have completed.
+#[cfg(feature = "cuda")]
+fn release_cuda_pool(device: &Device) -> Result<()> {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+    let stream    = device.as_cuda_device()?.cuda_stream();
+    let cu_device = stream.context().cu_device();
+    unsafe {
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        sys::cuDeviceGetDefaultMemPool(&mut pool, cu_device)
+            .result().map_err(|e| anyhow::anyhow!("cuDeviceGetDefaultMemPool: {e:?}"))?;
+        sys::cuMemPoolTrimTo(pool, 0)
+            .result().map_err(|e| anyhow::anyhow!("cuMemPoolTrimTo: {e:?}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn release_cuda_pool(_device: &Device) -> Result<()> { Ok(()) }
+
 /// Validate that a path exists; emit a source-tagged error if not.
 fn check_path(path: &str, source: ValueSource, field: &str) -> Result<()> {
     if !Path::new(path).exists() {
@@ -305,6 +330,9 @@ fn run() -> Result<()> {
     println!("{:<28} {} ({}ms)", "Silence detection", merged.silence_flush, merged.silence_flush * 80);
     println!("{:<28} {} ({}ms)", "Min speech to activate", merged.min_speech, merged.min_speech * 80);
     println!("{:<28} {}", "RMS EMA alpha", merged.rms_ema);
+    println!("{:<28} {}{}", "Fuzzy hotwords",
+        if merged.fuzzy_hotwords { "on" } else { "off" },
+        if merged.fuzzy_hotwords { format!(" (max ratio {})", merged.fuzzy_max_ratio) } else { String::new() });
     println!("{:<28} {:?}", "Compute dtype", dtype);
     if !is_offline {
         println!("{:<28} {}:{}", "Listen", merged.bind_addr.value, merged.port);
@@ -779,7 +807,7 @@ mod server {
     use super::*;
     use crate::config::{save_config_file, SharedConfigFile};
     use crate::settings::{IniValues, SharedSettings, StartupSnapshot, STATE_READY};
-    use crate::words::WordsCorrector;
+    use crate::words::{FuzzyMatcher, WordsCorrector};
     use axum::{
         extract::{Query, State, WebSocketUpgrade},
         http::StatusCode,
@@ -827,6 +855,8 @@ mod server {
             paragraph_delay_offset: 4,
             min_speech_chunks: merged.min_speech,
             rms_ema_alpha: merged.rms_ema,
+            fuzzy_hotwords: merged.fuzzy_hotwords,
+            fuzzy_max_ratio: merged.fuzzy_max_ratio,
         };
         let settings = Arc::new(SharedSettings::new(vals, merged.silence_flush));
         settings.state.store(STATE_READY, Ordering::SeqCst);
@@ -882,9 +912,12 @@ mod server {
 
         let connection_count = Arc::new(AtomicUsize::new(0));
         let words_path = paths.custom_words.clone();
-        let words = Arc::new(tokio::sync::RwLock::new(
-            WordsCorrector::load(&words_path)
+        let initial_corrector = WordsCorrector::load(&words_path);
+        // Fuzzy matcher targets = the plain (non-`=`) terms in custom_words.txt.
+        let fuzzy = Arc::new(tokio::sync::RwLock::new(
+            FuzzyMatcher::from_corrector(&initial_corrector)
         ));
+        let words = Arc::new(tokio::sync::RwLock::new(initial_corrector));
 
         let training_status = Arc::new(tokio::sync::Mutex::new(TrainingStatus::new()));
 
@@ -900,6 +933,7 @@ mod server {
             config_file,
             words_path,
             words,
+            fuzzy,
             training_status,
             paths,
             lora_path,
@@ -980,6 +1014,8 @@ mod server {
         config_file:       SharedConfigFile,
         words_path:        std::path::PathBuf,
         words:             Arc<tokio::sync::RwLock<WordsCorrector>>,
+        /// Fuzzy phonetic matcher, rebuilt from `words` whenever custom_words.txt changes.
+        fuzzy:             Arc<tokio::sync::RwLock<FuzzyMatcher>>,
         training_status:   Arc<tokio::sync::Mutex<TrainingStatus>>,
         paths:             crate::config::WorkspacePaths,
         /// Currently active LoRA adapter path (None if no adapter loaded).
@@ -1015,6 +1051,18 @@ mod server {
 
         state.connection_count.fetch_sub(1, Ordering::Relaxed);
         eprintln!("Connection closed (total: {})", state.connection_count.load(Ordering::Relaxed));
+    }
+
+    /// Post-process a raw final transcription: literal `wrong=correct` replacements
+    /// first, then (if enabled) fuzzy phonetic snapping onto known hotwords.
+    async fn finalize_text(state: &AppState, raw: &str) -> String {
+        let corrected = state.words.read().await.apply(raw);
+        if state.settings.fuzzy_hotwords.load(Ordering::Relaxed) {
+            let ratio = state.settings.fuzzy_max_ratio.load(Ordering::Relaxed);
+            state.fuzzy.read().await.correct(&corrected, ratio)
+        } else {
+            corrected
+        }
     }
 
     async fn handle_asr_session(socket: &mut WebSocket, state: &AppState) -> Result<()> {
@@ -1073,7 +1121,7 @@ mod server {
                             }
                             ChunkOutput::Silence => {
                                 let raw = stream_state.take_text_buf();
-                                let final_text = state.words.read().await.apply(&raw);
+                                let final_text = finalize_text(state, &raw).await;
                                 json!({ "type": "final", "text": final_text }).to_string()
                             }
                             ChunkOutput::Pad => continue,
@@ -1087,7 +1135,7 @@ mod server {
                     // Flush remaining buffer as final
                     let raw = stream_state.take_text_buf();
                     if !raw.is_empty() {
-                        let corrected = state.words.read().await.apply(&raw);
+                        let corrected = finalize_text(state, &raw).await;
                         let msg = json!({ "type": "final", "text": corrected }).to_string();
                         let _ = socket.send(Message::Text(msg.into())).await;
                     }
@@ -1117,6 +1165,8 @@ mod server {
             "silence_flush":     s.silence_chunks.load(Ordering::Relaxed),
             "min_speech":        s.min_speech_chunks.load(Ordering::Relaxed),
             "rms_ema":           s.rms_ema_alpha.load(Ordering::Relaxed),
+            "fuzzy_hotwords":    s.fuzzy_hotwords.load(Ordering::Relaxed),
+            "fuzzy_max_ratio":   s.fuzzy_max_ratio.load(Ordering::Relaxed),
             // Startup-only — from snapshot; changing via PATCH writes config file but requires restart
             "model_dir":         snap.model_dir,
             "device":            snap.device,
@@ -1140,6 +1190,8 @@ mod server {
         silence_flush:     Option<usize>,
         min_speech:        Option<usize>,
         rms_ema:           Option<f32>,
+        fuzzy_hotwords:    Option<bool>,
+        fuzzy_max_ratio:   Option<f32>,
         // Startup-only (written to file, restart required)
         model_dir:    Option<String>,
         device:       Option<usize>,
@@ -1168,6 +1220,12 @@ mod server {
                     format!("rms_ema must be between 0.0 and 1.0, got {}", r)).into_response();
             }
         }
+        if let Some(r) = patch.fuzzy_max_ratio {
+            if !(0.0..=1.0).contains(&r) {
+                return (StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("fuzzy_max_ratio must be between 0.0 and 1.0, got {}", r)).into_response();
+            }
+        }
 
         // Apply runtime params to atomics immediately
         let s = &state.settings;
@@ -1176,6 +1234,8 @@ mod server {
         if let Some(v) = patch.silence_flush     { s.silence_chunks.store(v, Ordering::SeqCst); }
         if let Some(v) = patch.min_speech        { s.min_speech_chunks.store(v, Ordering::SeqCst); }
         if let Some(v) = patch.rms_ema           { s.rms_ema_alpha.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.fuzzy_hotwords    { s.fuzzy_hotwords.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.fuzzy_max_ratio   { s.fuzzy_max_ratio.store(v, Ordering::SeqCst); }
 
         // Update config file under lock and persist to disk
         {
@@ -1185,6 +1245,8 @@ mod server {
             if patch.silence_flush.is_some()     { cfg.silence_flush     = patch.silence_flush; }
             if patch.min_speech.is_some()        { cfg.min_speech        = patch.min_speech; }
             if patch.rms_ema.is_some()           { cfg.rms_ema           = patch.rms_ema; }
+            if patch.fuzzy_hotwords.is_some()    { cfg.fuzzy_hotwords    = patch.fuzzy_hotwords; }
+            if patch.fuzzy_max_ratio.is_some()   { cfg.fuzzy_max_ratio   = patch.fuzzy_max_ratio; }
             if patch.model_dir.is_some()         { cfg.model_dir         = patch.model_dir; }
             if patch.device.is_some()            { cfg.device            = patch.device; }
             if patch.port.is_some()              { cfg.port              = patch.port; }
@@ -1236,9 +1298,10 @@ mod server {
         let new_content = words.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n") + "\n";
         match tokio::fs::write(&state.words_path, new_content).await {
             Ok(_) => {
-                // Rebuild the in-memory corrector from the updated file
+                // Rebuild the in-memory corrector + fuzzy matcher from the updated file
                 let new_corrector = WordsCorrector::load(&state.words_path);
                 let raw_lines = new_corrector.raw_lines.clone();
+                *state.fuzzy.write().await = FuzzyMatcher::from_corrector(&new_corrector);
                 *state.words.write().await = new_corrector;
                 Json(json!({ "words": raw_lines })).into_response()
             }
@@ -1611,9 +1674,15 @@ mod server {
             *guard = None; // drop enc+dec → frees their VRAM
         }
         // Return the freed pool memory to the OS so the separate training process sees it.
+        // Drop frees into cudarc's stream-ordered pool; we must synchronize (let the async
+        // frees complete) then trim the pool, or the GPU still reads as full to other procs.
         {
             let model = Arc::clone(&state.model);
-            let _ = tokio::task::spawn_blocking(move || model.device.synchronize()).await;
+            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                model.device.synchronize()?;
+                release_cuda_pool(&model.device)?;
+                Ok(())
+            }).await;
         }
         eprintln!("Model unloaded from VRAM for training.");
 

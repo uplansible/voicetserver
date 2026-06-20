@@ -146,7 +146,7 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 - `src/streaming.rs` — `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
 - `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
-- `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`
+- `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`; `FuzzyMatcher`: Kölner-Phonetik + Levenshtein fuzzy snapping of transcribed words onto known plain-term hotwords
 - `src/settings.rs` — `SharedSettings` (atomic runtime params) + `StartupSnapshot`
 - `src/encoder.rs` / `src/decoder.rs` — Voxtral model; flash-attn behind `#[cfg(feature = "cuda")]`
 - `src/session.rs` — Phase 2 stub (patient session vocabulary)
@@ -182,7 +182,7 @@ disk, ~10–30 s).
 `~/.config/voicetserver/config.toml` — created automatically with commented template on first run.
 CLI args override config file values. Unknown fields in the config file are silently ignored.
 
-Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`.
+Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`, `fuzzy_hotwords`, `fuzzy_max_ratio`.
 
 Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `data_dir`, `log_file`, `log_keep_days`.
 
@@ -222,12 +222,35 @@ Reads PID file, sends SIGTERM, polls `/proc/<pid>` for up to 5 s, deletes PID fi
 
 `~/.config/voicetserver/custom_words.txt` — one entry per line:
 - `wrong=correct` — replacement pair: every occurrence of `wrong` in transcribed text is replaced with `correct`
-- `PlainTerm` — stored as-is, no correction effect yet (Phase 3 vocab boosting)
+- `PlainTerm` — fuzzy phonetic target: transcribed words that *sound like* it are snapped onto this canonical spelling (see below)
 - `# comment` — ignored
 
 The aho-corasick automaton is built at startup and hot-reloaded whenever `POST /words` updates the file. No restart required.
 
 Example: add `Migration=Miktion` to correct a model phonetic confusion.
+
+## Fuzzy phonetic hotword correction
+
+The model often transcribes unfamiliar proper names / medical terms with a slightly different
+(phonetically equivalent) spelling each time (e.g. "Bedmika"/"Bedmiga" for "Betmiga"), so exact
+`wrong=correct` pairs cannot keep up. Every **final** transcription is post-processed by a
+`FuzzyMatcher` (`src/words.rs`) that snaps phonetically-close words onto the canonical spelling.
+
+- Targets = the **plain terms** in `custom_words.txt` (lines without `=`), exposed via
+  `WordsCorrector::plain_terms()`. Rebuilt whenever `POST /words` updates the file.
+- Matching: identical **Kölner Phonetik** (Cologne phonetics) code **AND** normalized Levenshtein
+  distance ≤ `fuzzy_max_ratio`. Both gates required → low false-positive risk.
+- Only single all-alphabetic terms are fuzzy targets (multi-word / hyphenated / digit-bearing
+  terms like `TUR-B` are excluded — the word scanner splits on non-alphabetic chars). They still
+  work as literal `wrong=correct` pairs.
+- Words shorter than 4 chars are never matched (`FUZZY_MIN_LEN`).
+- Applied at both final sites (silence flush, Close) **after** the literal `WordsCorrector::apply()`
+  pass — see `finalize_text()` in `src/main.rs`.
+
+Pipeline: literal `wrong=correct` replacements → fuzzy phonetic snap.
+
+Runtime-adjustable via `PATCH /config`: `fuzzy_hotwords` (bool, default true),
+`fuzzy_max_ratio` (f32 ∈ [0,1], default 0.34 — lower = stricter). No CLI flags; config + runtime only.
 
 # HTTP API
 
@@ -235,7 +258,7 @@ All endpoints support CORS (`allow_origin: *`).
 
 - `GET /health` — `{"status":"ready","connections":N}`
 - `GET /config` — current settings (runtime + startup snapshot); includes `data_dir`
-- `PATCH /config` — update settings; runtime params apply immediately, startup params written to file
+- `PATCH /config` — update settings; runtime params apply immediately, startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1].
 - `GET /words` — `{"words":[...]}`
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
 - `POST /lora/reload` — hot-reload LoRA adapter without restart; optional JSON body `{"path":"..."}` to specify dir (omit to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`

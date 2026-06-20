@@ -53,6 +53,8 @@ pub struct ConfigFile {
     pub silence_flush:     Option<usize>,
     pub min_speech:        Option<usize>,
     pub rms_ema:           Option<f32>,
+    pub fuzzy_hotwords:    Option<bool>,
+    pub fuzzy_max_ratio:   Option<f32>,
     // Log file settings
     pub log_file:      Option<String>,
     pub log_keep_days: Option<u32>,
@@ -86,6 +88,8 @@ pub struct MergedConfig {
     pub silence_flush:     usize,
     pub min_speech:        usize,
     pub rms_ema:           f32,
+    pub fuzzy_hotwords:    bool,
+    pub fuzzy_max_ratio:   f32,
     // Log file settings
     pub log_file:      Option<String>,
     pub log_keep_days: u32,
@@ -154,7 +158,7 @@ impl WorkspacePaths {
 const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # All fields are optional — omit to use the compiled default.
 # Restart required for: model_dir, device, port, bind_addr, tls_cert, tls_key, lora_adapter
-# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema
+# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio
 
 # model_dir = "/path/to/Voxtral-Mini-4B-Realtime"
 # bind_addr = "127.0.0.1"
@@ -171,6 +175,11 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # silence_flush = 20
 # min_speech = 15
 # rms_ema = 0.3
+
+# Fuzzy phonetic hotword correction (snaps transcribed words onto plain terms
+# in custom_words.txt that sound the same — Kölner Phonetik + Levenshtein).
+# fuzzy_hotwords = true     # set false to disable fuzzy snapping
+# fuzzy_max_ratio = 0.34    # max normalized edit distance (0..1); lower = stricter
 
 # log_file = "/path/to/voicetserver.log"   # default: ~/.config/voicetserver/logs/voicetserver.log
 # log_keep_days = 7
@@ -258,6 +267,9 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let (silence_flush, _)     = merge_val(&cli.silence_flush,     &file.silence_flush,     20usize);
     let (min_speech, _)        = merge_val(&cli.min_speech,        &file.min_speech,        15usize);
     let (rms_ema, _)           = merge_val(&cli.rms_ema,           &file.rms_ema,           0.3f32);
+    // Fuzzy phonetic correction: config-file + runtime only (no CLI flag).
+    let fuzzy_hotwords  = file.fuzzy_hotwords.unwrap_or(true);
+    let fuzzy_max_ratio = file.fuzzy_max_ratio.unwrap_or(0.34f32);
 
     let (tls_cert_val, tls_cert_src) = merge_opt_str(&cli.tls_cert, &file.tls_cert);
     let (tls_key_val,  tls_key_src)  = merge_opt_str(&cli.tls_key,  &file.tls_key);
@@ -285,6 +297,8 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         silence_flush,
         min_speech,
         rms_ema,
+        fuzzy_hotwords,
+        fuzzy_max_ratio,
         log_file,
         log_keep_days,
     }

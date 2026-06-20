@@ -3,7 +3,7 @@
 // SharedSettings holds all adjustable inference parameters as atomics, shared
 // between the model loading thread and per-connection streaming tasks.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 pub const SILENCE_CHUNKS_DEFAULT: usize = 20;
 
@@ -44,6 +44,10 @@ pub struct SharedSettings {
     pub min_speech_chunks: AtomicUsize,
     pub rms_ema_alpha: AtomicF32,
     pub delay_tokens: AtomicUsize,
+    /// Fuzzy phonetic hotword correction on/off (default on).
+    pub fuzzy_hotwords: AtomicBool,
+    /// Max normalized Levenshtein distance accepted as a fuzzy match (lower = stricter).
+    pub fuzzy_max_ratio: AtomicF32,
     /// Server state: STATE_READY / STATE_LOADING (no hotkey toggle in server mode).
     pub state: AtomicU8,
 }
@@ -60,6 +64,8 @@ impl SharedSettings {
             min_speech_chunks: AtomicUsize::new(vals.min_speech_chunks),
             rms_ema_alpha: AtomicF32::new(vals.rms_ema_alpha),
             delay_tokens: AtomicUsize::new(vals.delay),
+            fuzzy_hotwords: AtomicBool::new(vals.fuzzy_hotwords),
+            fuzzy_max_ratio: AtomicF32::new(vals.fuzzy_max_ratio),
             state: AtomicU8::new(STATE_LOADING),
         }
     }
@@ -73,6 +79,8 @@ pub struct IniValues {
     pub paragraph_delay_offset: usize,
     pub min_speech_chunks: usize,
     pub rms_ema_alpha: f32,
+    pub fuzzy_hotwords: bool,
+    pub fuzzy_max_ratio: f32,
 }
 
 impl Default for IniValues {
@@ -84,6 +92,8 @@ impl Default for IniValues {
             paragraph_delay_offset: 4,
             min_speech_chunks: 15,
             rms_ema_alpha: 0.3,
+            fuzzy_hotwords: true,
+            fuzzy_max_ratio: 0.34,
         }
     }
 }

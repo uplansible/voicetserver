@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.8
+// @version      0.1.9
 // @description  Local GPU dictation — German medical (Voxtral Mini 4B Realtime)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -410,6 +410,12 @@
             <div style="${LABEL_STYLE}">RMS EMA alpha (0.0–1.0)</div>
             <input id="schmidi-rms-ema" type="number" step="0.01" min="0" max="1" style="${INPUT_STYLE}"/>
             <div style="display:flex;align-items:center;gap:8px;margin-top:2px;">
+                <input type="checkbox" id="schmidi-fuzzy-hotwords" style="cursor:pointer;"/>
+                <label for="schmidi-fuzzy-hotwords" style="${LABEL_STYLE}cursor:pointer;">Fuzzy-Korrektur eigener Wörter (phonetisch)</label>
+            </div>
+            <div style="${LABEL_STYLE}">Fuzzy max ratio (0.0–1.0, kleiner = strenger)</div>
+            <input id="schmidi-fuzzy-max-ratio" type="number" step="0.01" min="0" max="1" style="${INPUT_STYLE}"/>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:2px;">
                 <input type="checkbox" id="schmidi-commit-mode" style="cursor:pointer;"/>
                 <label for="schmidi-commit-mode" style="${LABEL_STYLE}cursor:pointer;">Diktat bestätigen (↵) statt sofort einfügen</label>
             </div>
@@ -483,6 +489,8 @@
             configPanel.querySelector("#schmidi-silence-flush").value     = cfg.silence_flush ?? "";
             configPanel.querySelector("#schmidi-min-speech").value        = cfg.min_speech ?? "";
             configPanel.querySelector("#schmidi-rms-ema").value           = cfg.rms_ema ?? "";
+            configPanel.querySelector("#schmidi-fuzzy-hotwords").checked  = cfg.fuzzy_hotwords ?? true;
+            configPanel.querySelector("#schmidi-fuzzy-max-ratio").value   = cfg.fuzzy_max_ratio ?? "";
             const vEl = configPanel.querySelector("#schmidi-server-version");
             if (vEl) vEl.textContent = cfg.version ? "v" + cfg.version : "";
             setEinstellungenStatus("", false);
@@ -498,6 +506,8 @@
             silence_flush:     parseInt(configPanel.querySelector("#schmidi-silence-flush").value) || undefined,
             min_speech:        parseInt(configPanel.querySelector("#schmidi-min-speech").value) || undefined,
             rms_ema:           parseFloat(configPanel.querySelector("#schmidi-rms-ema").value) || undefined,
+            fuzzy_hotwords:    configPanel.querySelector("#schmidi-fuzzy-hotwords").checked,
+            fuzzy_max_ratio:   parseFloat(configPanel.querySelector("#schmidi-fuzzy-max-ratio").value) || undefined,
         };
         Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
         setEinstellungenStatus("Speichere…", false);
