@@ -519,7 +519,12 @@ fn load_wav(path: &str) -> Result<Vec<f32>> {
     };
 
     let samples = if spec.channels > 1 {
-        samples.iter().step_by(spec.channels as usize).copied().collect()
+        // Downmix to mono by averaging all channels (not just taking channel 0).
+        let ch = spec.channels as usize;
+        samples
+            .chunks_exact(ch)
+            .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+            .collect()
     } else {
         samples
     };
@@ -1119,9 +1124,8 @@ mod server {
                             ChunkOutput::Token(ref text) => {
                                 json!({ "type": "partial", "text": text }).to_string()
                             }
-                            ChunkOutput::Silence => {
-                                let raw = stream_state.take_text_buf();
-                                let final_text = finalize_text(state, &raw).await;
+                            ChunkOutput::Silence(ref raw) => {
+                                let final_text = finalize_text(state, raw).await;
                                 json!({ "type": "final", "text": final_text }).to_string()
                             }
                             ChunkOutput::Pad => continue,
@@ -1220,6 +1224,14 @@ mod server {
                     format!("rms_ema must be between 0.0 and 1.0, got {}", r)).into_response();
             }
         }
+        if let Some(t) = patch.silence_threshold {
+            // RMS of normalized [-1,1] audio lives in [0,1]; a negative value makes
+            // every chunk count as speech, so finalization would never fire.
+            if !(0.0..=1.0).contains(&t) {
+                return (StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("silence_threshold must be between 0.0 and 1.0, got {}", t)).into_response();
+            }
+        }
         if let Some(r) = patch.fuzzy_max_ratio {
             if !(0.0..=1.0).contains(&r) {
                 return (StatusCode::UNPROCESSABLE_ENTITY,
@@ -1284,18 +1296,32 @@ mod server {
         State(state): State<Arc<AppState>>,
         Json(body): Json<WordsPatch>,
     ) -> Response {
-        // Read current words into a sorted, deduplicated set
+        // Preserve comment lines (in their original order) and manage only the actual
+        // entry lines as a sorted, deduplicated set — folding `# …` comments into the
+        // set would scramble them alphabetically among the entries.
         let content = tokio::fs::read_to_string(&state.words_path).await.unwrap_or_default();
-        let mut words: std::collections::BTreeSet<String> = content
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        let mut comments: Vec<String> = Vec::new();
+        let mut words: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            } else if trimmed.starts_with('#') {
+                comments.push(line.to_string());
+            } else {
+                words.insert(trimmed.to_string());
+            }
+        }
 
-        for w in body.add.unwrap_or_default() { words.insert(w); }
-        for w in body.remove.unwrap_or_default() { words.remove(&w); }
+        for w in body.add.unwrap_or_default() {
+            let w = w.trim().to_string();
+            if !w.is_empty() { words.insert(w); }
+        }
+        for w in body.remove.unwrap_or_default() { words.remove(w.trim()); }
 
-        let new_content = words.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n") + "\n";
+        let mut new_content = String::new();
+        for c in &comments { new_content.push_str(c); new_content.push('\n'); }
+        for w in &words    { new_content.push_str(w); new_content.push('\n'); }
         match tokio::fs::write(&state.words_path, new_content).await {
             Ok(_) => {
                 // Rebuild the in-memory corrector + fuzzy matcher from the updated file
@@ -1572,9 +1598,11 @@ mod server {
 
         let pairs_path = &state.paths.training_pairs;
 
-        // Determine next ID from existing pair count
-        let count = count_pairs(&pairs_path).await;
-        let id = format!("{:04}", count + 1);
+        // Derive the next ID from the highest existing ID (not the count) so that
+        // deleting a pair never causes a later upload to reuse — and overwrite — an
+        // existing ID.
+        let (count, next_id) = pairs_stats(&pairs_path).await;
+        let id = format!("{:04}", next_id);
         let wav_path = audio_dir.join(format!("{id}.wav"));
         let duration_s = pcm.len() as f32 / 16000.0;
 
@@ -1635,12 +1663,8 @@ mod server {
 
     /// POST /training/run — spawn train_lora.py as a subprocess
     async fn training_run_handler(State(state): State<Arc<AppState>>) -> Response {
-        {
-            let ts = state.training_status.lock().await;
-            if ts.status == TrainingStatusKind::Running {
-                return (StatusCode::CONFLICT, "Training already running").into_response();
-            }
-        }
+        // Validate prerequisites before touching the status, so a failed validation
+        // never leaves the status stuck on "running".
 
         // Locate train_lora.py: try cwd/tools/ then binary dir/tools/
         let script = find_script("tools/train_lora.py");
@@ -1661,8 +1685,13 @@ mod server {
                 "No training data yet — collect pairs first").into_response();
         }
 
+        // Atomically check-and-set the running flag under a single lock so two
+        // concurrent requests cannot both pass the check and double-spawn.
         {
             let mut ts = state.training_status.lock().await;
+            if ts.status == TrainingStatusKind::Running {
+                return (StatusCode::CONFLICT, "Training already running").into_response();
+            }
             *ts = TrainingStatus { status: TrainingStatusKind::Running, log: vec![] };
         }
 
@@ -1817,9 +1846,22 @@ mod server {
 
     // ---- Training helpers ----
 
-    async fn count_pairs(pairs_path: &std::path::Path) -> usize {
+    /// Scan pairs.jsonl once and return `(count, next_id)` where `count` is the number
+    /// of non-empty lines and `next_id` is one past the highest numeric `id` seen
+    /// (so IDs are never reused after a delete). Falls back to 1 for an empty file.
+    async fn pairs_stats(pairs_path: &std::path::Path) -> (usize, usize) {
         let content = tokio::fs::read_to_string(pairs_path).await.unwrap_or_default();
-        content.lines().filter(|l| !l.trim().is_empty()).count()
+        let mut count = 0usize;
+        let mut max_id = 0usize;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            count += 1;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(id) = v["id"].as_str().and_then(|s| s.parse::<usize>().ok()) {
+                    max_id = max_id.max(id);
+                }
+            }
+        }
+        (count, max_id + 1)
     }
 
     fn save_training_wav(path: &std::path::Path, pcm: &[f32]) -> anyhow::Result<()> {

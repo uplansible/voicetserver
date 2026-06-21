@@ -31,8 +31,10 @@ const NEW_MEL_PER_CHUNK: usize = MEL_FRAMES_PER_TOKEN;
 pub enum ChunkOutput {
     /// A text token was decoded. Append to buffer and send partial result.
     Token(String),
-    /// Silence detected. Send final result and clear buffer.
-    Silence,
+    /// Silence detected. Carries the raw (uncorrected) accumulated text, taken and
+    /// cleared at the moment silence fired so any tokens decoded later in the same
+    /// chunk start a fresh buffer. The caller applies word/fuzzy correction.
+    Silence(String),
     /// PAD token — no output this tick.
     Pad,
 }
@@ -210,6 +212,10 @@ pub struct StreamingState {
     pub silence: SilenceDetector,
     pub sample_buf_for_silence: Vec<f32>,
     pub text_buf: String,
+    /// Holds raw token bytes that do not yet form a complete UTF-8 sequence.
+    /// Tekken is byte-level BPE, so a multi-byte char (umlauts, ß, …) can straddle
+    /// two tokens; we buffer the incomplete tail until the next token completes it.
+    pub pending_bytes: Vec<u8>,
     // Model references (not owned here — owned by main)
     pub delay_tokens: usize,
     pub dtype: DType,
@@ -245,6 +251,7 @@ impl StreamingState {
             silence: SilenceDetector::new(),
             sample_buf_for_silence: Vec::new(),
             text_buf: String::new(),
+            pending_bytes: Vec::new(),
             delay_tokens,
             dtype,
         })
@@ -276,8 +283,11 @@ impl StreamingState {
                 .iter().map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
             self.sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
             if self.silence.process_chunk(rms, settings) {
-                outputs.push(ChunkOutput::Silence);
-                // text_buf is cleared by take_text_buf() in the caller — do not clear here
+                // Take + clear the buffer here (not in the caller) so tokens decoded
+                // later in this same chunk start fresh instead of being re-sent as
+                // part of the next partial.
+                let raw = self.take_text_buf();
+                outputs.push(ChunkOutput::Silence(raw));
             }
         }
 
@@ -322,8 +332,20 @@ impl StreamingState {
             if next_token == tokenizer::STREAMING_PAD_ID || next_token == tokenizer::STREAMING_WORD_ID {
                 outputs.push(ChunkOutput::Pad);
             } else if let Some(bytes) = tok.decode_token(next_token) {
-                if let Ok(s) = std::str::from_utf8(&bytes) {
+                // Append raw bytes and emit only the valid UTF-8 prefix; keep any
+                // incomplete trailing bytes for the next token to complete. Without
+                // this, a char split across two tokens (e.g. German umlauts) would be
+                // silently dropped.
+                self.pending_bytes.extend_from_slice(&bytes);
+                let valid_up_to = match std::str::from_utf8(&self.pending_bytes) {
+                    Ok(s)  => s.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if valid_up_to > 0 {
+                    // valid_up_to bytes are guaranteed valid UTF-8 by construction.
+                    let s = std::str::from_utf8(&self.pending_bytes[..valid_up_to]).unwrap();
                     self.text_buf.push_str(s);
+                    self.pending_bytes.drain(..valid_up_to);
                     outputs.push(ChunkOutput::Token(self.text_buf.clone()));
                 }
             }
