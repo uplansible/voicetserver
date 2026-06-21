@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.9
+// @version      0.1.10
 // @description  Local GPU dictation — German medical (Voxtral Mini 4B Realtime)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -30,6 +30,7 @@
     let recording = false;
     let reconnectAttempts = 0;
     let reconnectTimer = null;
+    let pendingOnReady = null;     // runs on whichever onopen fires first (survives retries)
     const MAX_RECONNECT = 3;
     const SAMPLE_RATE = 16000;
 
@@ -294,7 +295,8 @@
         return s
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;");
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
     }
 
     // ---- Config panel ----
@@ -499,15 +501,24 @@
         }
     }
 
+    // Parse a numeric input field. Returns undefined for empty/invalid input,
+    // but preserves a legitimate 0 (which `value || undefined` would wrongly drop).
+    function numField(sel, parse) {
+        const raw = configPanel.querySelector(sel).value.trim();
+        if (raw === "") return undefined;
+        const n = parse(raw);
+        return Number.isFinite(n) ? n : undefined;
+    }
+
     async function saveServerParams() {
         const patch = {
-            delay:             parseInt(configPanel.querySelector("#schmidi-delay").value) || undefined,
-            silence_threshold: parseFloat(configPanel.querySelector("#schmidi-silence-threshold").value) || undefined,
-            silence_flush:     parseInt(configPanel.querySelector("#schmidi-silence-flush").value) || undefined,
-            min_speech:        parseInt(configPanel.querySelector("#schmidi-min-speech").value) || undefined,
-            rms_ema:           parseFloat(configPanel.querySelector("#schmidi-rms-ema").value) || undefined,
+            delay:             numField("#schmidi-delay", parseInt),
+            silence_threshold: numField("#schmidi-silence-threshold", parseFloat),
+            silence_flush:     numField("#schmidi-silence-flush", parseInt),
+            min_speech:        numField("#schmidi-min-speech", parseInt),
+            rms_ema:           numField("#schmidi-rms-ema", parseFloat),
             fuzzy_hotwords:    configPanel.querySelector("#schmidi-fuzzy-hotwords").checked,
-            fuzzy_max_ratio:   parseFloat(configPanel.querySelector("#schmidi-fuzzy-max-ratio").value) || undefined,
+            fuzzy_max_ratio:   numField("#schmidi-fuzzy-max-ratio", parseFloat),
         };
         Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
         setEinstellungenStatus("Speichere…", false);
@@ -630,6 +641,15 @@
     function setPaareStatus(msg, isError) {
         const el = configPanel.querySelector('#schmidi-training-status');
         if (el) { el.textContent = msg; el.style.color = isError ? '#e74c3c' : '#aaa'; }
+    }
+
+    // Flatten the recorded chunk list into one contiguous Float32Array.
+    function concatPcm(buffers) {
+        const totalLen = buffers.reduce((s, b) => s + b.length, 0);
+        const combined = new Float32Array(totalLen);
+        let offset = 0;
+        for (const buf of buffers) { combined.set(buf, offset); offset += buf.length; }
+        return combined;
     }
 
     // ---- Aufnehmen: sentence navigation ----
@@ -847,10 +867,7 @@
             return;
         }
         if (trainingPcmBuffers.length === 0) return;
-        const totalLen = trainingPcmBuffers.reduce((s, b) => s + b.length, 0);
-        const combined = new Float32Array(totalLen);
-        let offset = 0;
-        for (const buf of trainingPcmBuffers) { combined.set(buf, offset); offset += buf.length; }
+        const combined = concatPcm(trainingPcmBuffers);
         try {
             trainingPreviewCtx = new AudioContext({ sampleRate: 16000 });
             const ctx      = trainingPreviewCtx;
@@ -879,10 +896,7 @@
         const text  = (entry.text || '').trim();
         if (!text) { setAufnehmenStatus('Kein Satz ausgewählt', true); return; }
 
-        const totalLen = trainingPcmBuffers.reduce((s, b) => s + b.length, 0);
-        const combined = new Float32Array(totalLen);
-        let offset = 0;
-        for (const buf of trainingPcmBuffers) { combined.set(buf, offset); offset += buf.length; }
+        const combined = concatPcm(trainingPcmBuffers);
 
         setAufnehmenStatus('Speichere…', false);
         try {
@@ -934,11 +948,12 @@
             listEl.innerHTML = trainingPairs.map(p => {
                 const t     = (p.text || '');
                 const short = t.length > 38 ? t.slice(0, 36) + '…' : t;
-                const safe  = t.replace(/"/g, '&quot;').replace(/</g, '&lt;');
+                const esc   = escapeHtml(short);   // displayed (HTML text content)
+                const safe  = escapeHtml(t);       // title attribute (quotes escaped too)
                 const dur   = (p.duration_s || 0).toFixed(1);
                 return `<div style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid #2a2a2a;">
                     <span style="color:#555;font-size:10px;min-width:28px;">${p.id}</span>
-                    <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#ccc;" title="${safe}">${short}</span>
+                    <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#ccc;" title="${safe}">${esc}</span>
                     <span style="color:#888;font-size:10px;min-width:30px;">${dur}s</span>
                     <button class="sp-play" data-id="${p.id}" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">▶</button>
                     <button class="sp-del"  data-id="${p.id}" style="background:#333;color:#c0392b;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">✕</button>
@@ -1077,6 +1092,8 @@
     document.addEventListener(
         "keydown",
         (e) => {
+            // Don't fire while typing in the config panel (e.g. a single-key hotkey).
+            if (configPanel.contains(e.target)) return;
             if (!matchesHotkey(e, getHotkey())) return;
             e.preventDefault();
             e.stopPropagation();
@@ -1210,13 +1227,18 @@
 
     // ---- WebSocket ----
     function connectWS(onReady) {
+        // Remember the ready callback so it still runs if the *first* attempt
+        // fails and a later retry is the one that actually connects.
+        if (onReady) pendingOnReady = onReady;
         const url = getServerUrl();
         ws = new WebSocket(url);
         ws.binaryType = "arraybuffer";
 
         ws.onopen = () => {
             reconnectAttempts = 0;
-            if (onReady) onReady();
+            const cb = pendingOnReady;
+            pendingOnReady = null;
+            if (cb) cb();
         };
 
         ws.onmessage = (e) => {
@@ -1245,27 +1267,21 @@
             }
         };
 
-        ws.onerror = () => {
-            if (reconnectAttempts < MAX_RECONNECT) {
-                reconnectAttempts++;
-                reconnectTimer = setTimeout(
-                    () => connectWS(null),
-                    Math.pow(2, reconnectAttempts) * 500,
-                );
-            } else {
-                showToast("SCHMIDIspeech: Server nicht erreichbar — " + url);
-                stopRecording();
-            }
-        };
+        // A failed connection fires onerror *and* onclose. Let onclose own the
+        // retry so a single failure doesn't schedule two reconnects (which would
+        // leak a timer and open parallel sockets). onerror is just a no-op.
+        ws.onerror = () => {};
 
         ws.onclose = () => {
-            if (recording && reconnectAttempts < MAX_RECONNECT) {
+            if (!recording) return;
+            if (reconnectTimer) return;          // a retry is already pending
+            if (reconnectAttempts < MAX_RECONNECT) {
                 reconnectAttempts++;
-                reconnectTimer = setTimeout(
-                    () => connectWS(null),
-                    Math.pow(2, reconnectAttempts) * 500,
-                );
-            } else if (recording) {
+                reconnectTimer = setTimeout(() => {
+                    reconnectTimer = null;
+                    connectWS(null);
+                }, Math.pow(2, reconnectAttempts) * 500);
+            } else {
                 showToast("SCHMIDIspeech: Server nicht erreichbar — Aufnahme beendet");
                 stopRecording();
             }
