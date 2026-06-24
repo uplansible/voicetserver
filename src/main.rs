@@ -1142,15 +1142,22 @@ mod server {
     }
 
     /// Post-process a raw final transcription: literal `wrong=correct` replacements
-    /// first, then (if enabled) fuzzy phonetic snapping onto known hotwords.
+    /// first, then (if enabled) fuzzy phonetic snapping onto known hotwords, and
+    /// finally the unconditional ß→ss normalization (Swiss orthography).
     async fn finalize_text(state: &AppState, raw: &str) -> String {
         let corrected = state.words.read().await.apply(raw);
-        if state.settings.fuzzy_hotwords.load(Ordering::Relaxed) {
+        let snapped = if state.settings.fuzzy_hotwords.load(Ordering::Relaxed) {
             let ratio = state.settings.fuzzy_max_ratio.load(Ordering::Relaxed);
             state.fuzzy.read().await.correct(&corrected, ratio)
         } else {
             corrected
-        }
+        };
+        replace_eszett(&snapped)
+    }
+
+    /// Replace every ß with ss (Swiss orthography). Always applied to all output.
+    fn replace_eszett(text: &str) -> String {
+        text.replace('ß', "ss")
     }
 
     async fn handle_asr_session(socket: &mut WebSocket, state: &AppState) -> Result<()> {
@@ -1205,7 +1212,7 @@ mod server {
                     for output in outputs {
                         let msg = match output {
                             ChunkOutput::Token(ref text) => {
-                                json!({ "type": "partial", "text": text }).to_string()
+                                json!({ "type": "partial", "text": replace_eszett(text) }).to_string()
                             }
                             ChunkOutput::Silence(ref raw) => {
                                 let final_text = finalize_text(state, raw).await;
