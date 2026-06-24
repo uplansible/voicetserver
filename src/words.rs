@@ -97,12 +97,27 @@ impl WordsCorrector {
 // spelling, regardless of which variant the model emitted. Targets are the
 // plain (non-`=`) terms in custom_words.txt.
 //
-// Matching is gated by BOTH an identical Kölner Phonetik (Cologne phonetics)
-// code AND a bounded normalized Levenshtein distance, to avoid replacing
-// legitimately different words that merely sound similar.
+// Matching is gated by BOTH a *near* Kölner Phonetik (Cologne phonetics) code
+// AND a bounded normalized Levenshtein distance, to avoid replacing legitimately
+// different words that merely sound similar.
+//
+// Voxtral has no prompt/biasing mechanism (unlike the qwen3 sister project), so
+// it cannot be nudged toward the canonical spelling of an unfamiliar name. Its
+// raw output therefore drifts further than an exact-code match can bridge — most
+// commonly a prepended/dropped edge vowel, which the Kölner coder turns into a
+// single leading `0` (e.g. "Betmiga"→`1264` vs "Epetmika"→`01264`). Requiring an
+// *identical* code rejected these outright. We instead (a) ignore a leading `0`
+// when comparing, and (b) allow a small Kölner-code edit distance
+// (`FUZZY_MAX_CODE_DIST`). The orthographic Levenshtein gate stays the
+// false-positive backstop.
 
 /// Words shorter than this are never fuzzy-matched (too collision-prone).
 const FUZZY_MIN_LEN: usize = 4;
+
+/// Maximum Kölner-Phonetik code edit distance still treated as a phonetic match.
+/// 0 (identity) plus one edit absorbs a single voicing/segment slip beyond the
+/// leading-`0` normalisation. Kept small so the orthographic gate dominates.
+const FUZZY_MAX_CODE_DIST: usize = 1;
 
 /// Fuzzy matcher built from the canonical hotword/vocabulary terms
 /// (the plain terms in custom_words.txt).
@@ -172,11 +187,13 @@ impl FuzzyMatcher {
         if code.is_empty() {
             return word.to_string();
         }
+        let code_n = strip_leading_zero(&code);
         let wl = word.to_lowercase();
 
         let mut best: Option<(&str, usize)> = None;
         for (canon, ccode) in &self.targets {
-            if *ccode != code {
+            // Phonetic gate: near (not identical) codes, ignoring a leading edge-vowel `0`.
+            if levenshtein(strip_leading_zero(ccode), code_n) > FUZZY_MAX_CODE_DIST {
                 continue;
             }
             let cl = canon.to_lowercase();
@@ -197,6 +214,13 @@ impl FuzzyMatcher {
         }
         best.map_or_else(|| word.to_string(), |(canon, _)| canon.to_string())
     }
+}
+
+/// Drop a single leading `0` (an edge-vowel code) so that vowel-initial and
+/// consonant-initial renderings of the same word compare equal under the
+/// phonetic gate (e.g. `01264` "Epetmika" vs `1264` "Betmiga").
+fn strip_leading_zero(code: &str) -> &str {
+    code.strip_prefix('0').unwrap_or(code)
 }
 
 /// A term is fuzzy-matchable only if it is a single all-alphabetic word.
@@ -358,6 +382,16 @@ mod tests {
         let m = FuzzyMatcher::new(&terms);
         assert_eq!(m.correct("Patient nimmt Bedmika und Tovias.", 0.34),
                    "Patient nimmt Betmiga und Toviaz.");
+    }
+
+    #[test]
+    fn fuzzy_snaps_leading_vowel_drift() {
+        // Voxtral (no biasing) prepends an edge vowel: "Epetmika" → code 01264,
+        // "Betmiga" → 1264. Identical-code matching missed this; the relaxed gate must catch it.
+        let terms = vec!["Betmiga".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        assert_eq!(koelner_phonetik("Epetmika"), "01264");
+        assert_eq!(m.correct("Patient nimmt Epetmika.", 0.5), "Patient nimmt Betmiga.");
     }
 
     #[test]

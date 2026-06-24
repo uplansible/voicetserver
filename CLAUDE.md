@@ -246,8 +246,14 @@ The model often transcribes unfamiliar proper names / medical terms with a sligh
 
 - Targets = the **plain terms** in `custom_words.txt` (lines without `=`), exposed via
   `WordsCorrector::plain_terms()`. Rebuilt whenever `POST /words` updates the file.
-- Matching: identical **Kölner Phonetik** (Cologne phonetics) code **AND** normalized Levenshtein
+- Matching: **near Kölner Phonetik** (Cologne phonetics) code **AND** normalized Levenshtein
   distance ≤ `fuzzy_max_ratio`. Both gates required → low false-positive risk.
+  - Phonetic gate is *near*, not *identical*: a leading `0` (edge-vowel code) is stripped before
+    comparison, then a Kölner-code edit distance ≤ `FUZZY_MAX_CODE_DIST` (=1) is accepted. Voxtral
+    has **no biasing** to keep spellings tight (the qwen3 sister project does), so its output drifts
+    further — most often a prepended/dropped edge vowel turning `1264` "Betmiga" into `01264`
+    "Epetmika". An identical-code requirement rejected these; the relaxed gate snaps them while the
+    orthographic Levenshtein ratio remains the false-positive backstop.
 - Only single all-alphabetic terms are fuzzy targets (multi-word / hyphenated / digit-bearing
   terms like `TUR-B` are excluded — the word scanner splits on non-alphabetic chars). They still
   work as literal `wrong=correct` pairs.
@@ -259,6 +265,30 @@ Pipeline: literal `wrong=correct` replacements → fuzzy phonetic snap.
 
 Runtime-adjustable via `PATCH /config`: `fuzzy_hotwords` (bool, default true),
 `fuzzy_max_ratio` (f32 ∈ [0,1], default 0.34 — lower = stricter). No CLI flags; config + runtime only.
+
+## Abbreviation / acronym matching (Exploration Notes — NOT implemented)
+
+Spelled-out abbreviations (MRI, PSA, EKG, TUR-B) are **not** handled by either mechanism above.
+Two structural reasons, both worth understanding before revisiting:
+
+1. **Hyphen/digit exclusion.** `is_single_word()` requires all chars alphabetic, so `TUR-B` is
+   dropped as a fuzzy target; and `FuzzyMatcher::correct()` splits the transcript on non-alphabetic
+   chars, so `TUR-B` in the text is never seen as one unit.
+2. **Letter-name ≠ acronym phonetics.** When dictated, an acronym comes out as German **letter
+   names**: "M-R-I" → the model writes `Em Er I` / `EM-ER-I` / `Emery`. Kölner Phonetik of the
+   spelled-out form keeps a leading vowel the acronym lacks — `MRI`→`67` vs `EMERI`→`067` — so the
+   phonetic-code gate rejects it; and the letter names are *separate tokens* the word-by-word
+   scanner never joins. Fuzzy phonetics maps sound-alike spellings of *one word*, not letter
+   sequences → acronym. It structurally cannot catch these.
+
+**Proposed approach (deferred):** a separate abbreviation pass with a German letter-name table
+(`em→M, er→R, es→S, pe→P, te→T, ka→K, …`). Scan finals for **runs of adjacent tokens that are all
+recognized letter names** (`Em Er I` → all three qualify), join their letters → candidate acronym
+(`MRI`), and if it matches a known abbreviation target, replace the whole run with the canonical
+spelling (`MRI`, `TUR-B`). Gating on "every token is an actual letter name" keeps false positives
+low. The single-word rendering case (`Emery`) would need a phonetic fallback that strips
+leading-zero codes. Open design question: how to designate which custom terms are abbreviations
+(auto-detect all-uppercase 2–6 letters vs. an explicit prefix marker vs. explicit expansion pairs).
 
 # HTTP API
 
@@ -275,7 +305,10 @@ set only via config file.
 Request bodies are capped at **20 MB** via axum `DefaultBodyLimit`.
 
 - `GET /health` — `{"status":"ready","connections":N}` — **public, no auth required**
-- `GET /config` — current settings (runtime + startup snapshot); includes `data_dir`
+- `GET /config` — current settings (runtime + startup snapshot); includes `data_dir`. Also reports
+  `lora_active` (bool — is a LoRA currently applied in-memory) and `lora_dir` (the path the
+  userscript "LoRA verwenden" toggle re-applies on enable: active path if loaded, else configured
+  `lora_adapter`, else the default training output dir — so the toggle still works after `DELETE /lora`)
 - `PATCH /config` — update settings; runtime params apply immediately, startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1].
 - `GET /words` — `{"words":[...]}`
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
@@ -350,7 +383,7 @@ Right-click → four tabs: **Client** (URL, hotkey), **Server** (runtime params,
 
 **Aufnehmen tab:** shows only unrecorded sentences (recorded ones are hidden). Navigate ◀/▶, edit/add/remove sentences inline, record via ScriptProcessor (raw f32 LE PCM, same as ASR path), preview recording client-side before saving (Web Audio API, no server round-trip), save to commit pair.
 
-**Paare tab:** scrollable list of all recorded pairs (id, text, duration) with per-pair ▶ playback and ✕ delete. LoRA training run + status log.
+**Paare tab:** scrollable list of all recorded pairs (id, text, duration) with per-pair ▶ playback and ✕ delete. LoRA training run + status log. **LoRA verwenden** checkbox: checked → load adapter (`POST /lora/reload` with `lora_dir` from `GET /config`), unchecked → unload (`DELETE /lora`); reflects `lora_active` on tab open. Lets you A/B the adapter against the base model live (useful when an adapter trained on read-aloud audio hurts free-speech accuracy).
 
 ## WebSocket reconnect / mic lifecycle
 

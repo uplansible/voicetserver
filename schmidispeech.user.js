@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.11
+// @version      0.1.12
 // @description  Local GPU dictation — German medical (Voxtral Mini 4B Realtime)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -397,6 +397,10 @@
             </div>
             <div id="schmidi-training-count" style="${LABEL_STYLE}">— Paare</div>
             <div style="border-top:1px solid #444;margin:4px 0;"></div>
+            <label style="display:flex;align-items:center;gap:8px;${LABEL_STYLE}">
+                <input type="checkbox" id="schmidi-lora-enabled" />
+                LoRA verwenden (aktivieren = laden, deaktivieren = entladen)
+            </label>
             <button id="schmidi-training-run"  style="${BTN_PRIMARY}">▶ LoRA trainieren</button>
             <button id="schmidi-lora-reload"   style="${BTN_CANCEL}">↺ LoRA neu laden</button>
             <div id="schmidi-training-status" style="${LABEL_STYLE};min-height:14px;"></div>
@@ -947,9 +951,23 @@
             const data = await res.json();
             trainingPairs = data.pairs || [];
             renderPairsList();
+            await refreshLoraToggle();
         } catch (e) {
             setPaareStatus('Fehler: ' + e.message, true);
         }
+    }
+
+    // Reflect the server's current LoRA state in the "LoRA verwenden" checkbox.
+    async function refreshLoraToggle() {
+        const box = configPanel.querySelector('#schmidi-lora-enabled');
+        if (!box) return;
+        try {
+            const res = await authFetch(`${getHttpBase()}/config`);
+            if (!res.ok) return;
+            const cfg = await res.json();
+            box.checked = !!cfg.lora_active;
+            box.dataset.loraDir = cfg.lora_dir || '';
+        } catch (_) { /* leave checkbox as-is on error */ }
     }
 
     function renderPairsList() {
@@ -1036,6 +1054,47 @@
 
     configPanel.querySelector('#schmidi-training-run').addEventListener('click', runLoraTraining);
     configPanel.querySelector('#schmidi-lora-reload').addEventListener('click', reloadLora);
+    configPanel.querySelector('#schmidi-lora-enabled').addEventListener('change', toggleLora);
+
+    // Checkbox: checked → load LoRA (POST /lora/reload with the adapter dir);
+    // unchecked → unload it (DELETE /lora). The dir comes from GET /config's
+    // `lora_dir`, so re-enabling works even after the active path was cleared.
+    async function toggleLora(ev) {
+        const box = ev.target;
+        if (box.checked) {
+            const dir = box.dataset.loraDir || '';
+            setPaareStatus('Lade LoRA…', false);
+            try {
+                const res  = await authFetch(`${getHttpBase()}/lora/reload`, {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    dir ? JSON.stringify({ path: dir }) : undefined,
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || res.status);
+                if (data.action === 'applied') {
+                    setPaareStatus('LoRA aktiv ✓', false);
+                } else {
+                    // No adapter files at the path — server reverted to base model.
+                    box.checked = false;
+                    setPaareStatus('Kein Adapter gefunden — LoRA nicht aktiv', true);
+                }
+            } catch (e) {
+                box.checked = false;
+                setPaareStatus('Fehler: ' + e.message, true);
+            }
+        } else {
+            setPaareStatus('Entlade LoRA…', false);
+            try {
+                const res = await authFetch(`${getHttpBase()}/lora`, { method: 'DELETE' });
+                if (!res.ok) throw new Error(await res.text());
+                setPaareStatus('LoRA entladen (Basismodell)', false);
+            } catch (e) {
+                box.checked = true;
+                setPaareStatus('Fehler: ' + e.message, true);
+            }
+        }
+    }
 
     async function runLoraTraining() {
         setPaareStatus('Starte Training…', false);

@@ -1244,6 +1244,15 @@ mod server {
     async fn config_get_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         let s = &state.settings;
         let snap = &state.startup_snapshot;
+        // LoRA state for the userscript "LoRA verwenden" toggle. `lora_active`
+        // is the checkbox state; `lora_dir` is the path the toggle re-applies
+        // when re-enabled (active path if loaded, else the configured adapter,
+        // else the default training output dir — so the toggle still works after
+        // DELETE /lora cleared the active path).
+        let active_lora = state.lora_path.read().await.clone();
+        let lora_dir = active_lora.clone()
+            .or_else(|| snap.lora_adapter.as_ref().map(std::path::PathBuf::from))
+            .unwrap_or_else(|| state.paths.lora_output_dir.clone());
         Json(json!({
             "version":           env!("CARGO_PKG_VERSION"),
             // Runtime-adjustable — live values from atomics
@@ -1261,6 +1270,8 @@ mod server {
             "bind_addr":         snap.bind_addr,
             "tls_enabled":       snap.tls_enabled,
             "lora_adapter":      snap.lora_adapter,
+            "lora_active":       active_lora.is_some(),
+            "lora_dir":          lora_dir.to_string_lossy(),
             "venv_path":         snap.venv_path,
             "_startup_only":     ["model_dir", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter", "venv_path"],
             "_note":             "Changing startup_only fields writes to config file but requires server restart."
