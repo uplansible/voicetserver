@@ -23,6 +23,11 @@ set_config_value() {
 }
 
 # --- Venv location ---
+if [[ -f "$CONFIG_FILE" ]] && grep -qE '^[[:space:]]*venv_path[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+    EXISTING_VENV=$(grep -E '^[[:space:]]*venv_path[[:space:]]*=' "$CONFIG_FILE" \
+        | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+    [[ -n "$EXISTING_VENV" ]] && DEFAULT_VENV="$EXISTING_VENV"
+fi
 printf "Venv path [%s]: " "$DEFAULT_VENV"
 read -r VENV_PATH
 VENV_PATH="${VENV_PATH:-$DEFAULT_VENV}"
@@ -75,18 +80,30 @@ python3 -m venv "$VENV_PATH" || {
 }
 mkdir -p "$VENV_PATH/tempdir"
 
-# --- Install torch (skip if already present) ---
+# --- Install / upgrade torch ---
 if "$VENV_PATH/bin/python3" -c "import torch" 2>/dev/null; then
-    echo "torch already installed — skipping."
+    printf "torch already installed — upgrade? [y/N]: "
+    read -r UPG_TORCH
+    if [[ "${UPG_TORCH,,}" == "y" ]]; then
+        echo "Upgrading torch from https://download.pytorch.org/whl/$CUDA_TAG ..."
+        TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir --upgrade \
+            torch --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+    fi
 else
     echo "Installing torch from https://download.pytorch.org/whl/$CUDA_TAG ..."
     TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir \
         torch --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
 fi
 
-# --- Install remaining deps (skip if already present) ---
+# --- Install / upgrade remaining deps ---
 if "$VENV_PATH/bin/python3" -c "import safetensors, mistral_common, numpy, tqdm, packaging" 2>/dev/null; then
-    echo "Python deps already installed — skipping."
+    printf "Python deps already installed — upgrade? [y/N]: "
+    read -r UPG_DEPS
+    if [[ "${UPG_DEPS,,}" == "y" ]]; then
+        echo "Upgrading dependencies..."
+        TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir --upgrade \
+            safetensors mistral-common numpy tqdm packaging
+    fi
 else
     echo "Installing remaining dependencies..."
     TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir \
@@ -123,6 +140,37 @@ fi
 set_config_value "venv_path" "$VENV_PATH"
 echo "venv_path set in $CONFIG_FILE"
 
+# --- Data directory ---
+DEFAULT_DATA_DIR="$HOME/.config/voicetserver"
+EXISTING_DATA_DIR=""
+if grep -qE '^[[:space:]]*data_dir[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+    EXISTING_DATA_DIR=$(grep -E '^[[:space:]]*data_dir[[:space:]]*=' "$CONFIG_FILE" \
+        | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+fi
+
+DATA_DIR=""
+if [[ -n "$EXISTING_DATA_DIR" ]]; then
+    printf "Data dir currently %s — keep this location? [Y/n]: " "$EXISTING_DATA_DIR"
+    read -r KEEP_DATA
+    if [[ "${KEEP_DATA,,}" == "n" ]]; then
+        printf "New data directory [%s]: " "$EXISTING_DATA_DIR"
+        read -r DATA_DIR
+        DATA_DIR="${DATA_DIR:-$EXISTING_DATA_DIR}"
+        set_config_value "data_dir" "$DATA_DIR"
+        echo "data_dir updated to: $DATA_DIR"
+    else
+        DATA_DIR="$EXISTING_DATA_DIR"
+    fi
+else
+    printf "Data directory for custom_words, training, LoRA [%s]: " "$DEFAULT_DATA_DIR"
+    read -r DATA_DIR
+    DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
+    if [[ "$DATA_DIR" != "$DEFAULT_DATA_DIR" ]]; then
+        set_config_value "data_dir" "$DATA_DIR"
+        echo "data_dir set to: $DATA_DIR"
+    fi
+fi
+
 # --- Model files ---
 echo ""
 
@@ -136,8 +184,18 @@ fi
 
 MODEL_DIR=""
 if [[ -n "$EXISTING_MODEL_DIR" && -f "$EXISTING_MODEL_DIR/consolidated.safetensors" ]]; then
-    echo "Model already present at: $EXISTING_MODEL_DIR"
-    MODEL_DIR="$EXISTING_MODEL_DIR"
+    printf "Model already at %s — keep this location? [Y/n]: " "$EXISTING_MODEL_DIR"
+    read -r KEEP_MODEL
+    if [[ "${KEEP_MODEL,,}" == "n" ]]; then
+        printf "New model directory [%s]: " "$EXISTING_MODEL_DIR"
+        read -r MODEL_DIR
+        MODEL_DIR="${MODEL_DIR:-$EXISTING_MODEL_DIR}"
+        set_config_value "model_dir" "$MODEL_DIR"
+        echo "model_dir updated to: $MODEL_DIR"
+        echo "Note: move model files from $EXISTING_MODEL_DIR to $MODEL_DIR, or re-download."
+    else
+        MODEL_DIR="$EXISTING_MODEL_DIR"
+    fi
 else
     printf "Download Voxtral-Mini-4B-Realtime model files (~8.9 GB)? [Y/n]: "
     read -r DL_CHOICE
@@ -379,6 +437,7 @@ echo "Done."
 echo "  Venv:     $VENV_PATH"
 echo "  Script:   ~/.config/voicetserver/tools/train_lora.py"
 echo "  Config:   $CONFIG_FILE"
+[[ -n "$DATA_DIR"  ]] && echo "  Data:     $DATA_DIR"
 [[ -n "$MODEL_DIR" ]] && echo "  Models:   $MODEL_DIR"
 if [[ "$CERT_CONFIGURED" == true ]]; then
     echo "  TLS cert: $CERT_FILE"
