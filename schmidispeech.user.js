@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.12
+// @version      0.1.13
 // @description  Local GPU dictation — German medical (Voxtral Mini 4B Realtime)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -625,8 +625,6 @@
         switchTab("einstellungen");
         loadServerParams();
         configPanel.style.display = "flex";
-        configPanel.querySelector("#schmidi-url-input").focus();
-        configPanel.querySelector("#schmidi-url-input").select();
     }
 
     function closeConfig() {
