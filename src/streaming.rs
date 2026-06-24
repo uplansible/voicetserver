@@ -354,8 +354,11 @@ impl StreamingState {
         Ok(outputs)
     }
 
-    /// Return and clear the accumulated text buffer (used on WebSocket close).
+    /// Return and clear the accumulated text buffer (used on silence flush + WebSocket
+    /// close). Also drops any incomplete trailing UTF-8 bytes so a partial multi-byte
+    /// char left over from the previous paragraph cannot prefix the next one with garbage.
     pub fn take_text_buf(&mut self) -> String {
+        self.pending_bytes.clear();
         std::mem::take(&mut self.text_buf)
     }
 }

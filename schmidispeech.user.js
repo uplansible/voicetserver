@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.10
+// @version      0.1.11
 // @description  Local GPU dictation — German medical (Voxtral Mini 4B Realtime)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -21,6 +21,18 @@
     function getHotkey() { return GM_getValue("hotkey", DEFAULT_HOTKEY); }
     function setHotkey(k) { GM_setValue("hotkey", k.toLowerCase().trim()); }
     function isCommitMode() { return GM_getValue("commit_mode", false); }
+    function apiKey() { return GM_getValue("api_key", ""); }
+    function setApiKey(k) { GM_setValue("api_key", k.trim()); }
+
+    // Wrapper around fetch() that injects the X-Api-Key header on every request.
+    // All server HTTP calls go through this so the key is always sent.
+    function authFetch(url, init = {}) {
+        const key = apiKey();
+        if (key) {
+            init.headers = { ...(init.headers || {}), "X-Api-Key": key };
+        }
+        return fetch(url, init);
+    }
 
     // ---- State ----
     let ws = null;
@@ -191,7 +203,7 @@
 
     async function addWordPair(wrong, correct) {
         try {
-            await fetch(`${getHttpBase()}/words`, {
+            await authFetch(`${getHttpBase()}/words`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ add: [`${wrong}=${correct}`], remove: [] }),
@@ -237,7 +249,7 @@
         if (text) {
             injectAtCursor(text);
             if (originalTranscribed && text !== originalTranscribed) {
-                fetch(`${getHttpBase()}/log/edit`, {
+                authFetch(`${getHttpBase()}/log/edit`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -398,6 +410,8 @@
         <div id="schmidi-pane-einstellungen" style="display:none;flex-direction:column;gap:6px;">
             <div style="${LABEL_STYLE}">Server URL</div>
             <input id="schmidi-url-input" type="text" style="${INPUT_STYLE}"/>
+            <div style="${LABEL_STYLE}">API-Schlüssel</div>
+            <input id="schmidi-apikey-input" type="text" style="${INPUT_STYLE}" placeholder="aus dem Server-Log kopieren"/>
             <div style="${LABEL_STYLE}">Tastenkürzel (z.B. ctrl+shift+d, alt+s)</div>
             <input id="schmidi-hotkey-input" type="text" style="${INPUT_STYLE}"/>
             <div style="border-top:1px solid #333;margin:2px 0;"></div>
@@ -470,7 +484,7 @@
     async function loadWords() {
         setWordsStatus("Lade Wörter…", false);
         try {
-            const res = await fetch(`${getHttpBase()}/words`);
+            const res = await authFetch(`${getHttpBase()}/words`);
             if (!res.ok) throw new Error("GET /words: " + res.status);
             const data = await res.json();
             configPanel.querySelector("#schmidi-words").value = (data.words || []).join("\n");
@@ -483,7 +497,7 @@
     async function loadServerParams() {
         setEinstellungenStatus("Lade Einstellungen…", false);
         try {
-            const res = await fetch(`${getHttpBase()}/config`);
+            const res = await authFetch(`${getHttpBase()}/config`);
             if (!res.ok) throw new Error("GET /config: " + res.status);
             const cfg = await res.json();
             configPanel.querySelector("#schmidi-delay").value             = cfg.delay ?? "";
@@ -523,7 +537,7 @@
         Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
         setEinstellungenStatus("Speichere…", false);
         try {
-            const res = await fetch(`${getHttpBase()}/config`, {
+            const res = await authFetch(`${getHttpBase()}/config`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(patch),
@@ -566,13 +580,13 @@
 
         setWordsStatus("Speichere Wörter…", false);
         try {
-            const wordsRes = await fetch(`${getHttpBase()}/words`);
+            const wordsRes = await authFetch(`${getHttpBase()}/words`);
             const current  = wordsRes.ok ? (await wordsRes.json()).words || [] : [];
             const newSet   = new Set(rawLines);
             const curSet   = new Set(current);
             const add      = rawLines.filter((w) => !curSet.has(w));
             const remove   = current.filter((w) => !newSet.has(w));
-            const res = await fetch(`${getHttpBase()}/words`, {
+            const res = await authFetch(`${getHttpBase()}/words`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ add, remove }),
@@ -586,9 +600,11 @@
 
     async function saveEinstellungen() {
         const url = configPanel.querySelector("#schmidi-url-input").value.trim();
+        const ak  = configPanel.querySelector("#schmidi-apikey-input").value.trim();
         const hk  = configPanel.querySelector("#schmidi-hotkey-input").value.trim();
         const cm  = configPanel.querySelector("#schmidi-commit-mode").checked;
         if (url) setServerUrl(url);
+        setApiKey(ak);
         if (hk)  setHotkey(hk);
         GM_setValue("commit_mode", cm);
         btn.title = `SCHMIDIspeech — ${getHotkey()} zum Diktieren, Rechtsklick konfigurieren`;
@@ -599,6 +615,7 @@
 
     function openConfig() {
         configPanel.querySelector("#schmidi-url-input").value    = getServerUrl();
+        configPanel.querySelector("#schmidi-apikey-input").value = apiKey();
         configPanel.querySelector("#schmidi-hotkey-input").value = getHotkey();
         configPanel.querySelector("#schmidi-commit-mode").checked = isCommitMode();
         switchTab("einstellungen");
@@ -656,7 +673,7 @@
 
     async function loadTrainingSentences() {
         try {
-            const res = await fetch(`${getHttpBase()}/training/sentences`);
+            const res = await authFetch(`${getHttpBase()}/training/sentences`);
             if (!res.ok) throw new Error('GET /training/sentences: ' + res.status);
             const data = await res.json();
             trainingSentences = (data.sentences || []).filter(s => !s.recorded);
@@ -720,7 +737,7 @@
         if (!newText) { setAufnehmenStatus('Leerer Text', true); return; }
         if (newText === oldText) { cancelEditSentence(); return; }
         try {
-            const res = await fetch(`${getHttpBase()}/training/sentence`, {
+            const res = await authFetch(`${getHttpBase()}/training/sentence`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ old: oldText, new: newText }),
@@ -755,7 +772,7 @@
         const text     = (addInput ? addInput.value : '').trim();
         if (!text) { setAufnehmenStatus('Leerer Satz', true); return; }
         try {
-            const res = await fetch(`${getHttpBase()}/training/sentence`, {
+            const res = await authFetch(`${getHttpBase()}/training/sentence`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text }),
@@ -782,7 +799,7 @@
         const text  = (entry.text || '').trim();
         if (!text) return;
         try {
-            const res = await fetch(`${getHttpBase()}/training/sentence`, {
+            const res = await authFetch(`${getHttpBase()}/training/sentence`, {
                 method: 'DELETE',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text }),
@@ -900,7 +917,7 @@
 
         setAufnehmenStatus('Speichere…', false);
         try {
-            const res = await fetch(
+            const res = await authFetch(
                 `${getHttpBase()}/training/pair?text=${encodeURIComponent(text)}`,
                 { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: combined.buffer }
             );
@@ -925,7 +942,7 @@
 
     async function loadTrainingPairs() {
         try {
-            const res = await fetch(`${getHttpBase()}/training/pairs`);
+            const res = await authFetch(`${getHttpBase()}/training/pairs`);
             if (!res.ok) throw new Error('GET /training/pairs: ' + res.status);
             const data = await res.json();
             trainingPairs = data.pairs || [];
@@ -976,7 +993,19 @@
                     paaresCurrentPlayId = null;
                     if (wasId === id) return;
                 }
-                const audio = new Audio(`${getHttpBase()}/training/audio/${id}`);
+                // Fetch the WAV via authFetch (so the API key is sent), then play it
+                // from an object URL — `new Audio(url)` cannot carry the auth header.
+                let audio;
+                try {
+                    const res = await authFetch(`${getHttpBase()}/training/audio/${id}`);
+                    if (!res.ok) throw new Error(await res.text());
+                    const blobUrl = URL.createObjectURL(await res.blob());
+                    audio = new Audio(blobUrl);
+                    audio.addEventListener('ended', () => URL.revokeObjectURL(blobUrl), { once: true });
+                } catch (err) {
+                    setPaareStatus('Wiedergabe: ' + err.message, true);
+                    return;
+                }
                 paaresCurrentAudio  = audio;
                 paaresCurrentPlayId = id;
                 playBtn.textContent = '⏹';
@@ -994,7 +1023,7 @@
             }
             if (delBtn) {
                 try {
-                    const res = await fetch(`${getHttpBase()}/training/pair/${delBtn.dataset.id}`, { method: 'DELETE' });
+                    const res = await authFetch(`${getHttpBase()}/training/pair/${delBtn.dataset.id}`, { method: 'DELETE' });
                     if (!res.ok) throw new Error(await res.text());
                     setPaareStatus(`Paar ${delBtn.dataset.id} gelöscht`, false);
                     await loadTrainingPairs();
@@ -1011,7 +1040,7 @@
     async function runLoraTraining() {
         setPaareStatus('Starte Training…', false);
         try {
-            const res = await fetch(`${getHttpBase()}/training/run`, { method: 'POST' });
+            const res = await authFetch(`${getHttpBase()}/training/run`, { method: 'POST' });
             if (res.status === 409) { setPaareStatus('Training läuft bereits', false); return; }
             if (!res.ok) throw new Error(await res.text());
             setPaareStatus('Training gestartet', false);
@@ -1027,7 +1056,7 @@
     async function reloadLora() {
         setPaareStatus('Lade LoRA neu…', false);
         try {
-            const res  = await fetch(`${getHttpBase()}/lora/reload`, { method: 'POST' });
+            const res  = await authFetch(`${getHttpBase()}/lora/reload`, { method: 'POST' });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || res.status);
             setPaareStatus(data.action === 'applied' ? 'LoRA geladen ✓' : 'LoRA entfernt (kein Adapter)', false);
@@ -1038,7 +1067,7 @@
 
     async function pollTrainingStatus() {
         try {
-            const res  = await fetch(`${getHttpBase()}/training/status`);
+            const res  = await authFetch(`${getHttpBase()}/training/status`);
             if (!res.ok) return;
             const data = await res.json();
             const statusMap = { idle: 'Bereit', running: 'Training läuft…', done: 'Training abgeschlossen ✓', error: 'Training fehlgeschlagen' };
@@ -1230,7 +1259,13 @@
         // Remember the ready callback so it still runs if the *first* attempt
         // fails and a later retry is the one that actually connects.
         if (onReady) pendingOnReady = onReady;
-        const url = getServerUrl();
+        // Browsers cannot set custom headers on the WS upgrade, so the API key is
+        // passed as a query param (?api_key=) instead of the X-Api-Key header.
+        let url = getServerUrl();
+        const key = apiKey();
+        if (key) {
+            url += (url.includes("?") ? "&" : "?") + "api_key=" + encodeURIComponent(key);
+        }
         ws = new WebSocket(url);
         ws.binaryType = "arraybuffer";
 

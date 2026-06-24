@@ -47,6 +47,9 @@ pub struct ConfigFile {
     pub lora_adapter: Option<String>,
     pub venv_path:    Option<String>,
     pub data_dir:     Option<String>,
+    /// API key for authenticating HTTP/WebSocket requests. Auto-generated on first
+    /// server start and persisted here. Not a CLI flag — config file only.
+    pub api_key:      Option<String>,
     // Runtime-adjustable via PATCH /config
     pub delay:             Option<usize>,
     pub silence_threshold: Option<f32>,
@@ -183,10 +186,13 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 
 # log_file = "/path/to/voicetserver.log"   # default: ~/.config/voicetserver/logs/voicetserver.log
 # log_keep_days = 7
+
+# api_key = ""   # auto-generated on first server start; copy into the userscript Einstellungen tab
 "#;
 
 /// Create ~/.config/voicetserver/ and a commented config.toml template if not present.
 pub fn bootstrap_config_dir() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let dir = config_dir();
     if !dir.exists() {
         std::fs::create_dir_all(&dir)?;
@@ -194,6 +200,8 @@ pub fn bootstrap_config_dir() -> Result<()> {
     let path = config_file_path();
     if !path.exists() {
         std::fs::write(&path, CONFIG_TEMPLATE)?;
+        // 0600 — the config file holds the API key.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         eprintln!("Created config: {}", path.display());
     }
     Ok(())
@@ -214,11 +222,49 @@ pub fn load_config_file() -> Result<ConfigFile> {
 
 /// Serialize and write the config file to disk.
 pub fn save_config_file(cfg: &ConfigFile) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let path = config_file_path();
     let toml_str = toml::to_string_pretty(cfg)
         .map_err(|e| anyhow::anyhow!("config serialize error: {}", e))?;
     std::fs::write(&path, toml_str)
-        .map_err(|e| anyhow::anyhow!("config write error ({}): {}", path.display(), e))
+        .map_err(|e| anyhow::anyhow!("config write error ({}): {}", path.display(), e))?;
+    // 0600 — the config file holds the API key.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow::anyhow!("config chmod error ({}): {}", path.display(), e))
+}
+
+// ---------------------------------------------------------------------------
+// API key management
+// ---------------------------------------------------------------------------
+
+/// Read 16 random bytes from /dev/urandom and hex-encode them.
+fn generate_api_key() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    let mut f = std::fs::File::open("/dev/urandom")
+        .expect("cannot open /dev/urandom for API key generation");
+    f.read_exact(&mut bytes)
+        .expect("cannot read /dev/urandom for API key generation");
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Ensure the config file has an API key. Generates and persists one if missing.
+/// Returns the key. Prints it to stdout when newly generated.
+pub fn ensure_api_key(cfg: &mut ConfigFile) -> Result<String> {
+    if let Some(ref key) = cfg.api_key {
+        if !key.is_empty() {
+            return Ok(key.clone());
+        }
+    }
+    let key = generate_api_key();
+    cfg.api_key = Some(key.clone());
+    save_config_file(cfg)
+        .map_err(|e| anyhow::anyhow!("Failed to save generated API key: {}", e))?;
+    println!("┌─────────────────────────────────────────────────────┐");
+    println!("│  Generated API key: {}  │", key);
+    println!("│  Paste it into the userscript Einstellungen tab.      │");
+    println!("└─────────────────────────────────────────────────────┘");
+    Ok(key)
 }
 
 // ---------------------------------------------------------------------------

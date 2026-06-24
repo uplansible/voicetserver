@@ -220,7 +220,7 @@ fn run() -> Result<()> {
 
     // Load config file and merge with CLI args (CLI overrides config overrides defaults).
     config::bootstrap_config_dir()?;
-    let file_config = config::load_config_file()?;
+    let mut file_config = config::load_config_file()?;
     let merged = config::merge(&cli, &file_config);
 
     // Ensure data_dir exists (may differ from config_dir when --data-dir / data_dir is set).
@@ -250,6 +250,14 @@ fn run() -> Result<()> {
 
     // Guard against starting a second instance.
     let is_server_mode = cli.wav_file.is_none();
+
+    // Ensure an API key exists (server mode only). Generated + persisted on first start.
+    let api_key = if is_server_mode {
+        config::ensure_api_key(&mut file_config)?
+    } else {
+        String::new()
+    };
+
     if is_server_mode {
         if let Some(pid) = read_pid_file() {
             if is_process_running(pid) {
@@ -404,6 +412,7 @@ fn run() -> Result<()> {
                     shared_config,
                     log_path.unwrap_or_default(),
                     watchdog_active,
+                    api_key,
                 ))
         }
     }
@@ -529,6 +538,10 @@ fn load_wav(path: &str) -> Result<Vec<f32>> {
         samples
     };
 
+    if samples.is_empty() {
+        anyhow::bail!("WAV file contains no decodable samples: {}", path);
+    }
+
     if spec.sample_rate != 16000 {
         println!("  Resampling from {} Hz to 16000 Hz", spec.sample_rate);
         let ratio = 16000.0 / spec.sample_rate as f64;
@@ -565,6 +578,14 @@ fn is_process_running(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }
 
+/// Verify the running process is actually voicetserver (guards against stale PID reuse
+/// by an unrelated process that happened to be assigned the same PID after a crash).
+fn is_our_process(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/cmdline", pid))
+        .map(|s| s.contains("voicetserver"))
+        .unwrap_or(false)
+}
+
 /// Send SIGTERM to the running daemon and wait for it to exit.
 fn stop_server() -> Result<()> {
     let pid_path = config::pid_file_path();
@@ -574,6 +595,13 @@ fn stop_server() -> Result<()> {
         ))?;
     let pid: i32 = pid_str.trim().parse()
         .map_err(|_| anyhow::anyhow!("Invalid PID file: {}", pid_path.display()))?;
+
+    if !is_our_process(pid as u32) {
+        anyhow::bail!(
+            "PID {} does not appear to be voicetserver (process reuse?). Refusing to send SIGTERM.",
+            pid
+        );
+    }
 
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
@@ -780,10 +808,14 @@ pub fn rotate_log_if_needed(log_path: &std::path::PathBuf, keep_days: u32) {
 }
 
 /// Delete rotated log files older than keep_days days.
+/// Uses the Unix timestamp embedded in the filename ("voicetserver.log.<ts>") rather
+/// than filesystem mtime, which is unreliable after copies/restores.
 fn prune_old_logs(log_dir: &std::path::Path, keep_days: u32) {
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(keep_days as u64 * 86400))
-        .unwrap_or(std::time::UNIX_EPOCH);
+    let cutoff_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(keep_days as u64 * 86400);
 
     let entries = match std::fs::read_dir(log_dir) {
         Ok(e) => e,
@@ -794,12 +826,9 @@ fn prune_old_logs(log_dir: &std::path::Path, keep_days: u32) {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         // Only prune files that look like rotated logs: "voicetserver.log.<timestamp>"
-        if !name.starts_with("voicetserver.log.") {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if modified < cutoff {
+        if let Some(ts_str) = name.strip_prefix("voicetserver.log.") {
+            if let Ok(ts) = ts_str.parse::<u64>() {
+                if ts < cutoff_secs {
                     std::fs::remove_file(&path).ok();
                 }
             }
@@ -814,8 +843,9 @@ mod server {
     use crate::settings::{IniValues, SharedSettings, StartupSnapshot, STATE_READY};
     use crate::words::{FuzzyMatcher, WordsCorrector};
     use axum::{
-        extract::{Query, State, WebSocketUpgrade},
+        extract::{DefaultBodyLimit, Query, State, WebSocketUpgrade},
         http::StatusCode,
+        middleware,
         response::{IntoResponse, Response},
         routing::get,
         Json, Router,
@@ -846,12 +876,51 @@ mod server {
         fn new() -> Self { Self { status: TrainingStatusKind::Idle, log: vec![] } }
     }
 
+    // ---- Auth middleware ----
+
+    /// Constant-time string comparison (no early return on first mismatch) to avoid
+    /// leaking the API key length/content via timing.
+    fn ct_eq(a: &str, b: &str) -> bool {
+        if a.len() != b.len() { return false; }
+        a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+
+    /// Checks the X-Api-Key header (HTTP) or the ?api_key= query param (WebSocket —
+    /// browsers cannot send custom headers during the WS upgrade). /health is exempt.
+    async fn api_key_auth(
+        State(state): State<Arc<AppState>>,
+        request: axum::extract::Request,
+        next: middleware::Next,
+    ) -> Response {
+        let header_key = request.headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let query_key = request.uri().query()
+            .and_then(|q| {
+                q.split('&').find_map(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    let k = parts.next()?;
+                    let v = parts.next()?;
+                    if k == "api_key" { Some(v) } else { None }
+                })
+            })
+            .unwrap_or("");
+
+        if !ct_eq(header_key, &state.api_key) && !ct_eq(query_key, &state.api_key) {
+            return (StatusCode::UNAUTHORIZED, "Invalid or missing API key").into_response();
+        }
+        next.run(request).await
+    }
+
     pub async fn run(
         model: Arc<VoxtralModel>,
         merged: MergedConfig,
         config_file: SharedConfigFile,
         log_path: std::path::PathBuf,
         watchdog_active: bool,
+        api_key: String,
     ) -> Result<()> {
         let vals = IniValues {
             delay: merged.delay,
@@ -942,6 +1011,8 @@ mod server {
             training_status,
             paths,
             lora_path,
+            api_key,
+            pair_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
 
         let cors = CorsLayer::new()
@@ -955,8 +1026,8 @@ mod server {
             ])
             .allow_headers(Any);
 
-        let app = Router::new()
-            .route("/health",  get(health_handler))
+        // Protected routes require a valid X-Api-Key header (or ?api_key= for WebSocket).
+        let protected = Router::new()
             .route("/asr",     get(ws_handler))
             .route("/config",  get(config_get_handler).patch(config_patch_handler))
             .route("/words",   get(words_get_handler).post(words_post_handler))
@@ -973,7 +1044,14 @@ mod server {
             .route("/training/run",         axum::routing::post(training_run_handler))
             .route("/training/status",      get(training_status_handler))
             .route("/lora/reload",          axum::routing::post(lora_reload_handler))
+            .route("/lora",                 axum::routing::delete(lora_clear_handler))
             .route("/log/edit",             axum::routing::post(log_edit_handler))
+            .route_layer(middleware::from_fn_with_state(Arc::clone(&state), api_key_auth));
+
+        let app = Router::new()
+            .route("/health", get(health_handler))   // public — no auth required
+            .merge(protected)
+            .layer(DefaultBodyLimit::max(20 * 1024 * 1024))  // 20 MB cap
             .layer(cors)
             .with_state(state);
 
@@ -1026,6 +1104,11 @@ mod server {
         /// Currently active LoRA adapter path (None if no adapter loaded).
         /// Updated by POST /lora/reload.
         lora_path:         Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
+        /// API key required on every endpoint except GET /health.
+        api_key:           String,
+        /// Serialises training-pair upload + delete so concurrent requests cannot
+        /// collide on the same ID or rewrite pairs.jsonl mid-append.
+        pair_write_lock:   Arc<tokio::sync::Mutex<()>>,
     }
 
     // ---- /health ----
@@ -1420,6 +1503,11 @@ mod server {
         if !wav_path.exists() {
             return StatusCode::NOT_FOUND.into_response();
         }
+
+        // Hold the write lock so a concurrent upload can't append to the JSONL while we
+        // rewrite it, and so two concurrent deletes don't interleave.
+        let _guard = state.pair_write_lock.lock().await;
+
         if let Err(e) = tokio::fs::remove_file(&wav_path).await {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to remove WAV: {e}")).into_response();
         }
@@ -1597,6 +1685,11 @@ mod server {
         }
 
         let pairs_path = &state.paths.training_pairs;
+
+        // Hold the write lock for the entire ID-assignment + file-write sequence so
+        // concurrent uploads don't collide on the same ID, and deletions don't rewrite
+        // the JSONL while we're appending to it.
+        let _guard = state.pair_write_lock.lock().await;
 
         // Derive the next ID from the highest existing ID (not the count) so that
         // deleting a pair never causes a later upload to reuse — and overwrite — an
@@ -1811,6 +1904,24 @@ mod server {
             "action": action,
             "path":   path.to_string_lossy(),
         }))).into_response()
+    }
+
+    // ---- DELETE /lora ----
+
+    /// DELETE /lora — unload the active LoRA adapter in-memory (revert to base model)
+    /// without a restart. The adapter files on disk are left untouched. Useful to
+    /// recover quickly from a bad adapter. No-op (still 200) while the model is
+    /// unloaded for training; the cleared path means nothing is re-applied on reload.
+    async fn lora_clear_handler(State(state): State<Arc<AppState>>) -> Response {
+        {
+            let mut guard = state.model.inner.lock().await;
+            if let Some(inner) = guard.as_mut() {
+                inner.dec.clear_lora();
+            }
+        }
+        *state.lora_path.write().await = None;
+        eprintln!("LoRA cleared (reverted to base model).");
+        Json(json!({ "status": "cleared" })).into_response()
     }
 
     // ---- POST /log/edit ----

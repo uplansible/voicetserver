@@ -142,7 +142,7 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 
 # Architecture
 
-- `src/main.rs` — sync `fn main()` → forks/daemonizes before tokio starts → `tokio::runtime::Builder::block_on(server::run(…))`; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers; detach/watchdog/PID/log helpers
+- `src/main.rs` — sync `fn main()` → forks/daemonizes before tokio starts → `tokio::runtime::Builder::block_on(server::run(…))`; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers; `api_key_auth` middleware (constant-time `ct_eq`) on a protected sub-router (`/health` is public); `pair_write_lock` serialises training-pair writes; detach/watchdog/PID/log helpers
 - `src/streaming.rs` — `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
 - `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
@@ -179,8 +179,14 @@ disk, ~10–30 s).
 
 # Config file
 
-`~/.config/voicetserver/config.toml` — created automatically with commented template on first run.
+`~/.config/voicetserver/config.toml` — created automatically with commented template on first run;
+file permissions are set to **0600** (owner read/write only) on creation and on every save, since it
+contains the API key.
 CLI args override config file values. Unknown fields in the config file are silently ignored.
+
+`api_key` — auto-generated (16-byte random hex) on first server start and persisted to config.toml.
+Printed prominently at startup when newly generated. Copy into the userscript Einstellungen tab.
+Not a CLI flag — set only via config file.
 
 Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`, `fuzzy_hotwords`, `fuzzy_max_ratio`.
 
@@ -209,14 +215,16 @@ Written at `~/.config/voicetserver/voicetserver.pid` immediately after fork (bef
 
 ## --stop flag
 
-Reads PID file, sends SIGTERM, polls `/proc/<pid>` for up to 5 s, deletes PID file.
+Reads PID file, verifies `/proc/<pid>/cmdline` contains `voicetserver` (guards against a stale
+PID being reused by an unrelated process — refuses to SIGTERM if it doesn't match), sends SIGTERM,
+polls `/proc/<pid>` for up to 5 s, deletes PID file.
 
 ## Log file
 
 - Default: `~/.config/voicetserver/logs/voicetserver.log`
 - Override: `--log-file <path>` or `log_file = "..."` in config.toml
 - Rotation: background tokio task checks size every 5 min; rotates at 20 MB → `voicetserver.log.<unix_ts>`
-- Pruning: rotated files older than `log_keep_days` days (default 7) are deleted on rotation
+- Pruning: rotated files older than `log_keep_days` days (default 7) are deleted on rotation; age is taken from the Unix timestamp in the filename (`voicetserver.log.<ts>`), not filesystem mtime (unreliable after copies/restores)
 
 # Custom words
 
@@ -256,12 +264,23 @@ Runtime-adjustable via `PATCH /config`: `fuzzy_hotwords` (bool, default true),
 
 All endpoints support CORS (`allow_origin: *`).
 
-- `GET /health` — `{"status":"ready","connections":N}`
+**Authentication:** all endpoints except `GET /health` require the `X-Api-Key` header. For
+WebSocket (browsers cannot send custom headers during the upgrade), pass the key as
+`?api_key=<key>` instead. The key is auto-generated (16-byte random hex) on first server start,
+persisted to `config.toml` (chmod 0600), and printed prominently at startup when newly generated.
+Auth is enforced by the `api_key_auth` middleware (constant-time compare via `ct_eq`) applied as
+a `route_layer` to the protected sub-router; `/health` is registered outside it. Not a CLI flag —
+set only via config file.
+
+Request bodies are capped at **20 MB** via axum `DefaultBodyLimit`.
+
+- `GET /health` — `{"status":"ready","connections":N}` — **public, no auth required**
 - `GET /config` — current settings (runtime + startup snapshot); includes `data_dir`
 - `PATCH /config` — update settings; runtime params apply immediately, startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1].
 - `GET /words` — `{"words":[...]}`
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
 - `POST /lora/reload` — hot-reload LoRA adapter without restart; optional JSON body `{"path":"..."}` to specify dir (omit to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
+- `DELETE /lora` — unload the active LoRA adapter in-memory (revert to base model) without restart; adapter files on disk are left untouched; clears `lora_path` so nothing is re-applied on the next training reload
 - `ws[s]://host:port/asr` — WebSocket audio stream (raw f32 LE PCM 16kHz mono)
 
 ### Training (Phase 2 — LoRA voice calibration)
@@ -273,7 +292,7 @@ All endpoints support CORS (`allow_origin: *`).
 - `DELETE /training/sentence` — `{"text":"…"}` — remove one sentence from file
 
 **Pair collection:**
-- `POST /training/pair?text=<url-encoded>` — body: raw f32 LE PCM at 16kHz (always; MediaRecorder path dropped — container bytes caused static); saves 16-bit WAV + appends to `pairs.jsonl`; returns `{"id","duration_s","count"}`
+- `POST /training/pair?text=<url-encoded>` — body: raw f32 LE PCM at 16kHz (always; MediaRecorder path dropped — container bytes caused static); saves 16-bit WAV + appends to `pairs.jsonl`; returns `{"id","duration_s","count"}`. ID is `max(existing_ids)+1` (not line count) so deletions never cause collisions. Upload + delete are serialised via a `pair_write_lock` mutex so concurrent requests can't collide on an ID or rewrite the JSONL mid-append.
 - `GET /training/pairs` — `{"pairs":[{"id","text","duration_s"}]}` sorted by id
 - `GET /training/audio/{id}` — serve recorded WAV for playback (numeric id only)
 - `DELETE /training/pair/{id}` — remove WAV file + JSONL entry
@@ -318,7 +337,11 @@ Scale = `lora_alpha / r` from `adapter_config.json`.
 Sends raw 16kHz mono f32 LE PCM over WebSocket binary frames.
 Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}` / `{"type":"error","text":"..."}`.
 
-Server URL and hotkey stored via `GM_setValue` (`server_url`, `hotkey`).
+Server URL, API key, and hotkey stored via `GM_setValue` (`server_url`, `api_key`, `hotkey`).
+All HTTP requests go through `authFetch()`, which injects `X-Api-Key: <stored key>` on every call;
+the WebSocket URL gets `?api_key=<key>` appended (browsers cannot send headers on the WS upgrade).
+Training-audio playback uses `authFetch` + `URL.createObjectURL(blob)` (not `new Audio(url)`) so the
+key is sent. The API key is entered in the Einstellungen tab.
 Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Client tab).
 Text is inserted live at cursor on each `final`; trailing partial inserted on stop.
 Falls back to clipboard if no editable element was captured.
