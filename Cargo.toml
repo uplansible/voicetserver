@@ -1,6 +1,6 @@
 [package]
 name = "voicetserver"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2021"
 
 [features]
@@ -11,6 +11,7 @@ cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",
     "dep:candle-flash-attn",
+    "qwen3-asr/cuda",
 ]
 
 [dependencies]
@@ -18,6 +19,9 @@ cuda = [
 candle-core = { path = "candle-fork/candle-core" }
 candle-nn   = { path = "candle-fork/candle-nn" }
 candle-flash-attn = { path = "candle-fork/candle-flash-attn", optional = true }
+
+# Qwen3-ASR engine (vendored from schmidiscribe; candle deps repointed to candle-fork)
+qwen3-asr = { path = "qwen3-asr-rs", default-features = false }
 
 # Numerics
 half = { version = "2.3.1", features = ["num-traits"] }
