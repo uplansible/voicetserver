@@ -142,6 +142,9 @@ pub struct VoxtralModel {
     pub dtype: DType,
     /// Model directory — used to rebuild enc+dec when reloading after training.
     pub model_dir: String,
+    /// GERMAN_PRIME_TEXT encoded once at load; injected into the prefill when the
+    /// german_prime setting is on (experimental language-prior biasing).
+    pub prime_ids: Vec<u32>,
 }
 
 /// Rebuild the GPU-resident encoder + decoder from `consolidated.safetensors`, optionally
@@ -260,7 +263,9 @@ fn run() -> Result<()> {
 
     if is_server_mode {
         if let Some(pid) = read_pid_file() {
-            if is_process_running(pid) {
+            // Verify the cmdline too — after a crash the stale PID may have been
+            // recycled by an unrelated process, which must not block startup.
+            if is_process_running(pid) && is_our_process(pid) {
                 anyhow::bail!(
                     "Server already running (PID {}). Use --stop to stop it.", pid
                 );
@@ -341,6 +346,8 @@ fn run() -> Result<()> {
     println!("{:<28} {}{}", "Fuzzy hotwords",
         if merged.fuzzy_hotwords { "on" } else { "off" },
         if merged.fuzzy_hotwords { format!(" (max ratio {})", merged.fuzzy_max_ratio) } else { String::new() });
+    println!("{:<28} {}", "German prime (experimental)",
+        if merged.german_prime { "on" } else { "off" });
     println!("{:<28} {:?}", "Compute dtype", dtype);
     if !is_offline {
         println!("{:<28} {}:{}", "Listen", merged.bind_addr.value, merged.port);
@@ -390,9 +397,17 @@ fn run() -> Result<()> {
 
     match cli.wav_file {
         Some(ref path) => {
-            run_offline(path, effective_delay, enc, &adapter, dec, &tok, &filters, &device, dtype)
+            // Offline mode respects the german_prime config flag too, so A/B runs on
+            // the same WAV are possible without a server.
+            let prime_ids = if merged.german_prime {
+                tok.encode_greedy(streaming::GERMAN_PRIME_TEXT)
+            } else {
+                Vec::new()
+            };
+            run_offline(path, effective_delay, &prime_ids, enc, &adapter, dec, &tok, &filters, &device, dtype)
         }
         None => {
+            let prime_ids = tok.encode_greedy(streaming::GERMAN_PRIME_TEXT);
             let model = Arc::new(VoxtralModel {
                 inner: tokio::sync::Mutex::new(Some(ModelInner { enc, dec })),
                 adapter,
@@ -401,6 +416,7 @@ fn run() -> Result<()> {
                 device,
                 dtype,
                 model_dir: merged.model_dir.value.clone(),
+                prime_ids,
             });
             let shared_config = Arc::new(tokio::sync::Mutex::new(file_config));
             tokio::runtime::Builder::new_multi_thread()
@@ -423,6 +439,7 @@ fn run() -> Result<()> {
 fn run_offline(
     wav_path: &str,
     delay_tokens: usize,
+    prime_tokens: &[u32],
     mut enc: encoder::AudioEncoder,
     adapter: &adapter::Adapter,
     mut dec: decoder::TextDecoder,
@@ -464,7 +481,7 @@ fn run_offline(
     let t_cond = decoder::sinusoidal_embedding(delay_tokens as f32, device, dtype)?;
     let prefill_len = decoder::prefill_len(delay_tokens);
 
-    let prefill_embeds = dec.prepare_prefill(&adapter_out, delay_tokens, device, dtype)?;
+    let prefill_embeds = dec.prepare_prefill(&adapter_out, delay_tokens, prime_tokens, device, dtype)?;
 
     dec.reset_caches();
     dec.precompute_t_cond(&t_cond)?;
@@ -609,11 +626,21 @@ fn stop_server() -> Result<()> {
     ).map_err(|e| anyhow::anyhow!("Failed to stop server (PID {}): {}", pid, e))?;
 
     // Wait up to 5 s for the process to exit
+    let mut exited = false;
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         if !is_process_running(pid as u32) {
+            exited = true;
             break;
         }
+    }
+
+    // Only report success (and delete the PID file) if the process actually exited —
+    // otherwise a stale "stopped" claim would allow a duplicate instance to start.
+    if !exited {
+        anyhow::bail!(
+            "Server (PID {}) did not exit within 5 s after SIGTERM. PID file kept.", pid
+        );
     }
 
     remove_pid_file();
@@ -783,11 +810,11 @@ fn redirect_stdin_to_null() {
 pub fn rotate_log_if_needed(log_path: &std::path::PathBuf, keep_days: u32) {
     const MAX_SIZE: u64 = 20 * 1024 * 1024;
 
-    let len = match std::fs::metadata(log_path) {
-        Ok(m) => m.len(),
+    let meta = match std::fs::metadata(log_path) {
+        Ok(m) => m,
         Err(_) => return,
     };
-    if len <= MAX_SIZE {
+    if meta.len() <= MAX_SIZE {
         return;
     }
 
@@ -802,15 +829,34 @@ pub fn rotate_log_if_needed(log_path: &std::path::PathBuf, keep_days: u32) {
         .map_or("voicetserver.log".into(), |n| n.to_string_lossy().into_owned());
     let rotated = log_dir.join(format!("{}.{}", fname, ts));
 
+    // Rotate by rename + reopen. Rename is atomic, so no lines are lost (the
+    // earlier copy+truncate scheme dropped anything written between the two
+    // steps). Our own stdout/stderr fds follow the renamed inode, so when they
+    // were dup2'd to this log file (detached / after 'd'), reopen the path and
+    // dup2 the fresh fd over 1/2 — rotation runs in-process, no SIGHUP needed.
+    // In interactive mode stdout is still the terminal and must not be touched.
+    let output_redirected = stdout_is_file(&meta);
     if std::fs::rename(log_path, &rotated).is_ok() {
-        prune_old_logs(log_dir, keep_days);
+        if output_redirected {
+            redirect_output_to_log(log_path);
+        }
+        prune_old_logs(log_dir, &fname, keep_days);
+    }
+}
+
+/// Does fd 1 currently point at the same inode as `target` (the live log file)?
+fn stdout_is_file(target: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match nix::sys::stat::fstat(1) {
+        Ok(st) => st.st_dev as u64 == target.dev() && st.st_ino as u64 == target.ino(),
+        Err(_) => false,
     }
 }
 
 /// Delete rotated log files older than keep_days days.
-/// Uses the Unix timestamp embedded in the filename ("voicetserver.log.<ts>") rather
+/// Uses the Unix timestamp embedded in the filename ("<log_fname>.<ts>") rather
 /// than filesystem mtime, which is unreliable after copies/restores.
-fn prune_old_logs(log_dir: &std::path::Path, keep_days: u32) {
+fn prune_old_logs(log_dir: &std::path::Path, log_fname: &str, keep_days: u32) {
     let cutoff_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -822,11 +868,12 @@ fn prune_old_logs(log_dir: &std::path::Path, keep_days: u32) {
         Err(_) => return,
     };
 
+    let prefix = format!("{}.", log_fname);
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        // Only prune files that look like rotated logs: "voicetserver.log.<timestamp>"
-        if let Some(ts_str) = name.strip_prefix("voicetserver.log.") {
+        // Only prune files that look like rotated logs: "<log_fname>.<timestamp>"
+        if let Some(ts_str) = name.strip_prefix(prefix.as_str()) {
             if let Ok(ts) = ts_str.parse::<u64>() {
                 if ts < cutoff_secs {
                     std::fs::remove_file(&path).ok();
@@ -841,7 +888,7 @@ mod server {
     use super::*;
     use crate::config::{save_config_file, SharedConfigFile};
     use crate::settings::{IniValues, SharedSettings, StartupSnapshot, STATE_READY};
-    use crate::words::{FuzzyMatcher, WordsCorrector};
+    use crate::words::{AbbrevExpander, FuzzyMatcher, WordsCorrector};
     use axum::{
         extract::{DefaultBodyLimit, Query, State, WebSocketUpgrade},
         http::StatusCode,
@@ -931,6 +978,7 @@ mod server {
             rms_ema_alpha: merged.rms_ema,
             fuzzy_hotwords: merged.fuzzy_hotwords,
             fuzzy_max_ratio: merged.fuzzy_max_ratio,
+            german_prime: merged.german_prime,
         };
         let settings = Arc::new(SharedSettings::new(vals, merged.silence_flush));
         settings.state.store(STATE_READY, Ordering::SeqCst);
@@ -991,6 +1039,10 @@ mod server {
         let fuzzy = Arc::new(tokio::sync::RwLock::new(
             FuzzyMatcher::from_corrector(&initial_corrector)
         ));
+        // Acronym targets = the uppercase 2–6-letter plain terms (MRI, TUR-B, …).
+        let abbrev = Arc::new(tokio::sync::RwLock::new(
+            AbbrevExpander::from_corrector(&initial_corrector)
+        ));
         let words = Arc::new(tokio::sync::RwLock::new(initial_corrector));
 
         let training_status = Arc::new(tokio::sync::Mutex::new(TrainingStatus::new()));
@@ -1008,6 +1060,7 @@ mod server {
             words_path,
             words,
             fuzzy,
+            abbrev,
             training_status,
             paths,
             lora_path,
@@ -1043,15 +1096,24 @@ mod server {
             .route("/training",             get(training_get_handler).delete(training_delete_handler))
             .route("/training/run",         axum::routing::post(training_run_handler))
             .route("/training/status",      get(training_status_handler))
+            // Dictation review (real dictations as training-pair candidates)
+            .route("/training/reviews",             get(review_list_handler))
+            .route("/training/review",              axum::routing::post(review_add_handler))
+            .route("/training/review/{id}",         axum::routing::delete(review_delete_handler))
+            .route("/training/review/{id}/accept",  axum::routing::post(review_accept_handler))
+            .route("/training/review/audio/{id}",   get(review_audio_handler))
             .route("/lora/reload",          axum::routing::post(lora_reload_handler))
             .route("/lora",                 axum::routing::delete(lora_clear_handler))
             .route("/log/edit",             axum::routing::post(log_edit_handler))
+            .route("/edits/report",         get(edit_report_handler))
             .route_layer(middleware::from_fn_with_state(Arc::clone(&state), api_key_auth));
 
         let app = Router::new()
             .route("/health", get(health_handler))   // public — no auth required
             .merge(protected)
-            .layer(DefaultBodyLimit::max(20 * 1024 * 1024))  // 20 MB cap
+            // 64 MB cap: review uploads are whole dictations as f32 PCM
+            // (64 KB/s → ~16 min head-room; the old 20 MB capped at ~5 min).
+            .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
             .layer(cors)
             .with_state(state);
 
@@ -1099,6 +1161,8 @@ mod server {
         words:             Arc<tokio::sync::RwLock<WordsCorrector>>,
         /// Fuzzy phonetic matcher, rebuilt from `words` whenever custom_words.txt changes.
         fuzzy:             Arc<tokio::sync::RwLock<FuzzyMatcher>>,
+        /// Acronym letter-name expander (Em Er I → MRI), rebuilt alongside `fuzzy`.
+        abbrev:            Arc<tokio::sync::RwLock<AbbrevExpander>>,
         training_status:   Arc<tokio::sync::Mutex<TrainingStatus>>,
         paths:             crate::config::WorkspacePaths,
         /// Currently active LoRA adapter path (None if no adapter loaded).
@@ -1106,8 +1170,9 @@ mod server {
         lora_path:         Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
         /// API key required on every endpoint except GET /health.
         api_key:           String,
-        /// Serialises training-pair upload + delete so concurrent requests cannot
-        /// collide on the same ID or rewrite pairs.jsonl mid-append.
+        /// Serialises training-file writes: pair upload + delete (so concurrent
+        /// requests cannot collide on the same ID or rewrite pairs.jsonl mid-append)
+        /// and sentence add/edit/delete (read-modify-write on training_sentences.txt).
         pair_write_lock:   Arc<tokio::sync::Mutex<()>>,
     }
 
@@ -1142,15 +1207,21 @@ mod server {
     }
 
     /// Post-process a raw final transcription: literal `wrong=correct` replacements
-    /// first, then (if enabled) fuzzy phonetic snapping onto known hotwords, and
-    /// finally the unconditional ß→ss normalization (Swiss orthography).
+    /// first, then acronym letter-name expansion (Em Er I → MRI — before the fuzzy
+    /// pass so letter-name tokens can't be snapped away), then (if enabled) fuzzy
+    /// phonetic snapping onto known hotwords, and finally the unconditional ß→ss
+    /// normalization (Swiss orthography).
     async fn finalize_text(state: &AppState, raw: &str) -> String {
         let corrected = state.words.read().await.apply(raw);
+        let expanded = {
+            let abbrev = state.abbrev.read().await;
+            if abbrev.is_empty() { corrected } else { abbrev.expand(&corrected) }
+        };
         let snapped = if state.settings.fuzzy_hotwords.load(Ordering::Relaxed) {
             let ratio = state.settings.fuzzy_max_ratio.load(Ordering::Relaxed);
-            state.fuzzy.read().await.correct(&corrected, ratio)
+            state.fuzzy.read().await.correct(&expanded, ratio)
         } else {
-            corrected
+            expanded
         };
         replace_eszett(&snapped)
     }
@@ -1172,10 +1243,19 @@ mod server {
             let mut guard = model.inner.lock().await;
             let inner = guard.as_mut().ok_or_else(|| // None while model is unloaded for LoRA training
                 anyhow::anyhow!("Server is training a new voice model — please try again in a few minutes"))?;
+            // Experimental german_prime flag: prime the prefill with German text
+            // tokens to bias the language prior. Read per-session so PATCH /config
+            // A/B toggling applies on the next connection.
+            let prime: &[u32] = if settings.german_prime.load(Ordering::Relaxed) {
+                &model.prime_ids
+            } else {
+                &[]
+            };
             StreamingState::new_sync(
                 &mut inner.enc,
                 &model.adapter,
                 &mut inner.dec,
+                prime,
                 &model.filters,
                 &model.device,
                 model.dtype,
@@ -1184,7 +1264,9 @@ mod server {
             // guard dropped here — lock released before any network I/O
         };
 
-        loop {
+        // `true` → flush remaining text as a final before returning;
+        // `false` → transport error, nothing more to send.
+        let flush = loop {
             match socket.recv().await {
                 Some(Ok(Message::Binary(data))) => {
                     // Decode raw f32 LE PCM (Phase 1; Opus planned for Phase 3)
@@ -1225,21 +1307,47 @@ mod server {
                         }
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => {
-                    // Flush remaining buffer as final
-                    let raw = stream_state.take_text_buf();
-                    if !raw.is_empty() {
-                        let corrected = finalize_text(state, &raw).await;
-                        let msg = json!({ "type": "final", "text": corrected }).to_string();
-                        let _ = socket.send(Message::Text(msg.into())).await;
-                    }
-                    break;
-                }
-                Some(Ok(_)) => {} // ping/pong/text — ignore
+                // Graceful stop (same protocol as schmidiscribe, shared frontend):
+                // flush remaining text as a final, then close — the client waits
+                // for onclose before finalizing, so the final is never lost the
+                // way it can be when the client just closes the socket.
+                Some(Ok(Message::Text(text))) if text.trim() == "stop" => break true,
+                // Fallback: client disconnected without sending "stop" — same flush,
+                // though the final may be lost if the client is already gone.
+                Some(Ok(Message::Close(_))) | None => break true,
+                Some(Ok(_)) => {} // ping/pong/other text — ignore
                 Some(Err(e)) => {
                     eprintln!("WebSocket error: {}", e);
-                    break;
+                    break false;
                 }
+            }
+        };
+
+        if flush {
+            // Drain the decoder lookahead before flushing: the client stops sending
+            // audio the moment the user presses stop, but the decoder lags the audio
+            // by `delay` tokens — without feeding silence to cover that window, the
+            // last words of the dictation would be truncated.
+            {
+                let mut guard = model.inner.lock().await;
+                if let Some(inner) = guard.as_mut() {
+                    if let Err(e) = stream_state.drain_sync(
+                        &mut inner.enc,
+                        &model.adapter,
+                        &mut inner.dec,
+                        &model.tok,
+                        &model.device,
+                    ) {
+                        eprintln!("End-of-session drain error: {}", e);
+                    }
+                }
+                // guard dropped here — lock released before the final send
+            }
+            let raw = stream_state.take_text_buf();
+            if !raw.is_empty() {
+                let corrected = finalize_text(state, &raw).await;
+                let msg = json!({ "type": "final", "text": corrected }).to_string();
+                let _ = socket.send(Message::Text(msg.into())).await;
             }
         }
 
@@ -1262,6 +1370,8 @@ mod server {
             .unwrap_or_else(|| state.paths.lora_output_dir.clone());
         Json(json!({
             "version":           env!("CARGO_PKG_VERSION"),
+            // Backend identity — lets the shared userscript adapt its UI per engine.
+            "server":            "voicetserver",
             // Runtime-adjustable — live values from atomics
             "delay":             s.delay_tokens.load(Ordering::Relaxed),
             "silence_threshold": s.silence_threshold.load(Ordering::Relaxed),
@@ -1270,6 +1380,7 @@ mod server {
             "rms_ema":           s.rms_ema_alpha.load(Ordering::Relaxed),
             "fuzzy_hotwords":    s.fuzzy_hotwords.load(Ordering::Relaxed),
             "fuzzy_max_ratio":   s.fuzzy_max_ratio.load(Ordering::Relaxed),
+            "german_prime":      s.german_prime.load(Ordering::Relaxed),
             // Startup-only — from snapshot; changing via PATCH writes config file but requires restart
             "model_dir":         snap.model_dir,
             "device":            snap.device,
@@ -1297,6 +1408,7 @@ mod server {
         rms_ema:           Option<f32>,
         fuzzy_hotwords:    Option<bool>,
         fuzzy_max_ratio:   Option<f32>,
+        german_prime:      Option<bool>,
         // Startup-only (written to file, restart required)
         model_dir:    Option<String>,
         device:       Option<usize>,
@@ -1349,6 +1461,7 @@ mod server {
         if let Some(v) = patch.rms_ema           { s.rms_ema_alpha.store(v, Ordering::SeqCst); }
         if let Some(v) = patch.fuzzy_hotwords    { s.fuzzy_hotwords.store(v, Ordering::SeqCst); }
         if let Some(v) = patch.fuzzy_max_ratio   { s.fuzzy_max_ratio.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.german_prime      { s.german_prime.store(v, Ordering::SeqCst); }
 
         // Update config file under lock and persist to disk
         {
@@ -1360,6 +1473,7 @@ mod server {
             if patch.rms_ema.is_some()           { cfg.rms_ema           = patch.rms_ema; }
             if patch.fuzzy_hotwords.is_some()    { cfg.fuzzy_hotwords    = patch.fuzzy_hotwords; }
             if patch.fuzzy_max_ratio.is_some()   { cfg.fuzzy_max_ratio   = patch.fuzzy_max_ratio; }
+            if patch.german_prime.is_some()      { cfg.german_prime      = patch.german_prime; }
             if patch.model_dir.is_some()         { cfg.model_dir         = patch.model_dir; }
             if patch.device.is_some()            { cfg.device            = patch.device; }
             if patch.port.is_some()              { cfg.port              = patch.port; }
@@ -1397,6 +1511,10 @@ mod server {
         State(state): State<Arc<AppState>>,
         Json(body): Json<WordsPatch>,
     ) -> Response {
+        // Hold the corrector write lock across the whole read-modify-write so two
+        // concurrent POST /words requests cannot lose each other's changes.
+        let mut words_guard = state.words.write().await;
+
         // Preserve comment lines (in their original order) and manage only the actual
         // entry lines as a sorted, deduplicated set — folding `# …` comments into the
         // set would scramble them alphabetically among the entries.
@@ -1425,11 +1543,13 @@ mod server {
         for w in &words    { new_content.push_str(w); new_content.push('\n'); }
         match tokio::fs::write(&state.words_path, new_content).await {
             Ok(_) => {
-                // Rebuild the in-memory corrector + fuzzy matcher from the updated file
+                // Rebuild the in-memory corrector + fuzzy matcher + acronym
+                // expander from the updated file
                 let new_corrector = WordsCorrector::load(&state.words_path);
                 let raw_lines = new_corrector.raw_lines.clone();
                 *state.fuzzy.write().await = FuzzyMatcher::from_corrector(&new_corrector);
-                *state.words.write().await = new_corrector;
+                *state.abbrev.write().await = AbbrevExpander::from_corrector(&new_corrector);
+                *words_guard = new_corrector;
                 Json(json!({ "words": raw_lines })).into_response()
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1467,7 +1587,9 @@ mod server {
         if let Ok(pairs_content) = tokio::fs::read_to_string(&pairs_path).await {
             for line in pairs_content.lines().filter(|l| !l.trim().is_empty()) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    let text = v["text"].as_str().unwrap_or("").to_string();
+                    // Trim so stray whitespace (in the file or the recorded pair text)
+                    // cannot break the sentence ↔ pair matching below.
+                    let text = v["text"].as_str().unwrap_or("").trim().to_string();
                     let id   = v["id"].as_str().unwrap_or("").to_string();
                     if !text.is_empty() && !id.is_empty() {
                         recorded.entry(text).or_default().push(id);
@@ -1478,7 +1600,8 @@ mod server {
 
         let sentences: Vec<serde_json::Value> = content
             .lines()
-            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(|s| {
                 let pair_ids = recorded.get(s).cloned().unwrap_or_default();
                 let is_recorded = !pair_ids.is_empty();
@@ -1531,20 +1654,7 @@ mod server {
         }
 
         // Rewrite pairs.jsonl without the deleted entry
-        if let Ok(content) = tokio::fs::read_to_string(&pairs_path).await {
-            let new_content: String = content
-                .lines()
-                .filter(|l| {
-                    if l.trim().is_empty() { return false; }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
-                        return v["id"].as_str() != Some(id.as_str());
-                    }
-                    true
-                })
-                .map(|l| format!("{l}\n"))
-                .collect();
-            let _ = tokio::fs::write(&pairs_path, new_content).await;
-        }
+        remove_jsonl_entry(pairs_path, &id).await;
 
         Json(json!({ "deleted": id })).into_response()
     }
@@ -1560,6 +1670,8 @@ mod server {
         Json(body): Json<DeleteSentenceRequest>,
     ) -> Response {
         let path = &state.paths.training_sentences;
+        // Serialise against concurrent sentence edits (read-modify-write on the file).
+        let _guard = state.pair_write_lock.lock().await;
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1603,6 +1715,8 @@ mod server {
             return (StatusCode::BAD_REQUEST, "Empty sentence").into_response();
         }
         let path = &state.paths.training_sentences;
+        // Serialise against concurrent sentence edits/deletes rewriting the file.
+        let _guard = state.pair_write_lock.lock().await;
         // Ensure file exists (may create default stub first)
         if !path.exists() {
             let _ = tokio::fs::write(&path, DEFAULT_TRAINING_SENTENCES).await;
@@ -1637,6 +1751,8 @@ mod server {
             return (StatusCode::BAD_REQUEST, "New text is empty").into_response();
         }
         let path = &state.paths.training_sentences;
+        // Serialise against concurrent sentence edits (read-modify-write on the file).
+        let _guard = state.pair_write_lock.lock().await;
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1673,9 +1789,10 @@ mod server {
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .collect();
-        // Sort by id for stable display order
-        pairs.sort_by(|a, b| {
-            a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+        // Sort numerically by id for stable display order (string compare would put
+        // a 5-digit "10000" before the zero-padded 4-digit "9999").
+        pairs.sort_by_key(|p| {
+            p["id"].as_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(usize::MAX)
         });
         Json(json!({ "pairs": pairs })).into_response()
     }
@@ -1683,6 +1800,41 @@ mod server {
     #[derive(serde::Deserialize)]
     struct TrainingPairQuery {
         text: String,
+    }
+
+    /// Append one JSONL entry `{"id","text","duration_s"}` to `jsonl_path`.
+    async fn append_pair_entry(
+        jsonl_path: &std::path::Path,
+        id: &str,
+        text: &str,
+        duration_s: f32,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let entry = format!("{{\"id\":\"{id}\",\"text\":{},\"duration_s\":{:.3}}}\n",
+            serde_json::to_string(text).unwrap_or_default(), duration_s);
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true).append(true).open(jsonl_path).await?;
+        f.write_all(entry.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Save a PCM+text pair: WAV to `audio_dir/{id}.wav`, JSONL line appended to
+    /// `jsonl_path`. The ID is one past the highest existing ID (never reused after
+    /// a delete). Caller must hold `pair_write_lock`.
+    /// Returns `(id, duration_s, count_after)`.
+    async fn save_pcm_pair(
+        audio_dir: &std::path::Path,
+        jsonl_path: &std::path::Path,
+        text: &str,
+        pcm: &[f32],
+    ) -> anyhow::Result<(String, f32, usize)> {
+        tokio::fs::create_dir_all(audio_dir).await?;
+        let (count, next_id) = pairs_stats(jsonl_path).await;
+        let id = format!("{:04}", next_id);
+        let duration_s = pcm.len() as f32 / 16000.0;
+        save_training_wav(&audio_dir.join(format!("{id}.wav")), pcm)?;
+        append_pair_entry(jsonl_path, &id, text, duration_s).await?;
+        Ok((id, duration_s, count + 1))
     }
 
     /// POST /training/pair?text=... — body is raw f32 LE PCM at 16kHz
@@ -1696,53 +1848,19 @@ mod server {
             return (StatusCode::BAD_REQUEST, "Empty audio body").into_response();
         }
 
-        let audio_dir = &state.paths.training_audio_dir;
-        if let Err(e) = tokio::fs::create_dir_all(audio_dir).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create training dir: {e}")).into_response();
-        }
-
-        let pairs_path = &state.paths.training_pairs;
-
         // Hold the write lock for the entire ID-assignment + file-write sequence so
         // concurrent uploads don't collide on the same ID, and deletions don't rewrite
         // the JSONL while we're appending to it.
         let _guard = state.pair_write_lock.lock().await;
 
-        // Derive the next ID from the highest existing ID (not the count) so that
-        // deleting a pair never causes a later upload to reuse — and overwrite — an
-        // existing ID.
-        let (count, next_id) = pairs_stats(&pairs_path).await;
-        let id = format!("{:04}", next_id);
-        let wav_path = audio_dir.join(format!("{id}.wav"));
-        let duration_s = pcm.len() as f32 / 16000.0;
-
-        // Save WAV (16kHz mono i16)
-        if let Err(e) = save_training_wav(&wav_path, &pcm) {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                format!("WAV write error: {e}")).into_response();
-        }
-
-        // Append JSONL entry
-        let entry = format!("{{\"id\":\"{id}\",\"text\":{},\"duration_s\":{:.3}}}\n",
-            serde_json::to_string(&params.text).unwrap_or_default(),
-            duration_s);
+        match save_pcm_pair(&state.paths.training_audio_dir, &state.paths.training_pairs,
+                            &params.text, &pcm).await
         {
-            use tokio::io::AsyncWriteExt;
-            let mut f = match tokio::fs::OpenOptions::new()
-                .create(true).append(true).open(&pairs_path).await
-            {
-                Ok(f) => f,
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("JSONL open error: {e}")).into_response(),
-            };
-            if let Err(e) = f.write_all(entry.as_bytes()).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("JSONL write error: {e}")).into_response();
-            }
+            Ok((id, duration_s, count)) =>
+                Json(json!({ "id": id, "duration_s": duration_s, "count": count })).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Pair save error: {e}")).into_response(),
         }
-
-        Json(json!({ "id": id, "duration_s": duration_s, "count": count + 1 })).into_response()
     }
 
     /// GET /training — summary of collected pairs
@@ -1915,7 +2033,14 @@ mod server {
             }
         }
 
-        *state.lora_path.write().await = Some(path.clone());
+        // Record the path only when an adapter was actually applied. Storing it on
+        // the "cleared" outcome (no adapter files at the path) would make GET /config
+        // report lora_active=true and re-apply a nonexistent adapter after training.
+        *state.lora_path.write().await = if lora_opt.is_some() {
+            Some(path.clone())
+        } else {
+            None
+        };
         eprintln!("LoRA hot-reload {}: {}", action, path.display());
         (StatusCode::OK, Json(json!({
             "status": "ok",
@@ -1971,6 +2096,269 @@ mod server {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         Json(json!({ "status": "ok" })).into_response()
+    }
+
+    // ---- GET /edits/report ----
+
+    /// Aggregate edit_log.jsonl (original→edited pairs from commit-mode edits) into
+    /// the most frequent word-level corrections — direct candidates for
+    /// custom_words `wrong=correct` entries.
+    async fn edit_report_handler(State(state): State<Arc<AppState>>) -> Response {
+        let content = tokio::fs::read_to_string(&state.paths.edit_log).await.unwrap_or_default();
+        let mut counts: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        let mut entries = 0usize;
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let (Some(orig), Some(edit)) = (v["original"].as_str(), v["edited"].as_str()) else {
+                continue;
+            };
+            entries += 1;
+            for (o, e) in word_diffs(orig, edit) {
+                *counts.entry((o, e)).or_insert(0) += 1;
+            }
+        }
+        let mut list: Vec<_> = counts.into_iter().collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let suggestions: Vec<serde_json::Value> = list.into_iter().take(30)
+            .map(|((o, e), c)| json!({ "original": o, "edited": e, "count": c }))
+            .collect();
+        Json(json!({ "entries": entries, "suggestions": suggestions })).into_response()
+    }
+
+    /// Word-level diff of one edit-log entry: LCS over whitespace tokens; changed
+    /// regions become (removed run → inserted run) pairs. Pure insertions/deletions
+    /// and punctuation-only changes are skipped — they make no wrong=correct pair.
+    fn word_diffs(orig: &str, edit: &str) -> Vec<(String, String)> {
+        /// Longer replaced runs are rewrites, not word corrections.
+        const MAX_RUN_WORDS: usize = 4;
+
+        let a: Vec<&str> = orig.split_whitespace().collect();
+        let b: Vec<&str> = edit.split_whitespace().collect();
+        // The DP table is O(n·m); skip pathological entries rather than stall.
+        if a.is_empty() || b.is_empty() || a.len() * b.len() > 250_000 {
+            return Vec::new();
+        }
+
+        let (n, m) = (a.len(), b.len());
+        let mut dp = vec![vec![0u32; m + 1]; n + 1];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                dp[i][j] = if a[i] == b[j] {
+                    dp[i + 1][j + 1] + 1
+                } else {
+                    dp[i + 1][j].max(dp[i][j + 1])
+                };
+            }
+        }
+
+        fn flush(removed: &mut Vec<&str>, inserted: &mut Vec<&str>,
+                 out: &mut Vec<(String, String)>, max_run: usize) {
+            if !removed.is_empty() && !inserted.is_empty()
+                && removed.len() <= max_run && inserted.len() <= max_run
+            {
+                let o = trim_punct(&removed.join(" "));
+                let e = trim_punct(&inserted.join(" "));
+                if !o.is_empty() && !e.is_empty() && o != e {
+                    out.push((o, e));
+                }
+            }
+            removed.clear();
+            inserted.clear();
+        }
+
+        let mut out = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        let mut removed: Vec<&str> = Vec::new();
+        let mut inserted: Vec<&str> = Vec::new();
+        while i < n && j < m {
+            if a[i] == b[j] {
+                flush(&mut removed, &mut inserted, &mut out, MAX_RUN_WORDS);
+                i += 1;
+                j += 1;
+            } else if dp[i + 1][j] >= dp[i][j + 1] {
+                removed.push(a[i]);
+                i += 1;
+            } else {
+                inserted.push(b[j]);
+                j += 1;
+            }
+        }
+        removed.extend_from_slice(&a[i..]);
+        inserted.extend_from_slice(&b[j..]);
+        flush(&mut removed, &mut inserted, &mut out, MAX_RUN_WORDS);
+        out
+    }
+
+    /// Strip leading/trailing punctuation from a phrase (inner punctuation stays).
+    fn trim_punct(s: &str) -> String {
+        s.trim_matches(|c: char| !c.is_alphanumeric()).to_string()
+    }
+
+    // ---- Dictation review (real dictations as training-pair candidates) ----
+    //
+    // Read-aloud calibration sentences train the LoRA on a different speaking
+    // style than free dictation. These endpoints let the client save a finished
+    // real dictation (audio + model transcript) as a *candidate*; the user later
+    // reviews it (play, re-transcribe, correct the text) and either accepts it
+    // into pairs.jsonl or discards it. Candidates live in training/review/ +
+    // review.jsonl and are invisible to the trainer until accepted.
+
+    /// POST /training/review?text=... — body raw f32 LE PCM 16kHz, `text` = model
+    /// transcript at save time.
+    async fn review_add_handler(
+        State(state): State<Arc<AppState>>,
+        Query(params): Query<TrainingPairQuery>,
+        body: Bytes,
+    ) -> Response {
+        let pcm = crate::audio::decode_audio_bytes(&body);
+        if pcm.is_empty() {
+            return (StatusCode::BAD_REQUEST, "Empty audio body").into_response();
+        }
+        let _guard = state.pair_write_lock.lock().await;
+        match save_pcm_pair(&state.paths.review_dir, &state.paths.review_jsonl,
+                            &params.text, &pcm).await
+        {
+            Ok((id, duration_s, count)) =>
+                Json(json!({ "id": id, "duration_s": duration_s, "count": count })).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Review save error: {e}")).into_response(),
+        }
+    }
+
+    /// GET /training/reviews — list all dictation candidates awaiting review
+    async fn review_list_handler(State(state): State<Arc<AppState>>) -> Response {
+        let content = tokio::fs::read_to_string(&state.paths.review_jsonl).await.unwrap_or_default();
+        let mut items: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect();
+        items.sort_by_key(|p| {
+            p["id"].as_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(usize::MAX)
+        });
+        Json(json!({ "reviews": items })).into_response()
+    }
+
+    /// GET /training/review/audio/{id} — serve a candidate WAV for playback /
+    /// client-side re-transcription
+    async fn review_audio_handler(
+        State(state): State<Arc<AppState>>,
+        axum::extract::Path(id): axum::extract::Path<String>,
+    ) -> Response {
+        if !id.chars().all(|c| c.is_ascii_digit()) {
+            return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
+        }
+        let wav_path = state.paths.review_dir.join(format!("{id}.wav"));
+        match tokio::fs::read(&wav_path).await {
+            Ok(bytes) => (
+                [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+                bytes,
+            ).into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    /// DELETE /training/review/{id} — discard a candidate (WAV + JSONL entry)
+    async fn review_delete_handler(
+        State(state): State<Arc<AppState>>,
+        axum::extract::Path(id): axum::extract::Path<String>,
+    ) -> Response {
+        if !id.chars().all(|c| c.is_ascii_digit()) {
+            return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
+        }
+        let wav_path = state.paths.review_dir.join(format!("{id}.wav"));
+        if !wav_path.exists() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let _guard = state.pair_write_lock.lock().await;
+        if let Err(e) = tokio::fs::remove_file(&wav_path).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to remove WAV: {e}")).into_response();
+        }
+        remove_jsonl_entry(&state.paths.review_jsonl, &id).await;
+        Json(json!({ "deleted": id })).into_response()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ReviewAcceptRequest {
+        text: String,
+    }
+
+    /// POST /training/review/{id}/accept — body `{"text":"…"}` (the corrected
+    /// transcript). Moves the WAV into training/audio/ under a fresh pair ID,
+    /// appends to pairs.jsonl, and removes the candidate from review.
+    async fn review_accept_handler(
+        State(state): State<Arc<AppState>>,
+        axum::extract::Path(id): axum::extract::Path<String>,
+        Json(body): Json<ReviewAcceptRequest>,
+    ) -> Response {
+        if !id.chars().all(|c| c.is_ascii_digit()) {
+            return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
+        }
+        let text = body.text.trim().to_string();
+        if text.is_empty() {
+            return (StatusCode::BAD_REQUEST, "Empty text").into_response();
+        }
+        let src_wav = state.paths.review_dir.join(format!("{id}.wav"));
+        if !src_wav.exists() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+
+        let _guard = state.pair_write_lock.lock().await;
+
+        // Duration from the review entry; fallback: recompute from the WAV size
+        // (16-bit mono 16 kHz, 44-byte header).
+        let review_content =
+            tokio::fs::read_to_string(&state.paths.review_jsonl).await.unwrap_or_default();
+        let duration_s = match review_content.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["id"].as_str() == Some(id.as_str()))
+            .and_then(|v| v["duration_s"].as_f64())
+        {
+            Some(d) => d as f32,
+            None => {
+                let len = tokio::fs::metadata(&src_wav).await.map(|m| m.len()).unwrap_or(0);
+                (len.saturating_sub(44) as f32 / 2.0) / 16000.0
+            }
+        };
+
+        if let Err(e) = tokio::fs::create_dir_all(&state.paths.training_audio_dir).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create training dir: {e}")).into_response();
+        }
+        let (_, next_id) = pairs_stats(&state.paths.training_pairs).await;
+        let new_id = format!("{:04}", next_id);
+        let dst_wav = state.paths.training_audio_dir.join(format!("{new_id}.wav"));
+        if let Err(e) = tokio::fs::rename(&src_wav, &dst_wav).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to move WAV: {e}")).into_response();
+        }
+        if let Err(e) = append_pair_entry(&state.paths.training_pairs, &new_id, &text, duration_s).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Pair append error: {e}")).into_response();
+        }
+        remove_jsonl_entry(&state.paths.review_jsonl, &id).await;
+        Json(json!({ "id": new_id, "duration_s": duration_s })).into_response()
+    }
+
+    /// Rewrite a `{"id":…}` JSONL file without the entry matching `id`.
+    /// Caller must hold `pair_write_lock`.
+    async fn remove_jsonl_entry(jsonl_path: &std::path::Path, id: &str) {
+        if let Ok(content) = tokio::fs::read_to_string(jsonl_path).await {
+            let new_content: String = content
+                .lines()
+                .filter(|l| {
+                    if l.trim().is_empty() { return false; }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        return v["id"].as_str() != Some(id);
+                    }
+                    true
+                })
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let _ = tokio::fs::write(jsonl_path, new_content).await;
+        }
     }
 
     // ---- Training helpers ----

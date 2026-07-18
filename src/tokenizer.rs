@@ -74,6 +74,35 @@ impl Tokenizer {
         }
     }
 
+    /// Encode text via greedy longest-match against the BPE vocab.
+    ///
+    /// Not true BPE (no merge ranks), but every returned ID is a valid vocab token
+    /// and the decoded concatenation equals the input text. Sufficient for prefill
+    /// priming, where the tokens only need to *read* as the intended text — the
+    /// exact segmentation the trained model would produce is not required.
+    pub fn encode_greedy(&self, text: &str) -> Vec<u32> {
+        use std::collections::HashMap;
+        let map: HashMap<&[u8], u32> = self.vocab.iter().enumerate()
+            .map(|(rank, bytes)| (bytes.as_slice(), rank as u32 + NUM_SPECIAL))
+            .collect();
+        let max_len = self.vocab.iter().map(|b| b.len()).max().unwrap_or(1);
+        let bytes = text.as_bytes();
+        let mut ids = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let end = (i + max_len).min(bytes.len());
+            let matched = (i + 1..=end).rev()
+                .find_map(|j| map.get(&bytes[i..j]).map(|&id| (id, j)));
+            match matched {
+                Some((id, j)) => { ids.push(id); i = j; }
+                // Byte not in vocab — skip it (cannot happen for a byte-level BPE
+                // vocab that covers all single bytes, but avoids an infinite loop).
+                None => { i += 1; }
+            }
+        }
+        ids
+    }
+
     /// Decode a sequence of token IDs to a string.
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();

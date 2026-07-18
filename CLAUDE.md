@@ -134,6 +134,23 @@ Download from HuggingFace: `mistralai/Voxtral-Mini-4B-Realtime-2602`
 
 Voxtral Mini 4B Realtime has **no language token mechanism**. It auto-detects language from the audio signal. There is no way to force a specific language — the model will transcribe in whatever language it hears. Confirmed by inspecting `tekken.json` (no `added_tokens`) and the reference C implementation (antirez/voxtral.c).
 
+### Experimental German prefill priming (`german_prime`)
+
+Since the language cannot be forced, an experimental hack biases the LM prior instead: when
+`german_prime = true` (config flag, default false; runtime-adjustable via `PATCH /config` and
+the userscript Einstellungen tab, applies on the next session), the decoder prefill carries a
+short German sentence (`GERMAN_PRIME_TEXT` in `src/streaming.rs`) right after BOS instead of
+pure `STREAMING_PAD` tokens — as if the model had already transcribed German text during the
+leading silence. Capped to the `LEFT_PAD_TOKENS` (32) silence region.
+
+- Token IDs are produced by `Tokenizer::encode_greedy()` (greedy longest-match over the tekken
+  vocab — not true BPE, but valid tokens whose decode equals the text; sufficient for priming).
+  Encoded once at model load into `VoxtralModel.prime_ids`.
+- Plumbing: `StreamingState::new_sync(prime_tokens)` → `run_startup()` → `TextDecoder::prepare_prefill()`.
+- Offline WAV mode respects the flag too, so A/B runs on the same WAV are possible.
+- Off by default — A/B test before trusting it; risk: the model repeating/continuing the prime
+  text at session start.
+
 Known special token IDs (all others in 0–999 are skipped as audio control tokens):
 - `BOS = 1`, `EOS = 2`
 - `AUDIO = 24`, `BEGIN_AUDIO = 25` — audio frame boundary markers
@@ -146,7 +163,7 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 - `src/streaming.rs` — `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
 - `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
-- `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`; `FuzzyMatcher`: Kölner-Phonetik + Levenshtein fuzzy snapping of transcribed words onto known plain-term hotwords
+- `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`; `FuzzyMatcher`: Kölner-Phonetik + Levenshtein fuzzy snapping of transcribed words onto known plain-term hotwords; `AbbrevExpander`: German letter-name runs → acronym targets (Em Er I → MRI)
 - `src/settings.rs` — `SharedSettings` (atomic runtime params) + `StartupSnapshot`
 - `src/encoder.rs` / `src/decoder.rs` — Voxtral model; flash-attn behind `#[cfg(feature = "cuda")]`
 - `src/session.rs` — Phase 2 stub (patient session vocabulary)
@@ -188,7 +205,7 @@ CLI args override config file values. Unknown fields in the config file are sile
 Printed prominently at startup when newly generated. Copy into the userscript Einstellungen tab.
 Not a CLI flag — set only via config file.
 
-Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`, `fuzzy_hotwords`, `fuzzy_max_ratio`.
+Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`, `fuzzy_hotwords`, `fuzzy_max_ratio`, `german_prime`.
 
 Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `data_dir`, `log_file`, `log_keep_days`.
 
@@ -223,7 +240,7 @@ polls `/proc/<pid>` for up to 5 s, deletes PID file.
 
 - Default: `~/.config/voicetserver/logs/voicetserver.log`
 - Override: `--log-file <path>` or `log_file = "..."` in config.toml
-- Rotation: background tokio task checks size every 5 min; rotates at 20 MB → `voicetserver.log.<unix_ts>`
+- Rotation: background tokio task checks size every 5 min; rotates at 20 MB → `voicetserver.log.<unix_ts>`. Rotate-by-**rename** (atomic, no lost lines), then — only if fd 1 currently points at the log inode (detached / after 'd'; never in interactive terminal mode) — the path is reopened and `dup2`'d over stdout/stderr in-process (`rotate_log_if_needed` / `stdout_is_file`). The earlier copy+truncate scheme dropped lines written between the two steps.
 - Pruning: rotated files older than `log_keep_days` days (default 7) are deleted on rotation; age is taken from the Unix timestamp in the filename (`voicetserver.log.<ts>`), not filesystem mtime (unreliable after copies/restores)
 
 # Custom words
@@ -261,34 +278,34 @@ The model often transcribes unfamiliar proper names / medical terms with a sligh
 - Applied at both final sites (silence flush, Close) **after** the literal `WordsCorrector::apply()`
   pass — see `finalize_text()` in `src/main.rs`.
 
-Pipeline: literal `wrong=correct` replacements → fuzzy phonetic snap.
+Pipeline: literal `wrong=correct` replacements → abbreviation letter-name expansion → fuzzy
+phonetic snap (abbrev runs before fuzzy so letter-name tokens can't be snapped away first).
 
 Runtime-adjustable via `PATCH /config`: `fuzzy_hotwords` (bool, default true),
 `fuzzy_max_ratio` (f32 ∈ [0,1], default 0.34 — lower = stricter). No CLI flags; config + runtime only.
 
-## Abbreviation / acronym matching (Exploration Notes — NOT implemented)
+## Abbreviation / acronym expansion (letter-name pass)
 
-Spelled-out abbreviations (MRI, PSA, EKG, TUR-B) are **not** handled by either mechanism above.
-Two structural reasons, both worth understanding before revisiting:
+Spelled-out abbreviations are structurally unreachable for the fuzzy matcher: `TUR-B` is excluded
+as a fuzzy target (hyphen), and a dictated acronym comes out as German **letter names** — "M-R-I"
+→ `Em Er I` / `EM-ER-I` — separate tokens the word-by-word scanner never joins. The
+`AbbrevExpander` (`src/words.rs`) handles them:
 
-1. **Hyphen/digit exclusion.** `is_single_word()` requires all chars alphabetic, so `TUR-B` is
-   dropped as a fuzzy target; and `FuzzyMatcher::correct()` splits the transcript on non-alphabetic
-   chars, so `TUR-B` in the text is never seen as one unit.
-2. **Letter-name ≠ acronym phonetics.** When dictated, an acronym comes out as German **letter
-   names**: "M-R-I" → the model writes `Em Er I` / `EM-ER-I` / `Emery`. Kölner Phonetik of the
-   spelled-out form keeps a leading vowel the acronym lacks — `MRI`→`67` vs `EMERI`→`067` — so the
-   phonetic-code gate rejects it; and the letter names are *separate tokens* the word-by-word
-   scanner never joins. Fuzzy phonetics maps sound-alike spellings of *one word*, not letter
-   sequences → acronym. It structurally cannot catch these.
-
-**Proposed approach (deferred):** a separate abbreviation pass with a German letter-name table
-(`em→M, er→R, es→S, pe→P, te→T, ka→K, …`). Scan finals for **runs of adjacent tokens that are all
-recognized letter names** (`Em Er I` → all three qualify), join their letters → candidate acronym
-(`MRI`), and if it matches a known abbreviation target, replace the whole run with the canonical
-spelling (`MRI`, `TUR-B`). Gating on "every token is an actual letter name" keeps false positives
-low. The single-word rendering case (`Emery`) would need a phonetic fallback that strips
-leading-zero codes. Open design question: how to designate which custom terms are abbreviations
-(auto-detect all-uppercase 2–6 letters vs. an explicit prefix marker vs. explicit expansion pairs).
+- **Targets** are auto-detected from the plain (non-`=`) custom_words.txt terms: only
+  letters/digits/hyphens with **2–6 letters, all uppercase** (`MRI`, `PSA`, `EKG`, `TUR-B`).
+  Matching key = letters only (`TUR-B` → `TURB`). Rebuilt on `POST /words`, like the fuzzy matcher.
+- **Scan**: finals are scanned for runs of **≥2 adjacent tokens that are ALL recognized German
+  letter names** (`em→M, er→R, es→S, pe→P, te→T, ka→K, …`; a single alphabetic char stands for
+  itself, so `E Ka Ge` works too). Adjacent = separated only by spaces/hyphens/periods.
+- **Replace**: the run's letters are joined; if they match a target key the whole run is replaced
+  by the canonical spelling. Longest run first, shrinking from the right on no match
+  (`Em Er I u` still finds `MRI`).
+- Requiring every token to be a letter name AND a full-key match keeps false positives low even
+  though `er`/`es` are common German words (they only fire inside a matching run).
+- The single-word rendering case (`Emery` for MRI) is **not** handled — it would need a phonetic
+  fallback that strips leading-zero Kölner codes; deferred.
+- Applied in `finalize_text()` between the literal and fuzzy passes. Always on; no-op when no
+  acronym-shaped terms exist.
 
 # HTTP API
 
@@ -302,10 +319,13 @@ Auth is enforced by the `api_key_auth` middleware (constant-time compare via `ct
 a `route_layer` to the protected sub-router; `/health` is registered outside it. Not a CLI flag —
 set only via config file.
 
-Request bodies are capped at **20 MB** via axum `DefaultBodyLimit`.
+Request bodies are capped at **64 MB** via axum `DefaultBodyLimit` (review uploads are whole
+dictations as f32 PCM: 64 KB/s → ~16 min head-room).
 
 - `GET /health` — `{"status":"ready","connections":N}` — **public, no auth required**
-- `GET /config` — current settings (runtime + startup snapshot); includes `data_dir`. Also reports
+- `GET /config` — current settings (runtime + startup snapshot); includes `data_dir` and
+  `"server":"voicetserver"` (backend identity — the shared userscript uses it and per-field
+  presence to adapt its UI; schmidiscribe reports `"server":"schmidiscribe"`). Also reports
   `lora_active` (bool — is a LoRA currently applied in-memory) and `lora_dir` (the path the
   userscript "LoRA verwenden" toggle re-applies on enable: active path if loaded, else configured
   `lora_adapter`, else the default training output dir — so the toggle still works after `DELETE /lora`)
@@ -314,7 +334,15 @@ Request bodies are capped at **20 MB** via axum `DefaultBodyLimit`.
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
 - `POST /lora/reload` — hot-reload LoRA adapter without restart; optional JSON body `{"path":"..."}` to specify dir (omit to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
 - `DELETE /lora` — unload the active LoRA adapter in-memory (revert to base model) without restart; adapter files on disk are left untouched; clears `lora_path` so nothing is re-applied on the next training reload
-- `ws[s]://host:port/asr` — WebSocket audio stream (raw f32 LE PCM 16kHz mono)
+- `ws[s]://host:port/asr` — WebSocket audio stream (raw f32 LE PCM 16kHz mono). **Stop
+  protocol** (same as schmidiscribe, shared frontend): client sends text frame `"stop"` →
+  server **drains the decoder lookahead** (feeds `delay + 3` ticks of silence via
+  `StreamingState::drain_sync` — the decoder lags the audio by `delay` tokens, so without this
+  the last ~delay×80ms of speech would be truncated), then flushes the remaining text buffer as
+  a `{"type":"final"}` and closes; client waits for `ws.onclose` (2 s fallback) before
+  finalizing. Fallback: a plain client close triggers the same drain + flush, but the final may
+  be lost if the client is already gone. Unknown query params (`hotwords`, `patient` —
+  schmidiscribe biasing) are ignored.
 
 ### Training (Phase 2 — LoRA voice calibration)
 
@@ -335,6 +363,23 @@ Request bodies are capped at **20 MB** via axum `DefaultBodyLimit`.
 **LoRA:**
 - `POST /training/run` — unloads the model from VRAM (frees ~8 GB for the trainer), then spawns `tools/train_lora.py`; 202 if started, 409 if already running. Model is reloaded automatically when training finishes. ASR requests error with "Server is training…" until reload.
 - `GET /training/status` — `{"status":"idle"|"running"|"done"|"error","log":[...]}`
+
+**Dictation review (real dictations as training-pair candidates):** read-aloud calibration
+sentences train the LoRA on a different speaking style than free dictation. The client can save
+a finished real dictation (audio + model transcript) as a *candidate*; the user later plays it,
+optionally re-transcribes it, corrects the text, and accepts it into the training set — or
+discards it. Candidates live in `training/review/*.wav` + `training/review.jsonl` and are
+invisible to the trainer until accepted.
+
+- `POST /training/review?text=<url-encoded>` — body raw f32 LE PCM 16kHz; `text` = model transcript at save time; same ID scheme + `pair_write_lock` as pairs
+- `GET /training/reviews` — `{"reviews":[{"id","text","duration_s"}]}` sorted by id
+- `GET /training/review/audio/{id}` — serve candidate WAV (playback / client-side re-transcription)
+- `POST /training/review/{id}/accept` — `{"text":"…"}` (corrected transcript) — moves the WAV into `training/audio/` under a fresh pair ID, appends to `pairs.jsonl`, removes the candidate
+- `DELETE /training/review/{id}` — discard candidate (WAV + JSONL entry)
+
+**Edit-log mining:**
+- `POST /log/edit` — `{"original","edited","timestamp"}` — appended to `edit_log.jsonl` by the userscript when a commit-mode dictation is edited before insertion
+- `GET /edits/report` — `{"entries":N,"suggestions":[{"original","edited","count"},…]}` — aggregates the edit log into the most frequent word-level corrections (LCS word diff per entry, changed runs ≤4 words paired as removed→inserted, punctuation-only changes skipped, top 30 by count). Direct candidates for custom_words `wrong=correct` entries; surfaced by the userscript's "💡 Vorschläge aus Korrekturen" button in the Eigene Wörter tab.
 
 Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl`.
 LoRA adapter output: `~/.config/voicetserver/lora_adapter/` (set `lora_adapter` in config to load at startup).
@@ -370,16 +415,55 @@ Scale = `lora_alpha / r` from `adapter_config.json`.
 Sends raw 16kHz mono f32 LE PCM over WebSocket binary frames.
 Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}` / `{"type":"error","text":"..."}`.
 
-Server URL, API key, and hotkey stored via `GM_setValue` (`server_url`, `api_key`, `hotkey`).
-All HTTP requests go through `authFetch()`, which injects `X-Api-Key: <stored key>` on every call;
-the WebSocket URL gets `?api_key=<key>` appended (browsers cannot send headers on the WS upgrade).
+**Unified dual-backend frontend** (v0.1.14+): this one userscript drives both **voicetserver**
+(Voxtral, port 8765) and **schmidiscribe** (Qwen3-ASR, port 8767) and replaces schmidiscribe's
+`schmididict.user.js` (disable that one to avoid duplicate mic buttons). A "Server:
+[Voxtral][Qwen3]" switcher sits above the tab bar and switches instantly (no save needed;
+blocked while recording). Server URL + API key are stored **per backend**
+(`server_url_voxtral`/`server_url_qwen`, `api_key_voxtral`/`api_key_qwen`, `active_backend`);
+legacy single-key `server_url`/`api_key` values act as the Voxtral profile's fallback. Hotkey +
+commit mode stay global. The Einstellungen tab adapts to whatever `GET /config` reports:
+`delay` + `german_prime` rows appear only for voicetserver, `context_biasing` only for
+schmidiscribe (saving sends only fields the connected backend reported).
+
+WebSocket sessions send `?api_key=` plus `?hotwords=` (Hotwords tab, GM-stored) and
+`?patient=` (read from `#schmidi-pat-info-patientendaten` if the host page has it) — used by
+schmidiscribe's prompt biasing, ignored by voicetserver. Stopping sends the text frame `"stop"`
+and waits for the server's final flush + close (2 s fallback) — both servers implement the same
+protocol. All audio paths (ASR, Aufnehmen, 2. Durchgang) route the ScriptProcessor through a
+zero-gain GainNode instead of connecting to `destination` directly — a direct connection plays
+the mic through the speakers and browser AEC then cancels the speech it hears back.
+
+All HTTP requests go through `authFetch()`, which injects `X-Api-Key: <stored key>` on every call
+(browsers cannot send headers on the WS upgrade, hence the query param there).
 Training-audio playback uses `authFetch` + `URL.createObjectURL(blob)` (not `new Audio(url)`) so the
 key is sent. The API key is entered in the Einstellungen tab.
-Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Client tab).
+Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Einstellungen tab).
 Text is inserted live at cursor on each `final`; trailing partial inserted on stop.
 Falls back to clipboard if no editable element was captured.
 
-Right-click → four tabs: **Client** (URL, hotkey), **Server** (runtime params, custom words), **Aufnehmen** (record calibration sentences), **Paare** (review pairs, delete, launch LoRA).
+Right-click → seven tabs: **Eigene Wörter** (server-side custom words + "💡 Vorschläge aus
+Korrekturen" from `GET /edits/report`), **Hotwords** (client-side GM-stored list sent per session
+via `?hotwords=`; biasing only on Qwen3), **Aufnehmen** (record calibration sentences),
+**2. Durchgang** (record once-recorded sentences — `pair_ids.length === 1` — a second time),
+**Training** (review pairs, delete, LoRA), **Diktate** (real-dictation review, below),
+**Einstellungen** (backend profile URL/key, hotkey, runtime params).
+
+**Audio capture (all paths — ASR, Aufnehmen, 2. Durchgang):** `createCaptureContext()` requests
+an `AudioContext({ sampleRate: 16000 })` so the **browser** resamples the mic stream with proper
+low-pass filtering. The old path decimated the native 48 kHz stream (every 3rd sample), folding
+high frequencies into the speech band as aliasing noise. Naive decimation survives only as a
+fallback (`captureChunk()`) for browsers that refuse a fixed-rate context.
+
+**Diktate tab (real dictations → training pairs):** every dictation's 16 kHz PCM is kept
+client-side (`dictationPcmBuffers` → `lastDictation` snapshot on stop, together with the
+transcript — the edited overlay text in commit mode). Saving (overlay 💾 button in commit mode,
+or "💾 Letztes Diktat speichern" in the tab) POSTs it to `/training/review`. The tab lists all
+candidates with ▶ playback and ✕ delete; selecting one opens a detail area with an editable
+transcript, "↻ Voxtral" / "↻ Qwen3" re-transcription (fetches the stored WAV, parses PCM16
+client-side, replays it through the chosen backend's normal WS session — `transcribePcm()`,
+works because both servers speak the same protocol), and "✓ Als Trainingspaar übernehmen" →
+`POST /training/review/{id}/accept` with the corrected text.
 
 **Aufnehmen tab:** shows only unrecorded sentences (recorded ones are hidden). Navigate ◀/▶, edit/add/remove sentences inline, record via ScriptProcessor (raw f32 LE PCM, same as ASR path), preview recording client-side before saving (Web Audio API, no server round-trip), save to commit pair.
 
@@ -461,3 +545,11 @@ Train a single LoRA on both speakers' audio combined. Both have the same vocabul
 - `src/main.rs` — `AppState.paths` → per-user lookup; training/words handlers accept `?user=` query param
 - `src/streaming.rs` — `StreamingState` carries per-session `WordsCorrector` + optional LoRA delta
 - `src/decoder.rs` — separate LoRA application from `set_lora()` (currently mutates global decoder) into per-call delta in `forward()`
+
+## Commit workflow
+
+Single `main` branch — no `testing` branch; "ok stable" does not apply here.
+
+1. After the code change is complete, bump the patch version in `Cargo.toml` (+0.0.1) **before** compiling.
+2. Run `cargo build --release` so the user can test.
+3. On commit ("ok go"): commit and push to `main` (version already bumped — do not bump again).

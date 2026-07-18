@@ -48,6 +48,9 @@ pub struct SharedSettings {
     pub fuzzy_hotwords: AtomicBool,
     /// Max normalized Levenshtein distance accepted as a fuzzy match (lower = stricter).
     pub fuzzy_max_ratio: AtomicF32,
+    /// Experimental: prime the decoder prefill with German text tokens instead of
+    /// pure PADs to bias the language prior (default off). Applies on next session.
+    pub german_prime: AtomicBool,
     /// Server state: STATE_READY / STATE_LOADING (no hotkey toggle in server mode).
     pub state: AtomicU8,
 }
@@ -66,6 +69,7 @@ impl SharedSettings {
             delay_tokens: AtomicUsize::new(vals.delay),
             fuzzy_hotwords: AtomicBool::new(vals.fuzzy_hotwords),
             fuzzy_max_ratio: AtomicF32::new(vals.fuzzy_max_ratio),
+            german_prime: AtomicBool::new(vals.german_prime),
             state: AtomicU8::new(STATE_LOADING),
         }
     }
@@ -81,12 +85,13 @@ pub struct IniValues {
     pub rms_ema_alpha: f32,
     pub fuzzy_hotwords: bool,
     pub fuzzy_max_ratio: f32,
+    pub german_prime: bool,
 }
 
 impl Default for IniValues {
     fn default() -> Self {
         Self {
-            delay: 4,
+            delay: 6,
             silence_threshold: 0.006,
             silence_chunks: None,
             paragraph_delay_offset: 4,
@@ -94,6 +99,7 @@ impl Default for IniValues {
             rms_ema_alpha: 0.3,
             fuzzy_hotwords: true,
             fuzzy_max_ratio: 0.34,
+            german_prime: false,
         }
     }
 }

@@ -216,6 +216,170 @@ impl FuzzyMatcher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Abbreviation / acronym expansion (letter-name pass)
+// ---------------------------------------------------------------------------
+//
+// Dictated acronyms come out of the model as German *letter names*: "M-R-I" is
+// transcribed as `Em Er I` / `EM-ER-I` — separate tokens the word-by-word fuzzy
+// matcher can never join, and hyphen/digit-bearing targets like `TUR-B` are
+// excluded from fuzzy matching entirely. This pass handles them:
+//
+//   1. Targets are the plain custom_words.txt terms that *look like* acronyms:
+//      2–6 letters, all uppercase, only letters/digits/hyphens (MRI, PSA, TUR-B).
+//   2. The final transcript is scanned for runs of ≥2 adjacent tokens that are
+//      ALL recognized German letter names (`em→M, er→R, i→I, …`; a single
+//      alphabetic character stands for itself).
+//   3. The run's letters are joined and compared against each target's
+//      letters-only key (`TUR-B` → `TURB`). On a match the whole run is
+//      replaced by the canonical spelling from custom_words.txt.
+//
+// Requiring every token to be a letter name AND the full run to match a known
+// target keeps false positives low even though `er`/`es` are common German
+// words. Longest run wins; on no match the window shrinks from the right.
+
+/// Fewest / most letters a custom-words term may have to count as an
+/// acronym target (letters only — digits and hyphens are ignored).
+const ABBREV_MIN_LETTERS: usize = 2;
+const ABBREV_MAX_LETTERS: usize = 6;
+
+/// Expander built from the acronym-shaped custom_words.txt terms.
+pub struct AbbrevExpander {
+    /// (canonical spelling, uppercase letters-only key), e.g. ("TUR-B", "TURB").
+    targets: Vec<(String, String)>,
+}
+
+impl AbbrevExpander {
+    pub fn new(terms: &[String]) -> Self {
+        let targets = terms
+            .iter()
+            .filter(|t| is_abbrev_target(t))
+            .map(|t| {
+                let key: String = t.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+                (t.clone(), key)
+            })
+            .collect();
+        Self { targets }
+    }
+
+    pub fn from_corrector(corrector: &WordsCorrector) -> Self {
+        let terms: Vec<String> = corrector.plain_terms().iter().map(|s| s.to_string()).collect();
+        Self::new(&terms)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// Replace spelled-out letter-name runs with their canonical acronym.
+    pub fn expand(&self, text: &str) -> String {
+        if self.targets.is_empty() {
+            return text.to_string();
+        }
+
+        // Tokenize into maximal alphabetic runs with byte ranges.
+        let mut tokens: Vec<(usize, usize)> = Vec::new(); // (start, end) byte offsets
+        let mut start: Option<usize> = None;
+        for (i, c) in text.char_indices() {
+            if c.is_alphabetic() {
+                if start.is_none() { start = Some(i); }
+            } else if let Some(s) = start.take() {
+                tokens.push((s, i));
+            }
+        }
+        if let Some(s) = start { tokens.push((s, text.len())); }
+
+        let letters: Vec<Option<char>> = tokens
+            .iter()
+            .map(|&(s, e)| letter_name(&text[s..e]))
+            .collect();
+
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0; // bytes copied to `out` so far
+        let mut i = 0;
+        while i < tokens.len() {
+            if letters[i].is_none() { i += 1; continue; }
+            // Extend the run while the next token is also a letter name and the
+            // separator between them is only spaces/hyphens/periods.
+            let mut j = i;
+            while j + 1 < tokens.len()
+                && letters[j + 1].is_some()
+                && text[tokens[j].1..tokens[j + 1].0]
+                    .chars()
+                    .all(|c| c == ' ' || c == '-' || c == '.')
+            {
+                j += 1;
+            }
+            // Longest window first; shrink from the right until a target matches.
+            let mut matched = false;
+            let mut k = j;
+            while k > i {
+                let key: String = (i..=k).map(|t| letters[t].unwrap()).collect();
+                if let Some((canon, _)) = self.targets.iter().find(|(_, tk)| *tk == key) {
+                    out.push_str(&text[cursor..tokens[i].0]);
+                    out.push_str(canon);
+                    cursor = tokens[k].1;
+                    i = k + 1;
+                    matched = true;
+                    break;
+                }
+                k -= 1;
+            }
+            if !matched { i += 1; }
+        }
+        out.push_str(&text[cursor..]);
+        out
+    }
+}
+
+/// A custom-words term is an acronym target if it consists only of
+/// letters/digits/hyphens with 2–6 letters, all of them uppercase (MRI, TUR-B).
+fn is_abbrev_target(s: &str) -> bool {
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return false;
+    }
+    let letters: Vec<char> = s.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    (ABBREV_MIN_LETTERS..=ABBREV_MAX_LETTERS).contains(&letters.len())
+        && letters.iter().all(|c| c.is_ascii_uppercase())
+}
+
+/// Map a transcribed token to the letter it names, if any.
+/// A single alphabetic character stands for itself ("T U R B" → TURB);
+/// otherwise the token must be a German letter name ("em" → M).
+fn letter_name(word: &str) -> Option<char> {
+    let mut chars = word.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        let u = c.to_ascii_uppercase();
+        return u.is_ascii_alphabetic().then_some(u);
+    }
+    let lower = word.to_lowercase();
+    let letter = match lower.as_str() {
+        "be" => 'B',
+        "ce" => 'C',
+        "de" => 'D',
+        "ef" | "eff" => 'F',
+        "ge" => 'G',
+        "ha" => 'H',
+        "jot" => 'J',
+        "ka" | "kah" => 'K',
+        "el" | "ell" => 'L',
+        "em" | "emm" => 'M',
+        "en" | "enn" => 'N',
+        "pe" | "peh" => 'P',
+        "ku" => 'Q',
+        "er" | "err" => 'R',
+        "es" | "ess" => 'S',
+        "te" | "teh" => 'T',
+        "vau" | "fau" => 'V',
+        "we" | "weh" => 'W',
+        "ix" | "iks" => 'X',
+        "ypsilon" | "ipsilon" | "üpsilon" => 'Y',
+        "zett" | "zet" => 'Z',
+        _ => return None,
+    };
+    Some(letter)
+}
+
 /// Drop a single leading `0` (an edge-vowel code) so that vowel-initial and
 /// consonant-initial renderings of the same word compare equal under the
 /// phonetic gate (e.g. `01264` "Epetmika" vs `1264` "Betmiga").
@@ -431,5 +595,52 @@ mod tests {
         let c = WordsCorrector::from_str("Migration=Miktion\nBetmiga\nToviaz\n");
         let m = FuzzyMatcher::from_corrector(&c);
         assert_eq!(m.correct("Bedmika", 0.34), "Betmiga");
+    }
+
+    #[test]
+    fn abbrev_target_detection() {
+        assert!(is_abbrev_target("MRI"));
+        assert!(is_abbrev_target("TUR-B"));
+        assert!(is_abbrev_target("PSA"));
+        assert!(!is_abbrev_target("Betmiga"));     // not uppercase
+        assert!(!is_abbrev_target("M"));           // too short
+        assert!(!is_abbrev_target("LANGWORT"));    // too long
+        assert!(!is_abbrev_target("von Willebrand")); // space
+    }
+
+    #[test]
+    fn abbrev_expands_letter_name_runs() {
+        let c = WordsCorrector::from_str("MRI\nTUR-B\nPSA\nEKG\nBetmiga\n");
+        let a = AbbrevExpander::from_corrector(&c);
+        assert_eq!(a.expand("Ein Em Er I wurde durchgeführt."),
+                   "Ein MRI wurde durchgeführt.");
+        assert_eq!(a.expand("Zustand nach Te U Er Be im März."),
+                   "Zustand nach TUR-B im März.");
+        assert_eq!(a.expand("Der Pe Es A Wert ist stabil."),
+                   "Der PSA Wert ist stabil.");
+        // Hyphen-joined rendering of the same dictation
+        assert_eq!(a.expand("EM-ER-I unauffällig."), "MRI unauffällig.");
+        // Single capital letters spell themselves
+        assert_eq!(a.expand("E Ka Ge ohne Befund."), "EKG ohne Befund.");
+    }
+
+    #[test]
+    fn abbrev_leaves_normal_text_alone() {
+        let c = WordsCorrector::from_str("MRI\nPSA\n");
+        let a = AbbrevExpander::from_corrector(&c);
+        // "er"/"es" are letter names but the runs don't match any target.
+        let input = "Er sagt, es geht ihm gut.";
+        assert_eq!(a.expand(input), input);
+        // Already-canonical acronym is a single token — never a ≥2-token run.
+        assert_eq!(a.expand("Das MRI war unauffällig."), "Das MRI war unauffällig.");
+    }
+
+    #[test]
+    fn abbrev_shrinks_window_to_match() {
+        let c = WordsCorrector::from_str("MRI\n");
+        let a = AbbrevExpander::from_corrector(&c);
+        // "u" extends the letter-name run (MRIU matches nothing) — the window
+        // must shrink from the right and still find MRI.
+        assert_eq!(a.expand("Em Er I u Schall."), "MRI u Schall.");
     }
 }

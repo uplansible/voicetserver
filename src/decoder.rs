@@ -386,10 +386,17 @@ impl TextDecoder {
     /// Build prefill embeddings: BOS + (LEFT_PAD_TOKENS + NUM_DELAY_TOKENS) PAD tokens,
     /// each fused (element-wise add) with the corresponding adapter frame.
     /// Returns the fused embeddings tensor [1, PREFILL_LEN, HIDDEN_SIZE].
+    ///
+    /// `prime_tokens` (experimental, german_prime config flag): text token IDs placed
+    /// right after BOS instead of PADs, as if the model had already transcribed that
+    /// text during the leading silence — biases the LM prior toward that language.
+    /// Capped to the LEFT_PAD_TOKENS silence region; pass `&[]` for the normal
+    /// all-PAD prefill.
     pub fn prepare_prefill(
         &self,
         adapter_out: &Tensor,
         delay_tokens: usize,
+        prime_tokens: &[u32],
         device: &Device,
         dtype: DType,
     ) -> candle_core::Result<Tensor> {
@@ -398,6 +405,9 @@ impl TextDecoder {
 
         let mut prefill_ids = vec![tokenizer::STREAMING_PAD_ID; pf_len];
         prefill_ids[0] = tokenizer::BOS_ID;
+        for (i, &t) in prime_tokens.iter().take(common::LEFT_PAD_TOKENS).enumerate() {
+            prefill_ids[1 + i] = t;
+        }
 
         let tok_embeds = self.embed_tokens(&prefill_ids, device)?;
         let audio_slice = if pf_len <= n_adapter {

@@ -133,6 +133,12 @@ impl SilenceDetector {
 
 // ---- Startup ----
 
+/// Experimental (german_prime config flag): German text used to prime the decoder
+/// prefill instead of pure PADs, biasing the model's language prior toward German.
+/// Encoded once at model load (`Tokenizer::encode_greedy`); must stay short enough
+/// to fit the LEFT_PAD_TOKENS (32) silence region.
+pub const GERMAN_PRIME_TEXT: &str = "Der Patient kommt zur Verlaufskontrolle in die Sprechstunde.";
+
 /// Internal state after startup prefill.
 pub struct StartupResult {
     pub last_token: u32,
@@ -144,6 +150,7 @@ pub struct StartupResult {
 pub fn run_startup(
     delay_samples: &[f32],
     delay_tokens: usize,
+    prime_tokens: &[u32],
     enc: &mut AudioEncoder,
     adapter: &Adapter,
     dec: &mut TextDecoder,
@@ -179,7 +186,7 @@ pub fn run_startup(
     let t_cond = decoder::sinusoidal_embedding(delay_tokens as f32, device, dtype)?;
     let prefill_len = decoder::prefill_len(delay_tokens);
 
-    let prefill_embeds = dec.prepare_prefill(&adapter_out, delay_tokens, device, dtype)?;
+    let prefill_embeds = dec.prepare_prefill(&adapter_out, delay_tokens, prime_tokens, device, dtype)?;
 
     dec.reset_caches();
     dec.precompute_t_cond(&t_cond)?;
@@ -228,6 +235,7 @@ impl StreamingState {
         enc: &mut AudioEncoder,
         adapter: &Adapter,
         dec: &mut TextDecoder,
+        prime_tokens: &[u32],
         filters: &[f32],
         device: &Device,
         dtype: DType,
@@ -238,7 +246,7 @@ impl StreamingState {
         let delay_samples_count = (1 + delay_tokens) * SAMPLES_PER_TOKEN;
         let silence_input = vec![0.0f32; delay_samples_count];
 
-        let startup = run_startup(&silence_input, delay_tokens, enc, adapter, dec, filters, device, dtype)?;
+        let startup = run_startup(&silence_input, delay_tokens, prime_tokens, enc, adapter, dec, filters, device, dtype)?;
 
         let mel_len = startup.mel_frames.len();
         let ctx_start = mel_len.saturating_sub(CONV_CTX);
@@ -274,7 +282,6 @@ impl StreamingState {
         self.sample_buf_for_silence.extend_from_slice(pcm);
         self.mel_buffer.extend(self.inc_mel.drain_frames());
 
-        let dtype = self.dtype;
         let mut outputs = Vec::new();
 
         // Silence detection (runs per 80ms chunk of audio)
@@ -292,6 +299,47 @@ impl StreamingState {
         }
 
         // Inference ticks (one per 80ms mel chunk)
+        self.infer_ticks(enc, adapter, dec, tok, device, &mut outputs)?;
+
+        Ok(outputs)
+    }
+
+    /// Flush the decoder lookahead at end of session by feeding silence.
+    ///
+    /// The decoder lags the audio by `delay_tokens` ticks (80ms each, plus conv/mel
+    /// context), and the client stops sending audio the moment the user presses
+    /// stop — without this drain, the last ~delay×80ms of speech would never be
+    /// decoded and the final words of a dictation would be truncated. Decoded text
+    /// accumulates in `text_buf`; the caller flushes it via `take_text_buf()`.
+    /// Silence detection is deliberately skipped (no competing Silence final).
+    pub fn drain_sync(
+        &mut self,
+        enc: &mut AudioEncoder,
+        adapter: &Adapter,
+        dec: &mut TextDecoder,
+        tok: &Tokenizer,
+        device: &Device,
+    ) -> Result<()> {
+        // +3 ticks of margin cover the mel window tail and conv-stem context.
+        let zeros = vec![0.0f32; (self.delay_tokens + 3) * SAMPLES_PER_TOKEN];
+        self.inc_mel.push_samples(&zeros);
+        self.mel_buffer.extend(self.inc_mel.drain_frames());
+        let mut outputs = Vec::new();
+        self.infer_ticks(enc, adapter, dec, tok, device, &mut outputs)
+    }
+
+    /// Run inference ticks (one per 80ms mel chunk) over the buffered mel frames.
+    /// Decoded text is appended to `text_buf`; per-token partials are pushed to `outputs`.
+    fn infer_ticks(
+        &mut self,
+        enc: &mut AudioEncoder,
+        adapter: &Adapter,
+        dec: &mut TextDecoder,
+        tok: &Tokenizer,
+        device: &Device,
+        outputs: &mut Vec<ChunkOutput>,
+    ) -> Result<()> {
+        let dtype = self.dtype;
         while self.mel_buffer.len() >= CONV_CTX + NEW_MEL_PER_CHUNK {
             let process_len = CONV_CTX + NEW_MEL_PER_CHUNK;
 
@@ -351,7 +399,7 @@ impl StreamingState {
             }
         }
 
-        Ok(outputs)
+        Ok(())
     }
 
     /// Return and clear the accumulated text buffer (used on silence flush + WebSocket

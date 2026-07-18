@@ -58,6 +58,7 @@ pub struct ConfigFile {
     pub rms_ema:           Option<f32>,
     pub fuzzy_hotwords:    Option<bool>,
     pub fuzzy_max_ratio:   Option<f32>,
+    pub german_prime:      Option<bool>,
     // Log file settings
     pub log_file:      Option<String>,
     pub log_keep_days: Option<u32>,
@@ -93,6 +94,7 @@ pub struct MergedConfig {
     pub rms_ema:           f32,
     pub fuzzy_hotwords:    bool,
     pub fuzzy_max_ratio:   f32,
+    pub german_prime:      bool,
     // Log file settings
     pub log_file:      Option<String>,
     pub log_keep_days: u32,
@@ -137,6 +139,8 @@ pub struct WorkspacePaths {
     pub training_sentences: PathBuf,  // {data_dir}/training_sentences.txt
     pub lora_output_dir:    PathBuf,  // {data_dir}/lora_adapter/
     pub edit_log:           PathBuf,  // {data_dir}/edit_log.jsonl
+    pub review_dir:         PathBuf,  // {data_dir}/training/review/ (candidate WAVs)
+    pub review_jsonl:       PathBuf,  // {data_dir}/training/review.jsonl
 }
 
 impl WorkspacePaths {
@@ -150,6 +154,8 @@ impl WorkspacePaths {
             training_sentences: data_dir.join("training_sentences.txt"),
             lora_output_dir:    data_dir.join("lora_adapter"),
             edit_log:           data_dir.join("edit_log.jsonl"),
+            review_dir:         training.join("review"),
+            review_jsonl:       training.join("review.jsonl"),
         }
     }
 }
@@ -161,7 +167,7 @@ impl WorkspacePaths {
 const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # All fields are optional — omit to use the compiled default.
 # Restart required for: model_dir, device, port, bind_addr, tls_cert, tls_key, lora_adapter
-# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio
+# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio, german_prime
 
 # model_dir = "/path/to/Voxtral-Mini-4B-Realtime"
 # bind_addr = "127.0.0.1"
@@ -173,7 +179,7 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # data_dir = "/path/to/data"   # base for custom_words.txt, training/, lora_adapter/, training_sentences.txt
 #                               # defaults to ~/.config/voicetserver/ when unset
 
-# delay = 4
+# delay = 6
 # silence_threshold = 0.006
 # silence_flush = 20
 # min_speech = 15
@@ -183,6 +189,10 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # in custom_words.txt that sound the same — Kölner Phonetik + Levenshtein).
 # fuzzy_hotwords = true     # set false to disable fuzzy snapping
 # fuzzy_max_ratio = 0.34    # max normalized edit distance (0..1); lower = stricter
+
+# Experimental: prime the decoder prefill with a few German text tokens instead of
+# pure PADs to bias the model's language prior toward German (A/B test flag).
+# german_prime = false
 
 # log_file = "/path/to/voicetserver.log"   # default: ~/.config/voicetserver/logs/voicetserver.log
 # log_keep_days = 7
@@ -260,10 +270,11 @@ pub fn ensure_api_key(cfg: &mut ConfigFile) -> Result<String> {
     cfg.api_key = Some(key.clone());
     save_config_file(cfg)
         .map_err(|e| anyhow::anyhow!("Failed to save generated API key: {}", e))?;
-    println!("┌─────────────────────────────────────────────────────┐");
+    // Box interior is 55 chars wide: 2 + 19 ("Generated API key:" + space) + 32 (hex key) + 2.
+    println!("┌───────────────────────────────────────────────────────┐");
     println!("│  Generated API key: {}  │", key);
     println!("│  Paste it into the userscript Einstellungen tab.      │");
-    println!("└─────────────────────────────────────────────────────┘");
+    println!("└───────────────────────────────────────────────────────┘");
     Ok(key)
 }
 
@@ -308,7 +319,9 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         merge_val(&cli.bind_addr, &file.bind_addr, "127.0.0.1".to_string());
     let (device, _) = merge_val(&cli.device, &file.device, 0usize);
     let (port, _)   = merge_val(&cli.port,   &file.port,   8765u16);
-    let (delay, _)             = merge_val(&cli.delay,             &file.delay,             4usize);
+    // Default lookahead raised 4 → 6 (≈480 ms): measurably better accuracy for
+    // ~160 ms extra latency. Runtime-tunable via PATCH /config / Einstellungen.
+    let (delay, _)             = merge_val(&cli.delay,             &file.delay,             6usize);
     let (silence_threshold, _) = merge_val(&cli.silence_threshold, &file.silence_threshold, 0.006f32);
     let (silence_flush, _)     = merge_val(&cli.silence_flush,     &file.silence_flush,     20usize);
     let (min_speech, _)        = merge_val(&cli.min_speech,        &file.min_speech,        15usize);
@@ -316,6 +329,8 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     // Fuzzy phonetic correction: config-file + runtime only (no CLI flag).
     let fuzzy_hotwords  = file.fuzzy_hotwords.unwrap_or(true);
     let fuzzy_max_ratio = file.fuzzy_max_ratio.unwrap_or(0.34f32);
+    // Experimental German prefill priming: config-file + runtime only (no CLI flag).
+    let german_prime = file.german_prime.unwrap_or(false);
 
     let (tls_cert_val, tls_cert_src) = merge_opt_str(&cli.tls_cert, &file.tls_cert);
     let (tls_key_val,  tls_key_src)  = merge_opt_str(&cli.tls_key,  &file.tls_key);
@@ -345,6 +360,7 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         rms_ema,
         fuzzy_hotwords,
         fuzzy_max_ratio,
+        german_prime,
         log_file,
         log_keep_days,
     }
