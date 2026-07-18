@@ -8,6 +8,7 @@ mod lora;
 mod macros;
 mod mel;
 mod qwen;
+mod qwen_streaming;
 mod session;
 mod settings;
 mod streaming;
@@ -1195,10 +1196,8 @@ mod server {
     #[derive(Clone)]
     struct AppState {
         model:             Arc<VoxtralModel>,
-        /// Second engine (Qwen3-ASR); None when qwen_model_dir is not configured.
-        /// Sessions dispatch on `?model=` starting with phase 3 — until then the
-        /// engine is loaded and resident but unused.
-        #[allow(dead_code)]
+        /// Second engine (Qwen3-ASR); None when qwen_model_dir is not configured —
+        /// sessions requesting `?model=qwen` then get an error frame.
         qwen:              Option<Arc<crate::qwen::QwenEngine>>,
         settings:          Arc<SharedSettings>,
         connection_count:  Arc<AtomicUsize>,
@@ -1232,18 +1231,70 @@ mod server {
 
     // ---- /asr WebSocket ----
 
+    #[derive(serde::Deserialize, Default)]
+    struct WsQuery {
+        /// Engine selection: "qwen" → Qwen3-ASR, anything else / absent → Voxtral.
+        model:    Option<String>,
+        /// Language override for the qwen engine (Voxtral auto-detects; ignored there).
+        lang:     Option<String>,
+        /// Patient context (qwen prompt biasing only).
+        patient:  Option<String>,
+        /// Per-session hotwords (comma/semicolon separated) to bias qwen decoding,
+        /// in addition to the fixed plain terms from custom_words.txt.
+        hotwords: Option<String>,
+    }
+
+    /// Collect and deduplicate the hotword/context terms (order-preserving) from
+    /// fixed plain terms, optional per-session hotwords, and an optional patient
+    /// name. These feed the qwen system-prompt biasing.
+    fn collect_terms(
+        plain_terms: &[&str],
+        hotwords: Option<&str>,
+        patient: Option<&str>,
+    ) -> Vec<String> {
+        let mut terms: Vec<String> = Vec::new();
+        let candidates = plain_terms
+            .iter()
+            .copied()
+            .chain(hotwords.into_iter().flat_map(|hw| hw.split([',', ';', '\n'])))
+            .chain(patient);
+        for c in candidates {
+            let c = c.trim();
+            if !c.is_empty() && !terms.iter().any(|t| t == c) {
+                terms.push(c.to_string());
+            }
+        }
+        terms
+    }
+
+    /// Format the system-prompt context string from collected terms.
+    /// Returns `None` if there is nothing to bias on.
+    fn build_context(terms: &[String]) -> Option<String> {
+        if terms.is_empty() {
+            None
+        } else {
+            Some(format!("Eigennamen und Fachbegriffe: {}.", terms.join(", ")))
+        }
+    }
+
     async fn ws_handler(
         ws: WebSocketUpgrade,
         State(state): State<Arc<AppState>>,
+        Query(params): Query<WsQuery>,
     ) -> Response {
-        ws.on_upgrade(move |socket| handle_socket(socket, state))
+        ws.on_upgrade(move |socket| handle_socket(socket, state, params))
     }
 
-    async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, params: WsQuery) {
         state.connection_count.fetch_add(1, Ordering::Relaxed);
         eprintln!("New connection (total: {})", state.connection_count.load(Ordering::Relaxed));
 
-        if let Err(e) = handle_asr_session(&mut socket, &state).await {
+        // Engine dispatch on ?model= — default Voxtral.
+        let result = match params.model.as_deref() {
+            Some("qwen") => handle_qwen_session(&mut socket, &state, &params).await,
+            _            => handle_asr_session(&mut socket, &state).await,
+        };
+        if let Err(e) = result {
             eprintln!("ASR session error: {}", e);
             let msg = json!({ "type": "error", "text": e.to_string() }).to_string();
             let _ = socket.send(Message::Text(msg.into())).await;
@@ -1395,6 +1446,109 @@ mod server {
                 let corrected = finalize_text(state, &raw).await;
                 let msg = json!({ "type": "final", "text": corrected }).to_string();
                 let _ = socket.send(Message::Text(msg.into())).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Qwen3-ASR session (`?model=qwen`) — ported from schmidiscribe's handler.
+    ///
+    /// Inference runs via `spawn_blocking` (the qwen engine serialises GPU work
+    /// behind its own internal lock, independent of the Voxtral mutex, so qwen
+    /// and Voxtral sessions run concurrently). Finals go through the same
+    /// `finalize_text()` pipeline as the Voxtral path, so qwen gains abbrev
+    /// expansion on top of schmidiscribe's literal + fuzzy passes.
+    async fn handle_qwen_session(socket: &mut WebSocket, state: &AppState, params: &WsQuery) -> Result<()> {
+        use crate::audio;
+        use crate::qwen_streaming::{ChunkOutput, StreamingState};
+
+        let engine = match &state.qwen {
+            Some(qwen) => qwen.get().await.ok_or_else(|| // None while unloaded for LoRA training
+                anyhow::anyhow!("Server is training a new voice model — please try again in a few minutes"))?,
+            None => anyhow::bail!("Qwen engine not enabled — set qwen_model_dir in config.toml"),
+        };
+
+        // Qwen honours a forced language; per-session ?lang= overrides the configured one.
+        let language = params.lang.clone()
+            .unwrap_or_else(|| state.startup_snapshot.language.clone());
+
+        // Soft system-prompt biasing (custom_words plain terms + ?hotwords= +
+        // ?patient=), gated by the runtime `context_biasing` toggle (read at
+        // connection start). The finalize_text() correction passes are independent.
+        let context = if state.settings.context_biasing.load(Ordering::Relaxed) {
+            let terms = collect_terms(
+                &state.words.read().await.plain_terms(),
+                params.hotwords.as_deref(),
+                params.patient.as_deref(),
+            );
+            build_context(&terms)
+        } else {
+            None
+        };
+
+        let mut stream_state = StreamingState::new(engine, Some(language), context);
+
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Binary(data))) => {
+                    let pcm = audio::decode_pcm_f32(&data);
+                    if pcm.is_empty() { continue; }
+
+                    // Run inference off the tokio worker thread to keep /health and
+                    // other handlers responsive during active dictation sessions.
+                    let settings_arc = Arc::clone(&state.settings);
+                    let (returned_state, result) = tokio::task::spawn_blocking(move || {
+                        let outputs = stream_state.process_chunk(&pcm, &settings_arc);
+                        (stream_state, outputs)
+                    }).await?;
+                    stream_state = returned_state;
+                    let outputs = result?;
+
+                    for output in outputs {
+                        let msg = match output {
+                            ChunkOutput::Token(ref text) => {
+                                json!({ "type": "partial", "text": replace_eszett(text) }).to_string()
+                            }
+                            ChunkOutput::Silence => {
+                                let raw = stream_state.take_text_buf();
+                                let final_text = finalize_text(state, &raw).await;
+                                json!({ "type": "final", "text": final_text }).to_string()
+                            }
+                        };
+                        if socket.send(Message::Text(msg.into())).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                // Graceful stop (shared protocol): finish inference, send final, close.
+                Some(Ok(Message::Text(text))) if text.trim() == "stop" => {
+                    let result = tokio::task::spawn_blocking(move || stream_state.finish()).await?;
+                    let raw = result?;
+                    if !raw.is_empty() {
+                        let final_text = finalize_text(state, &raw).await;
+                        let msg = json!({ "type": "final", "text": final_text }).to_string();
+                        let _ = socket.send(Message::Text(msg.into())).await;
+                    }
+                    break;
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    // Fallback: client disconnected without sending "stop" — same
+                    // flush, though the final may be lost if the client is gone.
+                    let result = tokio::task::spawn_blocking(move || stream_state.finish()).await?;
+                    let raw = result?;
+                    if !raw.is_empty() {
+                        let final_text = finalize_text(state, &raw).await;
+                        let msg = json!({ "type": "final", "text": final_text }).to_string();
+                        let _ = socket.send(Message::Text(msg.into())).await;
+                    }
+                    break;
+                }
+                Some(Ok(_)) => {} // ping/pong/other text — ignore
+                Some(Err(e)) => {
+                    eprintln!("WebSocket error: {}", e);
+                    break;
+                }
             }
         }
 

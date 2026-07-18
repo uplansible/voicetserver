@@ -56,9 +56,7 @@ pub struct SharedSettings {
     /// pure PADs to bias the language prior (default off). Applies on next session.
     pub german_prime: AtomicBool,
     /// Qwen prompt biasing (custom words + hotwords + patient context) on/off
-    /// (default on). Qwen engine only; applies on the next session. Read by the
-    /// qwen session path starting with phase 3.
-    #[allow(dead_code)]
+    /// (default on). Qwen engine only; applies on the next session.
     pub context_biasing: AtomicBool,
     /// Server state: STATE_READY / STATE_LOADING (no hotkey toggle in server mode).
     pub state: AtomicU8,

@@ -51,8 +51,6 @@ impl QwenEngine {
     }
 
     /// Clone out the engine handle, or None if unloaded (training in progress).
-    /// Sessions use this starting with phase 3's `?model=qwen` dispatch.
-    #[allow(dead_code)]
     pub async fn get(&self) -> Option<Arc<qwen3_asr::AsrInference>> {
         self.inner.lock().await.clone()
     }
