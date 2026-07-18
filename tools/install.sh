@@ -96,18 +96,18 @@ else
 fi
 
 # --- Install / upgrade remaining deps ---
-if "$VENV_PATH/bin/python3" -c "import safetensors, mistral_common, numpy, tqdm, packaging" 2>/dev/null; then
+if "$VENV_PATH/bin/python3" -c "import safetensors, mistral_common, tokenizers, numpy, tqdm, packaging" 2>/dev/null; then
     printf "Python deps already installed — upgrade? [y/N]: "
     read -r UPG_DEPS
     if [[ "${UPG_DEPS,,}" == "y" ]]; then
         echo "Upgrading dependencies..."
         TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir --upgrade \
-            safetensors mistral-common numpy tqdm packaging
+            safetensors mistral-common tokenizers numpy tqdm packaging
     fi
 else
     echo "Installing remaining dependencies..."
     TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir \
-        safetensors mistral-common numpy tqdm packaging
+        safetensors mistral-common tokenizers numpy tqdm packaging
 fi
 
 # --- Deploy trainer scripts (per-model: voxtral + qwen) ---

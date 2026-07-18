@@ -1,6 +1,7 @@
 torch>=2.3
 safetensors>=0.4
 mistral-common>=1.0
+tokenizers>=0.19
 numpy>=1.26
 tqdm>=4.66
 packaging>=23.0
