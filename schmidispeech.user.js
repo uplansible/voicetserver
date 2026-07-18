@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.15
-// @description  Local GPU dictation — German medical (Voxtral/voicetserver + Qwen3/schmidiscribe)
+// @version      0.1.16
+// @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -15,37 +15,36 @@
     // ---- Configuration ----
     const DEFAULT_HOTKEY = "ctrl+shift+d";
 
-    // Two switchable server backends sharing this one frontend. Both speak the
-    // same protocol (raw f32 PCM in, partial/final JSON out, "stop" text frame,
-    // identical HTTP API); backend-specific settings are shown/hidden based on
-    // what GET /config reports.
-    const BACKENDS = {
-        voxtral: { label: "Voxtral", defaultUrl: "ws://127.0.0.1:8765/asr" },  // voicetserver
-        qwen:    { label: "Qwen3",   defaultUrl: "ws://127.0.0.1:8767/asr" },  // schmidiscribe
+    // One unified server hosts both models; the switcher only selects which
+    // engine a session uses (?model= on the WS URL). Model-specific settings
+    // are shown/hidden based on what GET /config reports ("models" list +
+    // per-field presence), so the script still degrades gracefully against an
+    // old single-model server during the transition.
+    const MODELS = {
+        voxtral: { label: "Voxtral" },
+        qwen:    { label: "Qwen3" },
     };
-    function activeBackend() { return GM_getValue("active_backend", "voxtral"); }
+    const DEFAULT_SERVER_URL = "ws://127.0.0.1:8765/asr";
+    // Migration from the dual-backend era: active_backend seeds active_model.
+    function activeModel() {
+        const m = GM_getValue("active_model", GM_getValue("active_backend", "voxtral"));
+        return MODELS[m] ? m : "voxtral";
+    }
 
-    // Server URL + API key are stored per backend. Pre-profile installs stored a
-    // single server_url/api_key — those act as the Voxtral profile's fallback.
-    // The per-backend accessors also serve the Diktate tab, which can replay a
-    // stored dictation through EITHER backend regardless of which one is active.
-    function backendWsUrl(b) {
-        const legacy = b === "voxtral"
-            ? GM_getValue("server_url", BACKENDS.voxtral.defaultUrl)
-            : BACKENDS[b].defaultUrl;
-        return GM_getValue("server_url_" + b, legacy);
+    // Single server URL + API key. The dual-backend era stored per-backend
+    // profiles — the Voxtral profile's values (server_url_voxtral/api_key_voxtral,
+    // themselves falling back to the pre-profile server_url/api_key) carry over
+    // as the unified values and remain the storage keys, so a rollback to the
+    // profile-era script keeps working. The qwen profile keys stay dormant.
+    function getServerUrl() {
+        return GM_getValue("server_url_voxtral", GM_getValue("server_url", DEFAULT_SERVER_URL));
     }
-    function backendApiKey(b) {
-        const legacy = b === "voxtral" ? GM_getValue("api_key", "") : "";
-        return GM_getValue("api_key_" + b, legacy);
-    }
-    function getServerUrl() { return backendWsUrl(activeBackend()); }
-    function setServerUrl(url) { GM_setValue("server_url_" + activeBackend(), url); }
+    function setServerUrl(url) { GM_setValue("server_url_voxtral", url); }
     function getHotkey() { return GM_getValue("hotkey", DEFAULT_HOTKEY); }
     function setHotkey(k) { GM_setValue("hotkey", k.toLowerCase().trim()); }
     function isCommitMode() { return GM_getValue("commit_mode", false); }
-    function apiKey() { return backendApiKey(activeBackend()); }
-    function setApiKey(k) { GM_setValue("api_key_" + activeBackend(), k.trim()); }
+    function apiKey() { return GM_getValue("api_key_voxtral", GM_getValue("api_key", "")); }
+    function setApiKey(k) { GM_setValue("api_key_voxtral", k.trim()); }
     function getHotwords() { return GM_getValue("hotwords", ""); }
     function setHotwords(v) { GM_setValue("hotwords", v); }
 
@@ -60,7 +59,7 @@
     }
 
     // Patient family name, if the host page exposes it (upl.smr.app); sent as
-    // ?patient= for schmidiscribe's prompt biasing. Absent element → empty string.
+    // ?patient= for the qwen engine's prompt biasing. Absent element → empty string.
     function getPatientName() {
         const el = document.querySelector("#schmidi-pat-info-patientendaten");
         return (el && el.dataset && el.dataset.nachname) ? el.dataset.nachname.trim() : "";
@@ -139,7 +138,7 @@
     });
     btn.textContent = "🎤";
     function updateBtnTitle() {
-        btn.title = `SCHMIDIspeech [${BACKENDS[activeBackend()].label}] — ` +
+        btn.title = `SCHMIDIspeech [${MODELS[activeModel()].label}] — ` +
             `${getHotkey()} zum Diktieren, Rechtsklick konfigurieren`;
     }
     updateBtnTitle();
@@ -401,9 +400,9 @@
     configPanel.innerHTML = `
         <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech <span id="schmidi-server-version" style="color:#888;font-weight:normal;font-size:11px;"></span></div>
         <div style="display:flex;gap:4px;margin-bottom:4px;align-items:center;">
-            <span style="${LABEL_STYLE}">Server:</span>
-            <button id="schmidi-backend-voxtral" data-backend="voxtral" style="${BTN_CANCEL};flex:1;">Voxtral</button>
-            <button id="schmidi-backend-qwen"    data-backend="qwen"    style="${BTN_CANCEL};flex:1;">Qwen3</button>
+            <span style="${LABEL_STYLE}">Modell:</span>
+            <button id="schmidi-model-voxtral" data-model="voxtral" style="${BTN_CANCEL};flex:1;">Voxtral</button>
+            <button id="schmidi-model-qwen"    data-model="qwen"    style="${BTN_CANCEL};flex:1;">Qwen3</button>
         </div>
         <div style="display:flex;gap:0;border-bottom:1px solid #444;margin-bottom:4px;flex-wrap:wrap;">
             <button id="schmidi-tab-woerter"       style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Eigene Wörter</button>
@@ -417,7 +416,7 @@
 
         <!-- Hotwords tab (client-side list, sent per session via ?hotwords=) -->
         <div id="schmidi-pane-hotwords" style="display:none;flex-direction:column;gap:6px;">
-            <div style="${LABEL_STYLE}">Hotwords (ein Begriff pro Zeile; Prompt-Biasing nur bei Qwen3/schmidiscribe)</div>
+            <div style="${LABEL_STYLE}">Hotwords (ein Begriff pro Zeile; Prompt-Biasing nur beim Qwen3-Modell)</div>
             <textarea id="schmidi-hotwords" rows="8" style="${INPUT_STYLE}font-family:monospace;resize:vertical;"></textarea>
             <div id="schmidi-hotwords-status" style="color:#aaa;font-size:11px;min-height:14px;"></div>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
@@ -503,9 +502,13 @@
             </div>
             <div id="schmidi-training-count" style="${LABEL_STYLE}">— Paare</div>
             <div style="border-top:1px solid #444;margin:4px 0;"></div>
-            <label style="display:flex;align-items:center;gap:8px;${LABEL_STYLE}">
-                <input type="checkbox" id="schmidi-lora-enabled" />
-                LoRA verwenden (aktivieren = laden, deaktivieren = entladen)
+            <label style="display:flex;align-items:center;gap:8px;${LABEL_STYLE}" title="aktivieren = laden, deaktivieren = entladen">
+                <input type="checkbox" id="schmidi-lora-voxtral" data-model="voxtral" />
+                LoRA Voxtral verwenden
+            </label>
+            <label id="schmidi-lora-qwen-row" style="display:none;align-items:center;gap:8px;${LABEL_STYLE}" title="aktivieren = laden, deaktivieren = entladen">
+                <input type="checkbox" id="schmidi-lora-qwen" data-model="qwen" />
+                LoRA Qwen3 verwenden
             </label>
             <button id="schmidi-training-run"  style="${BTN_PRIMARY}">▶ LoRA trainieren</button>
             <button id="schmidi-lora-reload"   style="${BTN_CANCEL}">↺ LoRA neu laden</button>
@@ -585,21 +588,32 @@
     `;
     document.body.appendChild(configPanel);
 
-    // ---- Backend switching ----
+    // ---- Model switching ----
     let currentTab = "einstellungen";
 
-    function styleBackendButtons() {
-        const active = activeBackend();
-        configPanel.querySelectorAll("[data-backend]").forEach((b) => {
-            const isActive = b.dataset.backend === active;
+    function styleModelButtons() {
+        const active = activeModel();
+        // "qwen" may be absent from the server's models list (engine disabled) —
+        // gray the button out then. Unknown until the first GET /config; a
+        // server without a "models" field (old single-model) allows both.
+        const available = lastCfg.models;
+        configPanel.querySelectorAll("button[data-model]").forEach((b) => {
+            const isActive  = b.dataset.model === active;
+            const isEnabled = !available || available.includes(b.dataset.model);
             b.style.background = isActive ? "#2980b9" : "#333";
-            b.style.color      = isActive ? "#fff" : "#aaa";
+            b.style.color      = isActive ? "#fff" : (isEnabled ? "#aaa" : "#555");
+            b.disabled         = !isEnabled;
+            b.title            = isEnabled ? "" : "Auf dem Server nicht geladen";
         });
         const vEl = configPanel.querySelector("#schmidi-server-version");
-        if (vEl) vEl.textContent = `[${BACKENDS[active].label}]`;
+        if (vEl) {
+            vEl.textContent = `[${MODELS[active].label}]` +
+                (lastCfg.version ? ` v${lastCfg.version}` : "");
+        }
     }
 
-    // Reload whatever the current tab shows from the newly selected backend.
+    // Refresh whatever the current tab shows after a model switch (same server —
+    // only model-dependent bits like the LoRA pane and settings gating change).
     const TAB_LOADERS = {
         woerter: () => loadWords(),
         hotwords: () => loadHotwords(),
@@ -610,17 +624,17 @@
         einstellungen: () => { fillClientFields(); loadServerParams(); },
     };
 
-    function switchBackend(b) {
-        if (recording) { showToast("Serverwechsel während der Aufnahme nicht möglich"); return; }
-        GM_setValue("active_backend", b);
-        styleBackendButtons();
+    function switchModel(m) {
+        if (recording) { showToast("Modellwechsel während der Aufnahme nicht möglich"); return; }
+        GM_setValue("active_model", m);
+        styleModelButtons();
         updateBtnTitle();
         const loader = TAB_LOADERS[currentTab];
         if (loader) loader();
     }
 
-    configPanel.querySelectorAll("[data-backend]").forEach((b) => {
-        b.addEventListener("click", () => switchBackend(b.dataset.backend));
+    configPanel.querySelectorAll("button[data-model]").forEach((b) => {
+        b.addEventListener("click", () => switchModel(b.dataset.model));
     });
 
     // ---- Tab switching ----
@@ -719,18 +733,18 @@
             configPanel.querySelector("#schmidi-fuzzy-max-ratio").value   = cfg.fuzzy_max_ratio ?? "";
             configPanel.querySelector("#schmidi-german-prime").checked    = cfg.german_prime ?? false;
             configPanel.querySelector("#schmidi-context-biasing").checked = cfg.context_biasing !== false;
-            // Show only the settings the connected backend actually reports.
+            // Show only the settings that apply: field presence keeps the script
+            // working against an old single-model server, the "models" list hides
+            // qwen rows when the unified server runs without the qwen engine
+            // (it reports context_biasing regardless).
+            const hasQwen = !cfg.models || cfg.models.includes("qwen");
             configPanel.querySelector("#schmidi-row-delay").style.display =
                 cfg.delay !== undefined ? "flex" : "none";
             configPanel.querySelector("#schmidi-row-german-prime").style.display =
                 cfg.german_prime !== undefined ? "flex" : "none";
             configPanel.querySelector("#schmidi-row-context-biasing").style.display =
-                cfg.context_biasing !== undefined ? "flex" : "none";
-            const vEl = configPanel.querySelector("#schmidi-server-version");
-            if (vEl) {
-                vEl.textContent = `[${BACKENDS[activeBackend()].label}]` +
-                    (cfg.version ? ` v${cfg.version}` : "");
-            }
+                cfg.context_biasing !== undefined && hasQwen ? "flex" : "none";
+            styleModelButtons();
             setEinstellungenStatus("", false);
         } catch (e) {
             setEinstellungenStatus("Fehler: " + e.message, true);
@@ -884,7 +898,7 @@
 
     function openConfig() {
         fillClientFields();
-        styleBackendButtons();
+        styleModelButtons();
         switchTab("einstellungen");
         loadServerParams();
         configPanel.style.display = "flex";
@@ -1420,17 +1434,40 @@
         }
     }
 
-    // Reflect the server's current LoRA state in the "LoRA verwenden" checkbox.
+    // Reflect the server's per-model LoRA state in the "LoRA … verwenden"
+    // checkboxes. The unsuffixed lora_active/lora_dir act as the voxtral
+    // fallback against an old server without per-model fields; the qwen row is
+    // hidden when the server reports no qwen state (engine disabled/old server).
     async function refreshLoraToggle() {
-        const box = configPanel.querySelector('#schmidi-lora-enabled');
-        if (!box) return;
+        const voxBox  = configPanel.querySelector('#schmidi-lora-voxtral');
+        const qwenBox = configPanel.querySelector('#schmidi-lora-qwen');
+        const qwenRow = configPanel.querySelector('#schmidi-lora-qwen-row');
+        if (!voxBox) return;
         try {
             const res = await authFetch(`${getHttpBase()}/config`);
             if (!res.ok) return;
             const cfg = await res.json();
-            box.checked = !!cfg.lora_active;
-            box.dataset.loraDir = cfg.lora_dir || '';
-        } catch (_) { /* leave checkbox as-is on error */ }
+            lastCfg = cfg;
+            voxBox.checked = !!(cfg.lora_active_voxtral ?? cfg.lora_active);
+            voxBox.dataset.loraDir = cfg.lora_dir_voxtral || cfg.lora_dir || '';
+            const hasQwen = (!cfg.models || cfg.models.includes("qwen")) &&
+                cfg.lora_active_qwen !== undefined;
+            if (qwenRow) qwenRow.style.display = hasQwen ? 'flex' : 'none';
+            if (qwenBox && hasQwen) {
+                qwenBox.checked = !!cfg.lora_active_qwen;
+                qwenBox.dataset.loraDir = cfg.lora_dir_qwen || '';
+            }
+            updateTrainButtonLabel();
+        } catch (_) { /* leave checkboxes as-is on error */ }
+    }
+
+    // The train/reload buttons act on the currently selected model.
+    function updateTrainButtonLabel() {
+        const label  = MODELS[activeModel()].label;
+        const runBtn = configPanel.querySelector('#schmidi-training-run');
+        const relBtn = configPanel.querySelector('#schmidi-lora-reload');
+        if (runBtn) runBtn.textContent = `▶ LoRA trainieren (${label})`;
+        if (relBtn) relBtn.textContent = `↺ LoRA neu laden (${label})`;
     }
 
     function renderPairsList() {
@@ -1517,45 +1554,50 @@
 
     configPanel.querySelector('#schmidi-training-run').addEventListener('click', runLoraTraining);
     configPanel.querySelector('#schmidi-lora-reload').addEventListener('click', reloadLora);
-    configPanel.querySelector('#schmidi-lora-enabled').addEventListener('change', toggleLora);
+    configPanel.querySelector('#schmidi-lora-voxtral').addEventListener('change', toggleLora);
+    configPanel.querySelector('#schmidi-lora-qwen').addEventListener('change', toggleLora);
 
-    // Checkbox: checked → load LoRA (POST /lora/reload with the adapter dir);
-    // unchecked → unload it (DELETE /lora). The dir comes from GET /config's
-    // `lora_dir`, so re-enabling works even after the active path was cleared.
+    // Checkbox: checked → load the model's LoRA (POST /lora/reload?model= with
+    // the adapter dir); unchecked → unload it (DELETE /lora?model=). The dir
+    // comes from GET /config's `lora_dir_<model>`, so re-enabling works even
+    // after the active path was cleared. An old server ignores the ?model=
+    // param (voxtral semantics).
     async function toggleLora(ev) {
-        const box = ev.target;
+        const box   = ev.target;
+        const model = box.dataset.model;
+        const label = MODELS[model].label;
         if (box.checked) {
             const dir = box.dataset.loraDir || '';
-            setPaareStatus('Lade LoRA…', false);
+            setPaareStatus(`Lade LoRA (${label})…`, false);
             try {
-                const res  = await authFetch(`${getHttpBase()}/lora/reload`, {
+                const res  = await authFetch(`${getHttpBase()}/lora/reload?model=${model}`, {
                     method:  'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body:    dir ? JSON.stringify({ path: dir }) : undefined,
                 });
-                // Error bodies may be plain text (e.g. schmidiscribe's 422), so
-                // parse defensively instead of assuming JSON.
+                // Error bodies may be plain text, so parse defensively instead
+                // of assuming JSON.
                 const raw = await res.text();
                 let data = {};
                 try { data = JSON.parse(raw); } catch (_) {}
                 if (!res.ok) throw new Error(data.error || raw || res.status);
                 if (data.action === 'applied') {
-                    setPaareStatus('LoRA aktiv ✓', false);
+                    setPaareStatus(`LoRA aktiv ✓ (${label})`, false);
                 } else {
                     // No adapter files at the path — server reverted to base model.
                     box.checked = false;
-                    setPaareStatus('Kein Adapter gefunden — LoRA nicht aktiv', true);
+                    setPaareStatus(`Kein Adapter gefunden — LoRA nicht aktiv (${label})`, true);
                 }
             } catch (e) {
                 box.checked = false;
                 setPaareStatus('Fehler: ' + e.message, true);
             }
         } else {
-            setPaareStatus('Entlade LoRA…', false);
+            setPaareStatus(`Entlade LoRA (${label})…`, false);
             try {
-                const res = await authFetch(`${getHttpBase()}/lora`, { method: 'DELETE' });
+                const res = await authFetch(`${getHttpBase()}/lora?model=${model}`, { method: 'DELETE' });
                 if (!res.ok) throw new Error(await res.text());
-                setPaareStatus('LoRA entladen (Basismodell)', false);
+                setPaareStatus(`LoRA entladen — Basismodell (${label})`, false);
             } catch (e) {
                 box.checked = true;
                 setPaareStatus('Fehler: ' + e.message, true);
@@ -1564,12 +1606,13 @@
     }
 
     async function runLoraTraining() {
-        setPaareStatus('Starte Training…', false);
+        const model = activeModel();
+        setPaareStatus(`Starte Training (${MODELS[model].label})…`, false);
         try {
-            const res = await authFetch(`${getHttpBase()}/training/run`, { method: 'POST' });
+            const res = await authFetch(`${getHttpBase()}/training/run?model=${model}`, { method: 'POST' });
             if (res.status === 409) { setPaareStatus('Training läuft bereits', false); return; }
             if (!res.ok) throw new Error(await res.text());
-            setPaareStatus('Training gestartet', false);
+            setPaareStatus(`Training gestartet (${MODELS[model].label})`, false);
             const logEl = configPanel.querySelector('#schmidi-training-log');
             if (logEl) logEl.style.display = 'block';
             if (trainingStatusPoll) clearInterval(trainingStatusPoll);
@@ -1580,9 +1623,10 @@
     }
 
     async function reloadLora() {
-        setPaareStatus('Lade LoRA neu…', false);
+        const model = activeModel();
+        setPaareStatus(`Lade LoRA neu (${MODELS[model].label})…`, false);
         try {
-            const res = await authFetch(`${getHttpBase()}/lora/reload`, { method: 'POST' });
+            const res = await authFetch(`${getHttpBase()}/lora/reload?model=${model}`, { method: 'POST' });
             const raw = await res.text();
             let data = {};
             try { data = JSON.parse(raw); } catch (_) {}
@@ -1777,15 +1821,17 @@
         throw new Error('WAV: kein data-Chunk');
     }
 
-    // Re-transcribe stored PCM by replaying it through a backend's normal WS
-    // session — both servers speak the same protocol, so either model can be
-    // chosen regardless of which backend is active. Resolves with the full
+    // Re-transcribe stored PCM by replaying it through a normal WS session on
+    // the unified server — ?model= picks the engine, so either model can be
+    // chosen regardless of which one is active. Resolves with the full
     // transcript (all finals + trailing partial).
-    function transcribePcm(pcm, backend) {
+    function transcribePcm(pcm, model) {
         return new Promise((resolve, reject) => {
-            let url = backendWsUrl(backend);
-            const key = backendApiKey(backend);
-            if (key) url += (url.includes('?') ? '&' : '?') + 'api_key=' + encodeURIComponent(key);
+            let url = getServerUrl();
+            const params = ['model=' + encodeURIComponent(model)];
+            const key = apiKey();
+            if (key) params.push('api_key=' + encodeURIComponent(key));
+            url += (url.includes('?') ? '&' : '?') + params.join('&');
             const sock = new WebSocket(url);
             sock.binaryType = 'arraybuffer';
             let text        = '';
@@ -1820,15 +1866,15 @@
         });
     }
 
-    async function transcribeReview(backend) {
+    async function transcribeReview(model) {
         if (!reviewSelectedId) return;
-        const label = BACKENDS[backend].label;
+        const label = MODELS[model].label;
         setDiktStatus(`Transkribiere mit ${label}…`, false);
         try {
             const res = await authFetch(`${getHttpBase()}/training/review/audio/${reviewSelectedId}`);
             if (!res.ok) throw new Error(await res.text());
             const pcm = parseWavPcm16(await res.arrayBuffer());
-            const out = await transcribePcm(pcm, backend);
+            const out = await transcribePcm(pcm, model);
             const ta  = configPanel.querySelector('#schmidi-dikt-text');
             if (ta) ta.value = out;
             setDiktStatus(`${label}-Transkript eingefügt — bitte korrigieren`, false);
@@ -2109,10 +2155,11 @@
         if (onReady) pendingOnReady = onReady;
         // Browsers cannot set custom headers on the WS upgrade, so the API key is
         // passed as a query param (?api_key=) instead of the X-Api-Key header.
-        // hotwords/patient feed schmidiscribe's prompt biasing; voicetserver
-        // ignores unknown query params, so they are always safe to send.
+        // ?model= picks the engine on the unified server; hotwords/patient feed
+        // the qwen engine's prompt biasing. Old servers ignore unknown query
+        // params, so all of them are always safe to send.
         let url = getServerUrl();
-        const params = [];
+        const params = ["model=" + encodeURIComponent(activeModel())];
         const key = apiKey();
         if (key) params.push("api_key=" + encodeURIComponent(key));
         const hw = hotwordsForUrl();
