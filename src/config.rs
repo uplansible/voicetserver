@@ -47,6 +47,11 @@ pub struct ConfigFile {
     pub lora_adapter: Option<String>,
     pub venv_path:    Option<String>,
     pub data_dir:     Option<String>,
+    /// Qwen3-ASR model directory. When unset the qwen engine is disabled and
+    /// `/asr?model=qwen` sessions get an error frame.
+    pub qwen_model_dir: Option<String>,
+    /// Transcription language for the qwen engine (Voxtral has no language control).
+    pub language:     Option<String>,
     /// API key for authenticating HTTP/WebSocket requests. Auto-generated on first
     /// server start and persisted here. Not a CLI flag — config file only.
     pub api_key:      Option<String>,
@@ -59,6 +64,8 @@ pub struct ConfigFile {
     pub fuzzy_hotwords:    Option<bool>,
     pub fuzzy_max_ratio:   Option<f32>,
     pub german_prime:      Option<bool>,
+    /// Qwen prompt biasing (custom words + hotwords + patient context) on/off.
+    pub context_biasing:   Option<bool>,
     // Log file settings
     pub log_file:      Option<String>,
     pub log_keep_days: Option<u32>,
@@ -78,6 +85,8 @@ pub struct MergedConfig {
     pub bind_addr: Sourced<String>,
     pub tls_cert:  Sourced<Option<String>>,
     pub tls_key:   Sourced<Option<String>>,
+    /// Qwen3-ASR model directory; None = qwen engine disabled.
+    pub qwen_model_dir: Sourced<Option<String>>,
     // Plain merged
     pub device:       usize,
     pub port:         u16,
@@ -95,6 +104,9 @@ pub struct MergedConfig {
     pub fuzzy_hotwords:    bool,
     pub fuzzy_max_ratio:   f32,
     pub german_prime:      bool,
+    pub context_biasing:   bool,
+    /// Qwen transcription language (default "German").
+    pub language:          String,
     // Log file settings
     pub log_file:      Option<String>,
     pub log_keep_days: u32,
@@ -166,10 +178,13 @@ impl WorkspacePaths {
 
 const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # All fields are optional — omit to use the compiled default.
-# Restart required for: model_dir, device, port, bind_addr, tls_cert, tls_key, lora_adapter
-# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio, german_prime
+# Restart required for: model_dir, qwen_model_dir, language, device, port, bind_addr, tls_cert, tls_key, lora_adapter
+# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio, german_prime, context_biasing
 
 # model_dir = "/path/to/Voxtral-Mini-4B-Realtime"
+# qwen_model_dir = "/path/to/Qwen3-ASR-0.6B"   # second engine (model.safetensors, config.json,
+#                                               # tokenizer.json); omit to disable qwen
+# language = "German"                           # qwen transcription language (Voxtral auto-detects)
 # bind_addr = "127.0.0.1"
 # port = 8765
 # tls_cert = "/etc/tailscale/certs/host.crt"
@@ -193,6 +208,10 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # Experimental: prime the decoder prefill with a few German text tokens instead of
 # pure PADs to bias the model's language prior toward German (A/B test flag).
 # german_prime = false
+
+# Qwen prompt biasing: inject custom words + per-session hotwords/patient context
+# into the system prompt (qwen engine only; Voxtral has no biasing mechanism).
+# context_biasing = true
 
 # log_file = "/path/to/voicetserver.log"   # default: ~/.config/voicetserver/logs/voicetserver.log
 # log_keep_days = 7
@@ -331,9 +350,14 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let fuzzy_max_ratio = file.fuzzy_max_ratio.unwrap_or(0.34f32);
     // Experimental German prefill priming: config-file + runtime only (no CLI flag).
     let german_prime = file.german_prime.unwrap_or(false);
+    // Qwen prompt biasing: config-file + runtime only (no CLI flag), like fuzzy_hotwords.
+    let context_biasing = file.context_biasing.unwrap_or(true);
+    let (language, _) = merge_val(&cli.language, &file.language, "German".to_string());
 
     let (tls_cert_val, tls_cert_src) = merge_opt_str(&cli.tls_cert, &file.tls_cert);
     let (tls_key_val,  tls_key_src)  = merge_opt_str(&cli.tls_key,  &file.tls_key);
+    let (qwen_model_dir_val, qwen_model_dir_src) =
+        merge_opt_str(&cli.qwen_model_dir, &file.qwen_model_dir);
     let lora_adapter = cli.lora_adapter.clone().or_else(|| file.lora_adapter.clone());
     let venv_path    = cli.venv_path.clone().or_else(|| file.venv_path.clone());
     let log_file      = cli.log_file.clone().or_else(|| file.log_file.clone());
@@ -348,6 +372,7 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         bind_addr: Sourced { value: bind_addr_val, source: bind_addr_src },
         tls_cert:  Sourced { value: tls_cert_val,  source: tls_cert_src  },
         tls_key:   Sourced { value: tls_key_val,   source: tls_key_src   },
+        qwen_model_dir: Sourced { value: qwen_model_dir_val, source: qwen_model_dir_src },
         device,
         port,
         lora_adapter,
@@ -361,6 +386,8 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         fuzzy_hotwords,
         fuzzy_max_ratio,
         german_prime,
+        context_biasing,
+        language,
         log_file,
         log_keep_days,
     }

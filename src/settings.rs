@@ -27,6 +27,10 @@ impl AtomicF32 {
 #[derive(serde::Serialize, Clone)]
 pub struct StartupSnapshot {
     pub model_dir:    String,
+    /// Qwen3-ASR model directory; None = qwen engine disabled.
+    pub qwen_model_dir: Option<String>,
+    /// Qwen transcription language (Voxtral auto-detects; no control).
+    pub language:     String,
     pub device:       usize,
     pub port:         u16,
     pub bind_addr:    String,
@@ -51,6 +55,11 @@ pub struct SharedSettings {
     /// Experimental: prime the decoder prefill with German text tokens instead of
     /// pure PADs to bias the language prior (default off). Applies on next session.
     pub german_prime: AtomicBool,
+    /// Qwen prompt biasing (custom words + hotwords + patient context) on/off
+    /// (default on). Qwen engine only; applies on the next session. Read by the
+    /// qwen session path starting with phase 3.
+    #[allow(dead_code)]
+    pub context_biasing: AtomicBool,
     /// Server state: STATE_READY / STATE_LOADING (no hotkey toggle in server mode).
     pub state: AtomicU8,
 }
@@ -70,6 +79,7 @@ impl SharedSettings {
             fuzzy_hotwords: AtomicBool::new(vals.fuzzy_hotwords),
             fuzzy_max_ratio: AtomicF32::new(vals.fuzzy_max_ratio),
             german_prime: AtomicBool::new(vals.german_prime),
+            context_biasing: AtomicBool::new(vals.context_biasing),
             state: AtomicU8::new(STATE_LOADING),
         }
     }
@@ -86,6 +96,7 @@ pub struct IniValues {
     pub fuzzy_hotwords: bool,
     pub fuzzy_max_ratio: f32,
     pub german_prime: bool,
+    pub context_biasing: bool,
 }
 
 impl Default for IniValues {
@@ -100,6 +111,7 @@ impl Default for IniValues {
             fuzzy_hotwords: true,
             fuzzy_max_ratio: 0.34,
             german_prime: false,
+            context_biasing: true,
         }
     }
 }

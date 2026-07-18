@@ -7,6 +7,7 @@ mod encoder;
 mod lora;
 mod macros;
 mod mel;
+mod qwen;
 mod session;
 mod settings;
 mod streaming;
@@ -30,12 +31,13 @@ use std::time::Instant;
 use common::MEL_FRAMES_PER_TOKEN;
 use config::{MergedConfig, ValueSource};
 
-/// `--version` output: package version plus build variant (e.g. "0.1.10 (CUDA 12.6)" or
-/// "0.1.10 (CPU)"). VOICETSERVER_BUILD_VARIANT is emitted by build.rs. With cudarc's
-/// dynamic-loading the GPU driver is only opened on first inference, so this prints fine
-/// even on a machine with no GPU/driver present.
+/// `--version` output: package version plus build variant and the compiled-in engines
+/// (e.g. "0.1.24 (CUDA 12.6, voxtral+qwen3)" or "0.1.24 (CPU, voxtral+qwen3)").
+/// VOICETSERVER_BUILD_VARIANT is emitted by build.rs. With cudarc's dynamic-loading
+/// the GPU driver is only opened on first inference, so this prints fine even on a
+/// machine with no GPU/driver present.
 const LONG_VERSION: &str =
-    concat!(env!("CARGO_PKG_VERSION"), " (", env!("VOICETSERVER_BUILD_VARIANT"), ")");
+    concat!(env!("CARGO_PKG_VERSION"), " (", env!("VOICETSERVER_BUILD_VARIANT"), ", voxtral+qwen3)");
 
 #[derive(Parser, Clone)]
 #[command(name = "voicetserver", about = "SCHMIDIspeech — real-time German medical dictation server", version = LONG_VERSION)]
@@ -46,6 +48,15 @@ pub struct Cli {
     /// Directory containing model files (consolidated.safetensors, tekken.json, mel_filters.bin) [default: "."]
     #[arg(long)]
     pub model_dir: Option<String>,
+
+    /// Qwen3-ASR model directory (model.safetensors, config.json, tokenizer.json).
+    /// Omit to disable the qwen engine.
+    #[arg(long)]
+    pub qwen_model_dir: Option<String>,
+
+    /// Transcription language for the qwen engine (Voxtral auto-detects) [default: "German"]
+    #[arg(long)]
+    pub language: Option<String>,
 
     /// CUDA device index [default: 0]
     #[arg(long)]
@@ -243,6 +254,11 @@ fn run() -> Result<()> {
     // Validate model_dir
     check_path(&merged.model_dir.value, merged.model_dir.source, "model_dir")?;
 
+    // Validate qwen_model_dir if set (the qwen engine is optional)
+    if let Some(ref dir) = merged.qwen_model_dir.value {
+        check_path(dir, merged.qwen_model_dir.source, "qwen_model_dir")?;
+    }
+
     // Validate TLS paths if provided
     if let Some(ref cert) = merged.tls_cert.value {
         check_path(cert, merged.tls_cert.source, "tls_cert")?;
@@ -348,6 +364,13 @@ fn run() -> Result<()> {
         if merged.fuzzy_hotwords { format!(" (max ratio {})", merged.fuzzy_max_ratio) } else { String::new() });
     println!("{:<28} {}", "German prime (experimental)",
         if merged.german_prime { "on" } else { "off" });
+    println!("{:<28} {}", "Qwen3 engine",
+        merged.qwen_model_dir.value.as_deref().unwrap_or("disabled (qwen_model_dir not set)"));
+    if merged.qwen_model_dir.value.is_some() {
+        println!("{:<28} {}", "Qwen3 language", merged.language);
+        println!("{:<28} {}", "Qwen3 context biasing",
+            if merged.context_biasing { "on" } else { "off" });
+    }
     println!("{:<28} {:?}", "Compute dtype", dtype);
     if !is_offline {
         println!("{:<28} {}:{}", "Listen", merged.bind_addr.value, merged.port);
@@ -407,6 +430,19 @@ fn run() -> Result<()> {
             run_offline(path, effective_delay, &prime_ids, enc, &adapter, dec, &tok, &filters, &device, dtype)
         }
         None => {
+            // Second engine (Qwen3-ASR) — server mode only; offline WAV mode stays
+            // Voxtral-only until phase 3 adds ?model= routing. Shares the candle
+            // Device with Voxtral (one CUDA context, separate GPU lock per engine).
+            let qwen_engine = match merged.qwen_model_dir.value {
+                Some(ref dir) => {
+                    println!("Loading Qwen3-ASR engine: {}", dir);
+                    let t_qwen = Instant::now();
+                    let engine = qwen::QwenEngine::load(dir, device.clone())?;
+                    println!("Qwen3-ASR loaded in {:.2}s", t_qwen.elapsed().as_secs_f64());
+                    Some(Arc::new(engine))
+                }
+                None => None,
+            };
             let prime_ids = tok.encode_greedy(streaming::GERMAN_PRIME_TEXT);
             let model = Arc::new(VoxtralModel {
                 inner: tokio::sync::Mutex::new(Some(ModelInner { enc, dec })),
@@ -424,6 +460,7 @@ fn run() -> Result<()> {
                 .build()?
                 .block_on(server::run(
                     model,
+                    qwen_engine,
                     merged,
                     shared_config,
                     log_path.unwrap_or_default(),
@@ -963,6 +1000,7 @@ mod server {
 
     pub async fn run(
         model: Arc<VoxtralModel>,
+        qwen: Option<Arc<crate::qwen::QwenEngine>>,
         merged: MergedConfig,
         config_file: SharedConfigFile,
         log_path: std::path::PathBuf,
@@ -979,6 +1017,7 @@ mod server {
             fuzzy_hotwords: merged.fuzzy_hotwords,
             fuzzy_max_ratio: merged.fuzzy_max_ratio,
             german_prime: merged.german_prime,
+            context_biasing: merged.context_biasing,
         };
         let settings = Arc::new(SharedSettings::new(vals, merged.silence_flush));
         settings.state.store(STATE_READY, Ordering::SeqCst);
@@ -987,6 +1026,8 @@ mod server {
         let paths = crate::config::WorkspacePaths::new(&merged.data_dir);
         let snapshot = StartupSnapshot {
             model_dir:    merged.model_dir.value.clone(),
+            qwen_model_dir: merged.qwen_model_dir.value.clone(),
+            language:     merged.language.clone(),
             device:       merged.device,
             port:         merged.port,
             bind_addr:    merged.bind_addr.value.clone(),
@@ -1053,6 +1094,7 @@ mod server {
 
         let state = Arc::new(AppState {
             model,
+            qwen,
             settings,
             connection_count,
             startup_snapshot: snapshot,
@@ -1153,6 +1195,11 @@ mod server {
     #[derive(Clone)]
     struct AppState {
         model:             Arc<VoxtralModel>,
+        /// Second engine (Qwen3-ASR); None when qwen_model_dir is not configured.
+        /// Sessions dispatch on `?model=` starting with phase 3 — until then the
+        /// engine is loaded and resident but unused.
+        #[allow(dead_code)]
+        qwen:              Option<Arc<crate::qwen::QwenEngine>>,
         settings:          Arc<SharedSettings>,
         connection_count:  Arc<AtomicUsize>,
         startup_snapshot:  StartupSnapshot,
