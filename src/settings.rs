@@ -36,6 +36,8 @@ pub struct StartupSnapshot {
     pub bind_addr:    String,
     pub tls_enabled:  bool,
     pub lora_adapter: Option<String>,
+    /// Qwen LoRA adapter directory (adapters are per-model — key formats differ).
+    pub lora_adapter_qwen: Option<String>,
     pub venv_path:    Option<String>,
     pub data_dir:     String,
 }

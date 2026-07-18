@@ -110,18 +110,20 @@ else
         safetensors mistral-common numpy tqdm packaging
 fi
 
-# --- Deploy train_lora.py ---
+# --- Deploy trainer scripts (per-model: voxtral + qwen) ---
 # Server's find_script() checks ~/.config/voicetserver/tools/ as a universal fallback,
 # so this location works regardless of where the binary lives.
-TRAIN_SCRIPT="$SCRIPT_DIR/train_lora.py"
 DEPLOY_DIR="$HOME/.config/voicetserver/tools"
-if [[ -f "$TRAIN_SCRIPT" ]]; then
-    mkdir -p "$DEPLOY_DIR"
-    cp "$TRAIN_SCRIPT" "$DEPLOY_DIR/"
-    echo "Deployed train_lora.py → $DEPLOY_DIR/"
-else
-    echo "Warning: train_lora.py not found at $TRAIN_SCRIPT — deploy manually."
-fi
+for TRAIN_NAME in train_lora_voxtral.py train_lora_qwen.py; do
+    TRAIN_SCRIPT="$SCRIPT_DIR/$TRAIN_NAME"
+    if [[ -f "$TRAIN_SCRIPT" ]]; then
+        mkdir -p "$DEPLOY_DIR"
+        cp "$TRAIN_SCRIPT" "$DEPLOY_DIR/"
+        echo "Deployed $TRAIN_NAME → $DEPLOY_DIR/"
+    else
+        echo "Warning: $TRAIN_NAME not found at $TRAIN_SCRIPT — deploy manually."
+    fi
+done
 
 # --- Ensure config dir + file exist ---
 mkdir -p "$(dirname "$CONFIG_FILE")"
@@ -435,7 +437,7 @@ echo ""
 echo "Done."
 [[ -f "$HOME/.local/bin/voicetserver" ]] && echo "  Binary:   ~/.local/bin/voicetserver"
 echo "  Venv:     $VENV_PATH"
-echo "  Script:   ~/.config/voicetserver/tools/train_lora.py"
+echo "  Scripts:  ~/.config/voicetserver/tools/train_lora_{voxtral,qwen}.py"
 echo "  Config:   $CONFIG_FILE"
 [[ -n "$DATA_DIR"  ]] && echo "  Data:     $DATA_DIR"
 [[ -n "$MODEL_DIR" ]] && echo "  Models:   $MODEL_DIR"

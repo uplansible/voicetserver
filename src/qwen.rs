@@ -42,12 +42,30 @@ impl QwenEngine {
         })
     }
 
-    /// Rebuild the inner engine after a training unload (phase 4 wires this in).
-    #[allow(dead_code)]
-    pub async fn reload(&self) -> Result<()> {
+    /// Rebuild the inner engine after a training unload, optionally re-applying a
+    /// LoRA adapter. Sync (model load takes seconds) — call from `spawn_blocking`
+    /// or before the tokio runtime starts; `blocking_lock` panics in async context.
+    pub fn reload_blocking(&self, lora_dir: Option<&Path>) -> Result<()> {
         let engine = load_inference(&self.model_dir, &self.device)?;
-        *self.inner.lock().await = Some(Arc::new(engine));
+        // Warn-and-continue on LoRA failure so a bad adapter never leaves the
+        // engine unloaded (same semantics as the Voxtral load_enc_dec reload).
+        if let Some(dir) = lora_dir {
+            if let Err(e) = engine.load_lora(dir) {
+                eprintln!("Warning: Qwen LoRA reload failed ({}): {}", dir.display(), e);
+            }
+        }
+        *self.inner.blocking_lock() = Some(Arc::new(engine));
         Ok(())
+    }
+
+    /// Apply a LoRA adapter to the currently loaded engine. Sync — same calling
+    /// constraints as `reload_blocking`. No-op error if the engine is unloaded.
+    pub fn apply_lora_blocking(&self, adapter_dir: &Path) -> Result<()> {
+        match self.inner.blocking_lock().as_ref() {
+            Some(engine) => engine.load_lora(adapter_dir)
+                .map_err(|e| anyhow::anyhow!("Qwen LoRA load failed ({}): {}", adapter_dir.display(), e)),
+            None => anyhow::bail!("Qwen engine is unloaded (training in progress)"),
+        }
     }
 
     /// Clone out the engine handle, or None if unloaded (training in progress).

@@ -440,6 +440,15 @@ fn run() -> Result<()> {
                     let t_qwen = Instant::now();
                     let engine = qwen::QwenEngine::load(dir, device.clone())?;
                     println!("Qwen3-ASR loaded in {:.2}s", t_qwen.elapsed().as_secs_f64());
+                    // Apply the qwen LoRA adapter if configured (pre-tokio, so the
+                    // blocking lock inside is safe). Warn-and-continue like Voxtral.
+                    if let Some(ref adapter_dir) = merged.lora_adapter_qwen {
+                        println!("Applying Qwen LoRA adapter: {}", adapter_dir);
+                        match engine.apply_lora_blocking(Path::new(adapter_dir)) {
+                            Ok(())  => println!("Qwen LoRA adapter applied."),
+                            Err(e)  => eprintln!("Warning: {}", e),
+                        }
+                    }
                     Some(Arc::new(engine))
                 }
                 None => None,
@@ -1034,6 +1043,7 @@ mod server {
             bind_addr:    merged.bind_addr.value.clone(),
             tls_enabled,
             lora_adapter: merged.lora_adapter.clone(),
+            lora_adapter_qwen: merged.lora_adapter_qwen.clone(),
             venv_path:    merged.venv_path.clone(),
             data_dir:     merged.data_dir.to_string_lossy().into_owned(),
         };
@@ -1092,6 +1102,15 @@ mod server {
         let lora_path = Arc::new(tokio::sync::RwLock::new(
             snapshot.lora_adapter.as_ref().map(std::path::PathBuf::from)
         ));
+        // Only meaningful when the qwen engine is enabled; a configured
+        // lora_adapter_qwen without an engine must not report lora_active_qwen.
+        let qwen_lora_path = Arc::new(tokio::sync::RwLock::new(
+            if qwen.is_some() {
+                snapshot.lora_adapter_qwen.as_ref().map(std::path::PathBuf::from)
+            } else {
+                None
+            }
+        ));
 
         let state = Arc::new(AppState {
             model,
@@ -1107,6 +1126,7 @@ mod server {
             training_status,
             paths,
             lora_path,
+            qwen_lora_path,
             api_key,
             pair_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
@@ -1211,9 +1231,12 @@ mod server {
         abbrev:            Arc<tokio::sync::RwLock<AbbrevExpander>>,
         training_status:   Arc<tokio::sync::Mutex<TrainingStatus>>,
         paths:             crate::config::WorkspacePaths,
-        /// Currently active LoRA adapter path (None if no adapter loaded).
+        /// Currently active Voxtral LoRA adapter path (None if no adapter loaded).
         /// Updated by POST /lora/reload.
         lora_path:         Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
+        /// Currently active Qwen LoRA adapter path (adapters are per-model —
+        /// weight-key formats differ). Updated by POST /lora/reload?model=qwen.
+        qwen_lora_path:    Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
         /// API key required on every endpoint except GET /health.
         api_key:           String,
         /// Serialises training-file writes: pair upload + delete (so concurrent
@@ -1565,14 +1588,30 @@ mod server {
         // when re-enabled (active path if loaded, else the configured adapter,
         // else the default training output dir — so the toggle still works after
         // DELETE /lora cleared the active path).
+        // Per-model LoRA state (adapters are strictly per-model — key formats
+        // differ). `lora_dir_*` is the path the userscript "LoRA verwenden"
+        // toggle re-applies when re-enabled (active path if loaded, else the
+        // configured adapter, else the model's default training output dir —
+        // so the toggle still works after DELETE /lora cleared the active path).
         let active_lora = state.lora_path.read().await.clone();
         let lora_dir = active_lora.clone()
             .or_else(|| snap.lora_adapter.as_ref().map(std::path::PathBuf::from))
             .unwrap_or_else(|| state.paths.lora_output_dir.clone());
+        let active_lora_qwen = state.qwen_lora_path.read().await.clone();
+        let lora_dir_qwen = active_lora_qwen.clone()
+            .or_else(|| snap.lora_adapter_qwen.as_ref().map(std::path::PathBuf::from))
+            .unwrap_or_else(|| state.paths.lora_output_dir_qwen.clone());
+        // Available engines — the frontend hides qwen UI when "qwen" is absent.
+        let models: Vec<&str> = if state.qwen.is_some() {
+            vec!["voxtral", "qwen"]
+        } else {
+            vec!["voxtral"]
+        };
         Json(json!({
             "version":           env!("CARGO_PKG_VERSION"),
             // Backend identity — lets the shared userscript adapt its UI per engine.
             "server":            "voicetserver",
+            "models":            models,
             // Runtime-adjustable — live values from atomics
             "delay":             s.delay_tokens.load(Ordering::Relaxed),
             "silence_threshold": s.silence_threshold.load(Ordering::Relaxed),
@@ -1582,17 +1621,27 @@ mod server {
             "fuzzy_hotwords":    s.fuzzy_hotwords.load(Ordering::Relaxed),
             "fuzzy_max_ratio":   s.fuzzy_max_ratio.load(Ordering::Relaxed),
             "german_prime":      s.german_prime.load(Ordering::Relaxed),
+            "context_biasing":   s.context_biasing.load(Ordering::Relaxed),
             // Startup-only — from snapshot; changing via PATCH writes config file but requires restart
             "model_dir":         snap.model_dir,
+            "qwen_model_dir":    snap.qwen_model_dir,
+            "language":          snap.language,
             "device":            snap.device,
             "port":              snap.port,
             "bind_addr":         snap.bind_addr,
             "tls_enabled":       snap.tls_enabled,
             "lora_adapter":      snap.lora_adapter,
-            "lora_active":       active_lora.is_some(),
-            "lora_dir":          lora_dir.to_string_lossy(),
+            "lora_adapter_qwen": snap.lora_adapter_qwen,
+            // Per-model LoRA state; the unsuffixed pair stays as voxtral aliases
+            // during the frontend transition (phase 6).
+            "lora_active":          active_lora.is_some(),
+            "lora_dir":             lora_dir.to_string_lossy(),
+            "lora_active_voxtral":  active_lora.is_some(),
+            "lora_dir_voxtral":     lora_dir.to_string_lossy(),
+            "lora_active_qwen":     active_lora_qwen.is_some(),
+            "lora_dir_qwen":        lora_dir_qwen.to_string_lossy(),
             "venv_path":         snap.venv_path,
-            "_startup_only":     ["model_dir", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter", "venv_path"],
+            "_startup_only":     ["model_dir", "qwen_model_dir", "language", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter", "lora_adapter_qwen", "venv_path"],
             "_note":             "Changing startup_only fields writes to config file but requires server restart."
         }))
     }
@@ -1610,14 +1659,18 @@ mod server {
         fuzzy_hotwords:    Option<bool>,
         fuzzy_max_ratio:   Option<f32>,
         german_prime:      Option<bool>,
+        context_biasing:   Option<bool>,
         // Startup-only (written to file, restart required)
         model_dir:    Option<String>,
+        qwen_model_dir: Option<String>,
+        language:     Option<String>,
         device:       Option<usize>,
         port:         Option<u16>,
         bind_addr:    Option<String>,
         tls_cert:     Option<String>,
         tls_key:      Option<String>,
         lora_adapter: Option<String>,
+        lora_adapter_qwen: Option<String>,
         venv_path:    Option<String>,
     }
 
@@ -1663,6 +1716,7 @@ mod server {
         if let Some(v) = patch.fuzzy_hotwords    { s.fuzzy_hotwords.store(v, Ordering::SeqCst); }
         if let Some(v) = patch.fuzzy_max_ratio   { s.fuzzy_max_ratio.store(v, Ordering::SeqCst); }
         if let Some(v) = patch.german_prime      { s.german_prime.store(v, Ordering::SeqCst); }
+        if let Some(v) = patch.context_biasing   { s.context_biasing.store(v, Ordering::SeqCst); }
 
         // Update config file under lock and persist to disk
         {
@@ -1675,13 +1729,17 @@ mod server {
             if patch.fuzzy_hotwords.is_some()    { cfg.fuzzy_hotwords    = patch.fuzzy_hotwords; }
             if patch.fuzzy_max_ratio.is_some()   { cfg.fuzzy_max_ratio   = patch.fuzzy_max_ratio; }
             if patch.german_prime.is_some()      { cfg.german_prime      = patch.german_prime; }
+            if patch.context_biasing.is_some()   { cfg.context_biasing   = patch.context_biasing; }
             if patch.model_dir.is_some()         { cfg.model_dir         = patch.model_dir; }
+            if patch.qwen_model_dir.is_some()    { cfg.qwen_model_dir    = patch.qwen_model_dir; }
+            if patch.language.is_some()          { cfg.language          = patch.language; }
             if patch.device.is_some()            { cfg.device            = patch.device; }
             if patch.port.is_some()              { cfg.port              = patch.port; }
             if patch.bind_addr.is_some()         { cfg.bind_addr         = patch.bind_addr; }
             if patch.tls_cert.is_some()          { cfg.tls_cert          = patch.tls_cert; }
             if patch.tls_key.is_some()           { cfg.tls_key           = patch.tls_key; }
             if patch.lora_adapter.is_some()      { cfg.lora_adapter      = patch.lora_adapter; }
+            if patch.lora_adapter_qwen.is_some() { cfg.lora_adapter_qwen = patch.lora_adapter_qwen; }
             if patch.venv_path.is_some()         { cfg.venv_path         = patch.venv_path; }
 
             if let Err(e) = save_config_file(&cfg) {
@@ -2091,22 +2149,47 @@ mod server {
         Json(json!({ "deleted": true })).into_response()
     }
 
-    /// POST /training/run — spawn train_lora.py as a subprocess
-    async fn training_run_handler(State(state): State<Arc<AppState>>) -> Response {
+    /// POST /training/run?model=voxtral|qwen — spawn the model's trainer script as
+    /// a subprocess (default voxtral). The shared pairs pool trains both models'
+    /// LoRAs; the scripts and adapter output dirs are per-model.
+    async fn training_run_handler(
+        State(state): State<Arc<AppState>>,
+        Query(scope): Query<ModelQuery>,
+    ) -> Response {
         // Validate prerequisites before touching the status, so a failed validation
         // never leaves the status stuck on "running".
+        let train_qwen = scope.is_qwen();
 
-        // Locate train_lora.py: try cwd/tools/ then binary dir/tools/
-        let script = find_script("tools/train_lora.py");
+        // Locate the trainer: try cwd/tools/, binary dir/tools/, config dir/tools/.
+        // Voxtral falls back to the pre-phase-4 script name for existing installs.
+        let script = if train_qwen {
+            find_script("tools/train_lora_qwen.py")
+        } else {
+            find_script("tools/train_lora_voxtral.py")
+                .or_else(|| find_script("tools/train_lora.py"))
+        };
         let script = match script {
             Some(p) => p,
-            None => return (StatusCode::UNPROCESSABLE_ENTITY,
-                "tools/train_lora.py not found — run server from project root").into_response(),
+            None => return (StatusCode::UNPROCESSABLE_ENTITY, format!(
+                "tools/train_lora_{}.py not found — run server from project root",
+                if train_qwen { "qwen" } else { "voxtral" })).into_response(),
         };
 
         let data_dir   = state.paths.training_dir.clone();
-        let model_dir  = state.startup_snapshot.model_dir.clone();
-        let output_dir = state.paths.lora_output_dir.clone();
+        let model_dir  = if train_qwen {
+            match state.startup_snapshot.qwen_model_dir.clone() {
+                Some(d) => d,
+                None => return (StatusCode::UNPROCESSABLE_ENTITY,
+                    "Qwen engine not enabled — set qwen_model_dir in config.toml").into_response(),
+            }
+        } else {
+            state.startup_snapshot.model_dir.clone()
+        };
+        let output_dir = if train_qwen {
+            state.paths.lora_output_dir_qwen.clone()
+        } else {
+            state.paths.lora_output_dir.clone()
+        };
         let venv_path  = state.startup_snapshot.venv_path.clone();
 
         // Ensure training dir exists before passing it to Python
@@ -2125,12 +2208,18 @@ mod server {
             *ts = TrainingStatus { status: TrainingStatusKind::Running, log: vec![] };
         }
 
-        // Free the GPU for the training subprocess: drop the resident encoder+decoder
-        // (~8 GB) so a single 16 GB card can hold the training copy of the model. ASR
-        // sessions return a "training in progress" error until the model is reloaded.
+        // Free the GPU for the training subprocess: unload BOTH engines (simplest
+        // safe rule on a 16 GB card — the trainer needs its own copy of whichever
+        // model it trains). ASR sessions on either engine return a "training in
+        // progress" error until the engines are reloaded. Note: a qwen session
+        // already in flight keeps its Arc handle alive (its VRAM frees when the
+        // session ends); new sessions are blocked immediately.
         {
             let mut guard = state.model.inner.lock().await;
             *guard = None; // drop enc+dec → frees their VRAM
+        }
+        if let Some(qwen) = state.qwen.as_ref() {
+            *qwen.inner.lock().await = None; // drop the qwen engine (~1.5 GB)
         }
         // Return the freed pool memory to the OS so the separate training process sees it.
         // Drop frees into cudarc's stream-ordered pool; we must synchronize (let the async
@@ -2143,15 +2232,18 @@ mod server {
                 Ok(())
             }).await;
         }
-        eprintln!("Model unloaded from VRAM for training.");
+        eprintln!("Models unloaded from VRAM for training.");
 
         let training_status = Arc::clone(&state.training_status);
         let model           = Arc::clone(&state.model);
         let lora_path       = Arc::clone(&state.lora_path);
+        let qwen_engine     = state.qwen.clone();
+        let qwen_lora_path  = Arc::clone(&state.qwen_lora_path);
         tokio::spawn(async move {
             run_training_subprocess(training_status, script, data_dir, model_dir, output_dir, venv_path).await;
 
-            // Reload the model regardless of training outcome, re-applying the active LoRA.
+            // Reload both engines regardless of training outcome, re-applying each
+            // model's active LoRA.
             let lora = lora_path.read().await.clone();
             let m = Arc::clone(&model);
             let reloaded = tokio::task::spawn_blocking(move || {
@@ -2164,6 +2256,17 @@ mod server {
                 }
                 Ok(Err(e)) => eprintln!("ERROR: model reload after training failed: {e}"),
                 Err(e)     => eprintln!("ERROR: model reload task panicked: {e}"),
+            }
+            if let Some(qwen) = qwen_engine {
+                let lora = qwen_lora_path.read().await.clone();
+                let reloaded = tokio::task::spawn_blocking(move || {
+                    qwen.reload_blocking(lora.as_deref())
+                }).await;
+                match reloaded {
+                    Ok(Ok(()))  => eprintln!("Qwen engine reloaded into VRAM after training."),
+                    Ok(Err(e)) => eprintln!("ERROR: qwen reload after training failed: {e}"),
+                    Err(e)     => eprintln!("ERROR: qwen reload task panicked: {e}"),
+                }
             }
         });
 
@@ -2181,19 +2284,38 @@ mod server {
 
     // ---- LoRA hot-reload ----
 
-    /// POST /lora/reload — reload (or swap) the LoRA adapter without restarting.
+    /// `?model=` scope for the LoRA endpoints: "qwen" → qwen adapter,
+    /// anything else / absent → voxtral (same convention as the WS `?model=`).
+    #[derive(serde::Deserialize, Default)]
+    struct ModelQuery {
+        model: Option<String>,
+    }
+
+    impl ModelQuery {
+        fn is_qwen(&self) -> bool {
+            self.model.as_deref() == Some("qwen")
+        }
+    }
+
+    /// POST /lora/reload?model=voxtral|qwen — reload (or swap) a model's LoRA
+    /// adapter without restarting (default voxtral).
     ///
     /// Optional JSON body: `{"path": "/abs/path/to/adapter_dir"}`.
     /// If omitted, reloads from the currently active path.
     /// If the path does not contain adapter files, the LoRA is cleared (base model).
     async fn lora_reload_handler(
         State(state): State<Arc<AppState>>,
+        Query(scope): Query<ModelQuery>,
         body: Option<Json<serde_json::Value>>,
     ) -> impl IntoResponse {
         let requested = body.as_ref()
             .and_then(|b| b.get("path"))
             .and_then(|v| v.as_str())
             .map(std::path::PathBuf::from);
+
+        if scope.is_qwen() {
+            return qwen_lora_reload(&state, requested).await;
+        }
 
         let path = if let Some(p) = requested {
             p
@@ -2250,13 +2372,101 @@ mod server {
         }))).into_response()
     }
 
+    /// Qwen branch of POST /lora/reload (`?model=qwen`). Same response shape and
+    /// semantics as the voxtral branch: a path without adapter files clears the
+    /// LoRA; while the engine is unloaded for training the path is only recorded
+    /// and re-applied on the post-training reload.
+    async fn qwen_lora_reload(
+        state: &Arc<AppState>,
+        requested: Option<std::path::PathBuf>,
+    ) -> Response {
+        let Some(qwen) = state.qwen.as_ref() else {
+            return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "Qwen engine not enabled — set qwen_model_dir in config.toml"}))).into_response();
+        };
+
+        let path = if let Some(p) = requested {
+            p
+        } else {
+            match state.qwen_lora_path.read().await.clone() {
+                Some(p) => p,
+                None => return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "no lora path configured"}))).into_response(),
+            }
+        };
+
+        // Mirror the voxtral semantics: missing adapter files → clear to base model.
+        if !path.join("adapter_model.safetensors").exists() {
+            if let Some(engine) = qwen.get().await {
+                let result = tokio::task::spawn_blocking(move || engine.clear_lora()).await;
+                if let Ok(Err(e)) = result {
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()}))).into_response();
+                }
+            }
+            *state.qwen_lora_path.write().await = None;
+            eprintln!("Qwen LoRA hot-reload cleared: {}", path.display());
+            return (StatusCode::OK, Json(json!({
+                "status": "ok",
+                "action": "cleared",
+                "path":   path.to_string_lossy(),
+            }))).into_response();
+        }
+
+        match qwen.get().await {
+            Some(engine) => {
+                let p2 = path.clone();
+                let result = tokio::task::spawn_blocking(move || engine.load_lora(&p2)).await;
+                match result {
+                    Ok(Ok(()))  => {}
+                    Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()}))).into_response(),
+                    Err(e)     => return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()}))).into_response(),
+                }
+            }
+            // Engine is unloaded for training; the path recorded below is
+            // re-applied automatically when the engine reloads.
+            None => {}
+        }
+
+        *state.qwen_lora_path.write().await = Some(path.clone());
+        eprintln!("Qwen LoRA hot-reload applied: {}", path.display());
+        (StatusCode::OK, Json(json!({
+            "status": "ok",
+            "action": "applied",
+            "path":   path.to_string_lossy(),
+        }))).into_response()
+    }
+
     // ---- DELETE /lora ----
 
-    /// DELETE /lora — unload the active LoRA adapter in-memory (revert to base model)
-    /// without a restart. The adapter files on disk are left untouched. Useful to
-    /// recover quickly from a bad adapter. No-op (still 200) while the model is
-    /// unloaded for training; the cleared path means nothing is re-applied on reload.
-    async fn lora_clear_handler(State(state): State<Arc<AppState>>) -> Response {
+    /// DELETE /lora?model=voxtral|qwen — unload a model's active LoRA adapter
+    /// in-memory (revert to base model) without a restart (default voxtral). The
+    /// adapter files on disk are left untouched. Useful to recover quickly from a
+    /// bad adapter. No-op (still 200) while the model is unloaded for training;
+    /// the cleared path means nothing is re-applied on reload.
+    async fn lora_clear_handler(
+        State(state): State<Arc<AppState>>,
+        Query(scope): Query<ModelQuery>,
+    ) -> Response {
+        if scope.is_qwen() {
+            let Some(qwen) = state.qwen.as_ref() else {
+                return (StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({"error": "Qwen engine not enabled — set qwen_model_dir in config.toml"}))).into_response();
+            };
+            if let Some(engine) = qwen.get().await {
+                let result = tokio::task::spawn_blocking(move || engine.clear_lora()).await;
+                if let Ok(Err(e)) = result {
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()}))).into_response();
+                }
+            }
+            *state.qwen_lora_path.write().await = None;
+            eprintln!("Qwen LoRA cleared (reverted to base model).");
+            return Json(json!({ "status": "cleared" })).into_response();
+        }
+
         {
             let mut guard = state.model.inner.lock().await;
             if let Some(inner) = guard.as_mut() {

@@ -45,6 +45,8 @@ pub struct ConfigFile {
     pub tls_cert:     Option<String>,
     pub tls_key:      Option<String>,
     pub lora_adapter: Option<String>,
+    /// Qwen LoRA adapter directory (adapters are per-model — weight-key formats differ).
+    pub lora_adapter_qwen: Option<String>,
     pub venv_path:    Option<String>,
     pub data_dir:     Option<String>,
     /// Qwen3-ASR model directory. When unset the qwen engine is disabled and
@@ -91,6 +93,8 @@ pub struct MergedConfig {
     pub device:       usize,
     pub port:         u16,
     pub lora_adapter: Option<String>,
+    /// Qwen LoRA adapter directory (config file only, no CLI flag).
+    pub lora_adapter_qwen: Option<String>,
     pub venv_path:    Option<String>,
     /// Base directory for custom_words.txt, training/, lora_adapter/, training_sentences.txt.
     /// Defaults to config_dir() (~/.config/voicetserver/) when not set.
@@ -149,7 +153,8 @@ pub struct WorkspacePaths {
     pub training_audio_dir: PathBuf,  // {data_dir}/training/audio/
     pub training_pairs:     PathBuf,  // {data_dir}/training/pairs.jsonl
     pub training_sentences: PathBuf,  // {data_dir}/training_sentences.txt
-    pub lora_output_dir:    PathBuf,  // {data_dir}/lora_adapter/
+    pub lora_output_dir:    PathBuf,  // {data_dir}/lora_adapter/ (voxtral)
+    pub lora_output_dir_qwen: PathBuf, // {data_dir}/lora_adapter_qwen/
     pub edit_log:           PathBuf,  // {data_dir}/edit_log.jsonl
     pub review_dir:         PathBuf,  // {data_dir}/training/review/ (candidate WAVs)
     pub review_jsonl:       PathBuf,  // {data_dir}/training/review.jsonl
@@ -165,6 +170,7 @@ impl WorkspacePaths {
             training_pairs:     training.join("pairs.jsonl"),
             training_sentences: data_dir.join("training_sentences.txt"),
             lora_output_dir:    data_dir.join("lora_adapter"),
+            lora_output_dir_qwen: data_dir.join("lora_adapter_qwen"),
             edit_log:           data_dir.join("edit_log.jsonl"),
             review_dir:         training.join("review"),
             review_jsonl:       training.join("review.jsonl"),
@@ -178,7 +184,7 @@ impl WorkspacePaths {
 
 const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # All fields are optional — omit to use the compiled default.
-# Restart required for: model_dir, qwen_model_dir, language, device, port, bind_addr, tls_cert, tls_key, lora_adapter
+# Restart required for: model_dir, qwen_model_dir, language, device, port, bind_addr, tls_cert, tls_key, lora_adapter, lora_adapter_qwen
 # Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio, german_prime, context_biasing
 
 # model_dir = "/path/to/Voxtral-Mini-4B-Realtime"
@@ -191,6 +197,8 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # tls_key  = "/etc/tailscale/certs/host.key"
 # device = 0
 # venv_path = "/mnt/ssdupl/voicetserver-venv"   # Python venv for LoRA training
+# lora_adapter = "/path/to/lora_adapter"          # Voxtral LoRA adapter loaded at startup
+# lora_adapter_qwen = "/path/to/lora_adapter_qwen" # Qwen LoRA adapter (per-model — key formats differ)
 # data_dir = "/path/to/data"   # base for custom_words.txt, training/, lora_adapter/, training_sentences.txt
 #                               # defaults to ~/.config/voicetserver/ when unset
 
@@ -359,6 +367,8 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let (qwen_model_dir_val, qwen_model_dir_src) =
         merge_opt_str(&cli.qwen_model_dir, &file.qwen_model_dir);
     let lora_adapter = cli.lora_adapter.clone().or_else(|| file.lora_adapter.clone());
+    // Qwen adapter: config file only (no CLI flag), like fuzzy_hotwords.
+    let lora_adapter_qwen = file.lora_adapter_qwen.clone();
     let venv_path    = cli.venv_path.clone().or_else(|| file.venv_path.clone());
     let log_file      = cli.log_file.clone().or_else(|| file.log_file.clone());
     let log_keep_days = cli.log_keep_days.or(file.log_keep_days).unwrap_or(7);
@@ -376,6 +386,7 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         device,
         port,
         lora_adapter,
+        lora_adapter_qwen,
         venv_path,
         data_dir,
         delay,
