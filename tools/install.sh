@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installs voicetserver binary, LoRA venv, train_lora.py, and model files; writes config.toml.
+# Installs voicetserver binary, LoRA venv, trainer scripts, and model files
+# (Voxtral + optional Qwen3-ASR second engine); writes config.toml.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,6 +9,8 @@ CONFIG_FILE="$HOME/.config/voicetserver/config.toml"
 DEFAULT_VENV="$HOME/.local/share/voicetserver-venv"
 DEFAULT_MODEL_DIR="$HOME/models/Voxtral-Mini-4B-Realtime"
 HF_BASE="https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602/resolve/main"
+DEFAULT_QWEN_DIR="$HOME/models/Qwen3-ASR-0.6B"
+HF_QWEN_BASE="https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main"
 
 echo "=== voicetserver installer ==="
 echo ""
@@ -130,8 +133,8 @@ mkdir -p "$(dirname "$CONFIG_FILE")"
 if [[ ! -f "$CONFIG_FILE" ]]; then
     cat > "$CONFIG_FILE" <<TOML
 # voicetserver configuration
-# Restart required for: model_dir, device, port, bind_addr, tls_cert, tls_key, lora_adapter, venv_path
-# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema
+# Restart required for: model_dir, qwen_model_dir, language, device, port, bind_addr, tls_cert, tls_key, lora_adapter, lora_adapter_qwen, venv_path
+# Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio, german_prime, context_biasing
 
 bind_addr = "127.0.0.1"
 port = 8765
@@ -173,7 +176,7 @@ else
     fi
 fi
 
-# --- Model files ---
+# --- Voxtral model files ---
 echo ""
 
 # Read existing model_dir from config if present
@@ -238,6 +241,83 @@ if [[ -n "$MODEL_DIR" && ! -f "$MODEL_DIR/mel_filters.bin" ]]; then
         echo "Warning: assets/mel_filters.bin not found — copy or regenerate it manually:" >&2
         echo "  python3 scripts/generate_mel_filters.py $MODEL_DIR" >&2
     fi
+fi
+
+# --- Qwen3 model files (optional second engine) ---
+echo ""
+
+# Read existing qwen_model_dir from config if present (set_config_value uncomments
+# the templated "# qwen_model_dir = ..." line in place, so only match active keys)
+EXISTING_QWEN_DIR=""
+if grep -qE '^[[:space:]]*qwen_model_dir[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+    EXISTING_QWEN_DIR=$(grep -E '^[[:space:]]*qwen_model_dir[[:space:]]*=' "$CONFIG_FILE" \
+        | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+fi
+[[ -n "$EXISTING_QWEN_DIR" ]] && DEFAULT_QWEN_DIR="$EXISTING_QWEN_DIR"
+
+QWEN_DIR=""
+if [[ -n "$EXISTING_QWEN_DIR" && -f "$EXISTING_QWEN_DIR/model.safetensors" ]]; then
+    printf "Qwen3 model already at %s — keep this location? [Y/n]: " "$EXISTING_QWEN_DIR"
+    read -r KEEP_QWEN
+    if [[ "${KEEP_QWEN,,}" == "n" ]]; then
+        printf "New Qwen3 model directory [%s]: " "$EXISTING_QWEN_DIR"
+        read -r QWEN_DIR
+        QWEN_DIR="${QWEN_DIR:-$EXISTING_QWEN_DIR}"
+        set_config_value "qwen_model_dir" "$QWEN_DIR"
+        echo "qwen_model_dir updated to: $QWEN_DIR"
+        echo "Note: move model files from $EXISTING_QWEN_DIR to $QWEN_DIR, or re-download."
+    else
+        QWEN_DIR="$EXISTING_QWEN_DIR"
+    fi
+else
+    printf "Enable the Qwen3-ASR second engine (download ~1.8 GB)? [Y/n]: "
+    read -r QWEN_CHOICE
+    if [[ "${QWEN_CHOICE,,}" != "n" ]]; then
+        printf "Qwen3 model directory [%s]: " "$DEFAULT_QWEN_DIR"
+        read -r QWEN_DIR
+        QWEN_DIR="${QWEN_DIR:-$DEFAULT_QWEN_DIR}"
+        mkdir -p "$QWEN_DIR"
+        echo "Downloading Qwen3 model files to: $QWEN_DIR"
+        QWEN_FILES=(config.json tokenizer.json tokenizer_config.json vocab.json
+                    merges.txt preprocessor_config.json generation_config.json
+                    model.safetensors)
+        for f in "${QWEN_FILES[@]}"; do
+            if [[ -f "$QWEN_DIR/$f" ]]; then
+                echo "  $f — already present, skipping"
+            else
+                echo "  Downloading $f ..."
+                if ! wget -q --show-progress -O "$QWEN_DIR/$f" "$HF_QWEN_BASE/$f"; then
+                    rm -f "$QWEN_DIR/$f"
+                    echo "  Warning: $f not available from HuggingFace" >&2
+                fi
+            fi
+        done
+        set_config_value "qwen_model_dir" "$QWEN_DIR"
+        echo "qwen_model_dir set to: $QWEN_DIR"
+    else
+        echo "Skipped — qwen engine disabled (set qwen_model_dir in config.toml to enable later)."
+    fi
+fi
+
+# --- Generate tokenizer.json if missing ---
+# tokenizer.json is not published on HuggingFace; derive it from the tokenizer
+# config using transformers (installed into the venv on demand — the trainers
+# themselves only need the lighter `tokenizers` package).
+if [[ -n "$QWEN_DIR" && -f "$QWEN_DIR/model.safetensors" && ! -f "$QWEN_DIR/tokenizer.json" ]]; then
+    echo ""
+    echo "tokenizer.json not found — generating from tokenizer config ..."
+    if ! "$VENV_PATH/bin/python3" -c "import transformers" 2>/dev/null; then
+        echo "Installing transformers into the venv (needed once for tokenizer generation) ..."
+        TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir transformers
+    fi
+    QWEN_DIR="$QWEN_DIR" "$VENV_PATH/bin/python3" -c "
+import os
+model_dir = os.environ['QWEN_DIR']
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+tok.save_pretrained(model_dir)
+print('  tokenizer.json written to', model_dir)
+" || echo "  Warning: could not generate tokenizer.json — see CLAUDE.md for the manual command." >&2
 fi
 
 # --- Install voicetserver binary ---
@@ -440,7 +520,12 @@ echo "  Venv:     $VENV_PATH"
 echo "  Scripts:  ~/.config/voicetserver/tools/train_lora_{voxtral,qwen}.py"
 echo "  Config:   $CONFIG_FILE"
 [[ -n "$DATA_DIR"  ]] && echo "  Data:     $DATA_DIR"
-[[ -n "$MODEL_DIR" ]] && echo "  Models:   $MODEL_DIR"
+[[ -n "$MODEL_DIR" ]] && echo "  Voxtral:  $MODEL_DIR"
+if [[ -n "$QWEN_DIR" ]]; then
+    echo "  Qwen3:    $QWEN_DIR"
+else
+    echo "  Qwen3:    disabled (qwen_model_dir not set)"
+fi
 if [[ "$CERT_CONFIGURED" == true ]]; then
     echo "  TLS cert: $CERT_FILE"
     echo "  External: wss://${TS_HOST}:8765"

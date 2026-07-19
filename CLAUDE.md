@@ -1,3 +1,18 @@
+# voicetserver — unified two-engine ASR server
+
+One binary serving **both** ASR models on one port (8765), one TLS cert, one API key, one
+config file, one data dir:
+
+- **Voxtral Mini 4B Realtime** (~8 GB VRAM, BF16) — primary engine, always loaded.
+- **Qwen3-ASR-0.6B** (~1.5 GB VRAM) via vendored `qwen3-asr-rs` — optional second engine,
+  ported from the schmidiscribe project; enabled by setting `qwen_model_dir` in config
+  (unset = disabled, saves the VRAM).
+
+A WebSocket session picks its engine with `?model=voxtral|qwen` (default voxtral). Each
+engine has its own GPU lock, so sessions on different models run concurrently. Both engines
+share the training-pair pool, custom words, and the whole HTTP API; LoRA adapters are
+strictly per-model (different weight-key formats).
+
 # Build
 
 > **Dev server has CUDA installed** — always use the CUDA build command below.
@@ -70,14 +85,19 @@ git clone <repo> && cd voicetserver
 ```
 
 It: creates a Python venv (for LoRA training), installs torch (auto-detects the CUDA index
-tag) + `safetensors mistral-common numpy tqdm packaging`, deploys `train_lora.py` to
-`~/.config/voicetserver/tools/` (a `find_script()` fallback), downloads the model files
-(`tekken.json`, `consolidated.safetensors`) from `mistralai/Voxtral-Mini-4B-Realtime-2602`,
-copies `assets/mel_filters.bin` into the model dir (not on HuggingFace), installs the binary to
-`~/.local/bin/voicetserver` (prebuilt **gpu** from `tools/voicetserver-cuda`, prebuilt **cpu**
-if present, or **compile** from source), ensures `~/.local/bin` is on PATH, and provisions a
-Tailscale TLS cert + weekly systemd renewal timer. All choices have sensible defaults; existing
-model/venv/config are detected and skipped. Writes/updates `~/.config/voicetserver/config.toml`.
+tag) + `safetensors mistral-common tokenizers numpy tqdm packaging` (the union of both
+trainers' deps), deploys `train_lora_voxtral.py` + `train_lora_qwen.py` to
+`~/.config/voicetserver/tools/` (a `find_script()` fallback), downloads the Voxtral model
+files (`tekken.json`, `consolidated.safetensors`) from
+`mistralai/Voxtral-Mini-4B-Realtime-2602`, copies `assets/mel_filters.bin` into the model dir
+(not on HuggingFace), optionally downloads the **Qwen3-ASR-0.6B** files (~1.8 GB) from
+`Qwen/Qwen3-ASR-0.6B` and sets `qwen_model_dir` (declining leaves the qwen engine disabled;
+`tokenizer.json` is not on HuggingFace and is generated via `transformers` — installed into
+the venv on demand), installs the binary to `~/.local/bin/voicetserver` (prebuilt **gpu**
+from `tools/voicetserver-cuda`, prebuilt **cpu** if present, or **compile** from source),
+ensures `~/.local/bin` is on PATH, and provisions a Tailscale TLS cert + weekly systemd
+renewal timer. All choices have sensible defaults; existing model/venv/config are detected
+and skipped. Writes/updates `~/.config/voicetserver/config.toml`.
 
 # Test
 
@@ -87,11 +107,16 @@ model/venv/config are detected and skipped. Writes/updates `~/.config/voicetserv
 ./target/release/voicetserver --model-dir /path/to/Voxtral-Mini-4B-Realtime audio.wav
 ```
 
+Offline WAV mode is **Voxtral-only** — the qwen engine is server-mode only (use a WS
+session with `?model=qwen`, e.g. the userscript's Diktate re-transcribe button, for qwen
+A/B runs on the same audio).
+
 ## WebSocket server (dev, no TLS)
 
 ```bash
-./target/release/voicetserver --model-dir /path/to/Voxtral-Mini-4B-Realtime
-# Listens on ws://127.0.0.1:8765/asr
+./target/release/voicetserver --model-dir /path/to/Voxtral-Mini-4B-Realtime \
+  --qwen-model-dir /path/to/Qwen3-ASR-0.6B   # optional second engine
+# Listens on ws://127.0.0.1:8765/asr (?model=voxtral|qwen picks the engine)
 curl http://127.0.0.1:8765/health
 ```
 
@@ -123,16 +148,33 @@ CPU candle backend does not support BF16 matmul; using BF16 on CPU causes
 
 # Model files
 
-Required in `--model-dir`:
+## Voxtral (required, `--model-dir` / `model_dir`)
+
 - `consolidated.safetensors` (~8.9 GB) — model weights
 - `tekken.json` — tokenizer
 - `mel_filters.bin` — precomputed Slaney mel filterbank (128×201 f32 LE); copy from `assets/mel_filters.bin` or regenerate with `python3 scripts/generate_mel_filters.py <dir>`
 
 Download from HuggingFace: `mistralai/Voxtral-Mini-4B-Realtime-2602`
 
+## Qwen3-ASR (optional, `--qwen-model-dir` / `qwen_model_dir`)
+
+- `model.safetensors` (~1.8 GB) — Qwen3-ASR-0.6B weights
+- `config.json` — model config
+- `tokenizer.json` — **not published on HuggingFace**; `tools/install.sh` generates it via
+  `transformers` (`AutoTokenizer.from_pretrained(dir, trust_remote_code=True).save_pretrained(dir)`)
+
+Download from HuggingFace: `Qwen/Qwen3-ASR-0.6B`. When `qwen_model_dir` is unset the qwen
+engine is disabled — `/asr?model=qwen` sessions get an error frame and `GET /config` reports
+`"models":["voxtral"]`.
+
 ## Model language behaviour
 
-Voxtral Mini 4B Realtime has **no language token mechanism**. It auto-detects language from the audio signal. There is no way to force a specific language — the model will transcribe in whatever language it hears. Confirmed by inspecting `tekken.json` (no `added_tokens`) and the reference C implementation (antirez/voxtral.c).
+**Voxtral** Mini 4B Realtime has **no language token mechanism**. It auto-detects language from the audio signal. There is no way to force a specific language — the model will transcribe in whatever language it hears. Confirmed by inspecting `tekken.json` (no `added_tokens`) and the reference C implementation (antirez/voxtral.c).
+
+**Qwen3-ASR** *does* support forced language via a language token prepended to the assistant
+turn (handled inside `qwen3-asr-rs`'s `build_prompt()`). The server passes the configured
+`language` (config key, default `"German"`, startup-only) to every qwen session; a per-session
+`?lang=` query param overrides it. Voxtral sessions ignore both.
 
 ### Experimental German prefill priming (`german_prime`)
 
@@ -159,8 +201,10 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 
 # Architecture
 
-- `src/main.rs` — sync `fn main()` → forks/daemonizes before tokio starts → `tokio::runtime::Builder::block_on(server::run(…))`; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers; `api_key_auth` middleware (constant-time `ct_eq`) on a protected sub-router (`/health` is public); `pair_write_lock` serialises training-pair writes; detach/watchdog/PID/log helpers
-- `src/streaming.rs` — `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
+- `src/main.rs` — sync `fn main()` → forks/daemonizes before tokio starts → `tokio::runtime::Builder::block_on(server::run(…))`; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers (`handle_socket` dispatches on `?model=` to `handle_asr_session` (voxtral) or `handle_qwen_session`); `api_key_auth` middleware (constant-time `ct_eq`) on a protected sub-router (`/health` is public); `pair_write_lock` serialises training-pair writes; detach/watchdog/PID/log helpers
+- `src/streaming.rs` — Voxtral `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
+- `src/qwen.rs` — `QwenEngine`: wraps vendored `qwen3_asr::AsrInference` behind the same `Mutex<Option<…>>` unload pattern; inner value is `Arc<AsrInference>` so sessions clone the handle, release the lock, and let AsrInference's own internal mutex serialise GPU work
+- `src/qwen_streaming.rs` — qwen `StreamingState` (ported from schmidiscribe): SilenceDetector with `has_speech()` gate (suppresses hallucinated partials during silence), silence reset carrying the last 200 chars as initial_text
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
 - `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
 - `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`; `FuzzyMatcher`: Kölner-Phonetik + Levenshtein fuzzy snapping of transcribed words onto known plain-term hotwords; `AbbrevExpander`: German letter-name runs → acronym targets (Em Er I → MRI)
@@ -169,29 +213,36 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 - `src/session.rs` — Phase 2 stub (patient session vocabulary)
 - `src/macros.rs` — Phase 4 stub (macro expansion)
 - `candle-fork/` — vendored Candle ML framework; do not update without reason
+- `qwen3-asr-rs/` — vendored Qwen3-ASR inference library; its candle deps point at `../candle-fork/` paths so there is exactly one candle build / CUDA context
 
-GPU lock: single `tokio::sync::Mutex<Option<ModelInner>>` wrapping both enc and dec.
-Acquire → `guard.as_mut()` → do all sync Candle work → release before every `.await`.
-Disjoint field borrows (enc, dec) work through the `&mut ModelInner` from `as_mut()`.
+GPU locks — one per engine, so voxtral and qwen sessions run **concurrently**:
+- Voxtral: single `tokio::sync::Mutex<Option<ModelInner>>` wrapping both enc and dec.
+  Acquire → `guard.as_mut()` → do all sync Candle work → release before every `.await`.
+  Disjoint field borrows (enc, dec) work through the `&mut ModelInner` from `as_mut()`.
+- Qwen: `QwenEngine.inner` is only locked briefly to clone the `Arc<AsrInference>`;
+  inference runs in `spawn_blocking`, serialised by AsrInference's internal mutex.
 
-`inner` is `Option` so the encoder+decoder (~8 GB VRAM) can be **unloaded during LoRA
-training** (see below) and reloaded afterward. While `None`, ASR sessions return a
-"Server is training…" error (surfaced to the client as a `{"type":"error"}` frame).
-`load_enc_dec()` rebuilds enc+dec from `consolidated.safetensors` and re-applies the
+Both inners are `Option` so the engines can be **unloaded during LoRA training** (see
+below) and reloaded afterward. While `None`, ASR sessions return a "Server is training…"
+error (surfaced to the client as a `{"type":"error"}` frame). `load_enc_dec()` /
+`QwenEngine::reload_blocking()` rebuild the engines from disk and re-apply each model's
 active LoRA on reload.
 
 ## Auto-unload for training (single-GPU VRAM reuse)
 
-A 4B model needs ~8 GB resident; a second copy for `train_lora.py` does not fit on a 16 GB
-card. So `POST /training/run` **unloads** the model before spawning the trainer:
-1. `*model.inner.lock() = None` drops enc+dec → frees ~8 GB.
+Voxtral needs ~8 GB resident (+~1.5 GB qwen); a trainer's own copy of either model does not
+fit alongside them on a 16 GB card. So `POST /training/run` **unloads both engines** before
+spawning either trainer (simplest safe rule):
+1. `*model.inner.lock() = None` drops enc+dec (~8 GB); `*qwen.inner.lock() = None` drops the
+   qwen engine (~1.5 GB). A qwen session already in flight keeps its Arc alive until it ends;
+   new sessions are blocked immediately.
 2. `model.device.synchronize()` returns the freed CUDA pool memory to the OS so the separate
    Python process can allocate it (candle/cudarc use the stream-ordered allocator with the
    default release-threshold of 0, so a sync releases unused pool memory).
-3. After the subprocess exits (success or failure), a spawned task reloads the model via
-   `load_enc_dec()`, re-applying the LoRA path from `state.lora_path`.
+3. After the subprocess exits (success or failure), a spawned task reloads both engines,
+   re-applying each model's LoRA path (`state.lora_path` / `state.qwen_lora_path`).
 
-Transcription is unavailable for the duration of training + reload (model is re-read from
+Transcription is unavailable for the duration of training + reload (models are re-read from
 disk, ~10–30 s).
 
 # Config file
@@ -205,11 +256,11 @@ CLI args override config file values. Unknown fields in the config file are sile
 Printed prominently at startup when newly generated. Copy into the userscript Einstellungen tab.
 Not a CLI flag — set only via config file.
 
-Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`, `fuzzy_hotwords`, `fuzzy_max_ratio`, `german_prime`.
+Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`, `fuzzy_hotwords`, `fuzzy_max_ratio`, `german_prime`, `context_biasing`.
 
-Startup-only (require restart): `model_dir`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `data_dir`, `log_file`, `log_keep_days`.
+Startup-only (require restart): `model_dir`, `qwen_model_dir`, `language`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `lora_adapter_qwen`, `venv_path`, `data_dir`, `log_file`, `log_keep_days`.
 
-`data_dir` — base directory for `custom_words.txt`, `training/`, `lora_adapter/`, `training_sentences.txt`. Defaults to `~/.config/voicetserver/`. Config file and PID file always stay in `~/.config/voicetserver/` regardless of this setting.
+`data_dir` — base directory for `custom_words.txt`, `training/`, `lora_adapter/`, `lora_adapter_qwen/`, `training_sentences.txt`. Defaults to `~/.config/voicetserver/`. Config file and PID file always stay in `~/.config/voicetserver/` regardless of this setting.
 
 # Daemon mode / detach / log file
 
@@ -323,26 +374,32 @@ Request bodies are capped at **64 MB** via axum `DefaultBodyLimit` (review uploa
 dictations as f32 PCM: 64 KB/s → ~16 min head-room).
 
 - `GET /health` — `{"status":"ready","connections":N}` — **public, no auth required**
-- `GET /config` — current settings (runtime + startup snapshot); includes `data_dir` and
-  `"server":"voicetserver"` (backend identity — the shared userscript uses it and per-field
-  presence to adapt its UI; schmidiscribe reports `"server":"schmidiscribe"`). Also reports
-  `lora_active` (bool — is a LoRA currently applied in-memory) and `lora_dir` (the path the
+- `GET /config` — union of both engines' settings (runtime + startup snapshot); includes
+  `"server":"voicetserver"` (backend identity for the shared userscript) and
+  `"models":["voxtral","qwen"]` (or `["voxtral"]` when qwen is disabled — the frontend hides
+  qwen UI accordingly). Per-model LoRA state: `lora_active_voxtral`/`lora_active_qwen` (bool —
+  is a LoRA currently applied in-memory) and `lora_dir_voxtral`/`lora_dir_qwen` (the path the
   userscript "LoRA verwenden" toggle re-applies on enable: active path if loaded, else configured
-  `lora_adapter`, else the default training output dir — so the toggle still works after `DELETE /lora`)
-- `PATCH /config` — update settings; runtime params apply immediately, startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1].
+  `lora_adapter`/`lora_adapter_qwen`, else the model's default training output dir — so the
+  toggle still works after `DELETE /lora`). The unsuffixed `lora_active`/`lora_dir` remain as
+  voxtral aliases from the frontend transition.
+- `PATCH /config` — update settings (the union — includes `context_biasing`, `language`, `qwen_model_dir`, `lora_adapter_qwen`); runtime params apply immediately, startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1].
 - `GET /words` — `{"words":[...]}`
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
-- `POST /lora/reload` — hot-reload LoRA adapter without restart; optional JSON body `{"path":"..."}` to specify dir (omit to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
-- `DELETE /lora` — unload the active LoRA adapter in-memory (revert to base model) without restart; adapter files on disk are left untouched; clears `lora_path` so nothing is re-applied on the next training reload
-- `ws[s]://host:port/asr` — WebSocket audio stream (raw f32 LE PCM 16kHz mono). **Stop
-  protocol** (same as schmidiscribe, shared frontend): client sends text frame `"stop"` →
-  server **drains the decoder lookahead** (feeds `delay + 3` ticks of silence via
-  `StreamingState::drain_sync` — the decoder lags the audio by `delay` tokens, so without this
-  the last ~delay×80ms of speech would be truncated), then flushes the remaining text buffer as
-  a `{"type":"final"}` and closes; client waits for `ws.onclose` (2 s fallback) before
-  finalizing. Fallback: a plain client close triggers the same drain + flush, but the final may
-  be lost if the client is already gone. Unknown query params (`hotwords`, `patient` —
-  schmidiscribe biasing) are ignored.
+- `POST /lora/reload?model=voxtral|qwen` — hot-reload the model's LoRA adapter without restart (default voxtral; same for all `?model=` params below); optional JSON body `{"path":"..."}` to specify dir (omit to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
+- `DELETE /lora?model=voxtral|qwen` — unload the model's active LoRA adapter in-memory (revert to base model) without restart; adapter files on disk are left untouched; clears the model's lora path so nothing is re-applied on the next training reload
+- `ws[s]://host:port/asr?model=voxtral|qwen` — WebSocket audio stream (raw f32 LE PCM 16kHz
+  mono); `?model=` picks the engine (default voxtral; `?model=qwen` on a server without
+  `qwen_model_dir` gets an error frame). **Stop protocol** (identical on both engines):
+  client sends text frame `"stop"` → server drains the engine (Voxtral: feeds `delay + 3`
+  ticks of silence via `StreamingState::drain_sync` — the decoder lags the audio by `delay`
+  tokens, so without this the last ~delay×80ms of speech would be truncated; qwen:
+  `finish_streaming()`), then flushes the remaining text as a `{"type":"final"}` and closes;
+  client waits for `ws.onclose` (2 s fallback) before finalizing. Fallback: a plain client
+  close triggers the same drain + flush, but the final may be lost if the client is already
+  gone. Qwen sessions also honour `?hotwords=` + `?patient=` (system-prompt biasing together
+  with the custom_words plain terms, gated by the runtime `context_biasing` toggle) and
+  `?lang=` (overrides the configured `language`); Voxtral sessions ignore all three.
 
 ### Training (Phase 2 — LoRA voice calibration)
 
@@ -361,7 +418,7 @@ dictations as f32 PCM: 64 KB/s → ~16 min head-room).
 - `DELETE /training/pairs` — remove all collected training data
 
 **LoRA:**
-- `POST /training/run` — unloads the model from VRAM (frees ~8 GB for the trainer), then spawns `tools/train_lora.py`; 202 if started, 409 if already running. Model is reloaded automatically when training finishes. ASR requests error with "Server is training…" until reload.
+- `POST /training/run?model=voxtral|qwen` — unloads **both** engines from VRAM (frees ~9.5 GB for the trainer), then spawns the model's trainer script (`tools/train_lora_voxtral.py` / `tools/train_lora_qwen.py`; voxtral falls back to the legacy `train_lora.py` name for old installs); 202 if started, 409 if already running (one `training_status` — only one training at a time regardless of model). The shared pairs pool trains both models' LoRAs. Both engines are reloaded automatically when training finishes; ASR requests on either engine error with "Server is training…" until then.
 - `GET /training/status` — `{"status":"idle"|"running"|"done"|"error","log":[...]}`
 
 **Dictation review (real dictations as training-pair candidates):** read-aloud calibration
@@ -381,10 +438,18 @@ invisible to the trainer until accepted.
 - `POST /log/edit` — `{"original","edited","timestamp"}` — appended to `edit_log.jsonl` by the userscript when a commit-mode dictation is edited before insertion
 - `GET /edits/report` — `{"entries":N,"suggestions":[{"original","edited","count"},…]}` — aggregates the edit log into the most frequent word-level corrections (LCS word diff per entry, changed runs ≤4 words paired as removed→inserted, punctuation-only changes skipped, top 30 by count). Direct candidates for custom_words `wrong=correct` entries; surfaced by the userscript's "💡 Vorschläge aus Korrekturen" button in the Eigene Wörter tab.
 
-Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl`.
-LoRA adapter output: `~/.config/voicetserver/lora_adapter/` (set `lora_adapter` in config to load at startup).
+Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl` (one
+pool — it trains both models' LoRAs). Adapter output is per-model:
+`~/.config/voicetserver/lora_adapter/` (voxtral) and `lora_adapter_qwen/` (qwen); set
+`lora_adapter` / `lora_adapter_qwen` in config to load at startup.
 
-Python venv install (run once — put venv on a large partition if root fs is tight):
+`tools/import_pairs.py` — one-time importer that appends another server's collected pairs
+(e.g. schmidiscribe's `~/.config/schmidiscribe/training/`) into the pool, re-IDing via the
+normal `max(id)+1` path. Run with voicetserver stopped (the `pair_write_lock` is in-process
+only); source WAVs are copied, not moved.
+
+Python venv install (run once — put venv on a large partition if root fs is tight; the dep
+list is the union of both trainers' requirements):
 ```bash
 VENV=/path/to/venv          # e.g. /mnt/ssdupl/voicetserver-venv
 python3 -m venv $VENV
@@ -392,22 +457,24 @@ mkdir -p $VENV/tempdir
 # torch must come from the PyTorch CUDA index (replace cu128 with your CUDA version)
 TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir \
   torch --index-url https://download.pytorch.org/whl/cu128
-# remaining deps from PyPI
+# remaining deps from PyPI (mistral-common: voxtral trainer; tokenizers: qwen trainer)
 TMPDIR=$VENV/tempdir $VENV/bin/pip install --no-cache-dir \
-  safetensors mistral-common numpy tqdm packaging
+  safetensors mistral-common tokenizers numpy tqdm packaging
 ```
-Deploy training script next to the binary:
+Deploy training scripts next to the binary:
 ```bash
-mkdir -p ~/.local/bin/tools && cp tools/train_lora.py ~/.local/bin/tools/
+mkdir -p ~/.local/bin/tools && cp tools/train_lora_voxtral.py tools/train_lora_qwen.py ~/.local/bin/tools/
 ```
 Then set `venv_path = "/path/to/venv"` in `~/.config/voicetserver/config.toml`.
 
 ### LoRA adapter
 
-`src/lora.rs` — loads `adapter_model.safetensors` + `adapter_config.json` from the adapter dir.
-Applied as runtime delta: `proj_output += scale * lora_b @ lora_a @ input` (no weight merging).
-Weight key format: `layers.{i}.attention.{wq,wk,wv,wo}.lora_{a,b}.weight`.
-Scale = `lora_alpha / r` from `adapter_config.json`.
+Both runtimes load `adapter_model.safetensors` + `adapter_config.json` from the adapter dir
+and apply the delta at runtime: `proj_output += scale * lora_b @ lora_a @ input` (no weight
+merging). Scale = `lora_alpha / r` from `adapter_config.json`. Weight-key formats **differ
+per model**, so adapters are strictly per-model:
+- Voxtral (`src/lora.rs`): `layers.{i}.attention.{wq,wk,wv,wo}.lora_{a,b}.weight`
+- Qwen (`qwen3-asr-rs`): `q_proj`/`v_proj` attention keys (see `tools/train_lora_qwen.py`)
 
 # Browser client
 
@@ -415,24 +482,26 @@ Scale = `lora_alpha / r` from `adapter_config.json`.
 Sends raw 16kHz mono f32 LE PCM over WebSocket binary frames.
 Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}` / `{"type":"error","text":"..."}`.
 
-**Unified dual-backend frontend** (v0.1.14+): this one userscript drives both **voicetserver**
-(Voxtral, port 8765) and **schmidiscribe** (Qwen3-ASR, port 8767) and replaces schmidiscribe's
-`schmididict.user.js` (disable that one to avoid duplicate mic buttons). A "Server:
-[Voxtral][Qwen3]" switcher sits above the tab bar and switches instantly (no save needed;
-blocked while recording). Server URL + API key are stored **per backend**
-(`server_url_voxtral`/`server_url_qwen`, `api_key_voxtral`/`api_key_qwen`, `active_backend`);
-legacy single-key `server_url`/`api_key` values act as the Voxtral profile's fallback. Hotkey +
-commit mode stay global. The Einstellungen tab adapts to whatever `GET /config` reports:
-`delay` + `german_prime` rows appear only for voicetserver, `context_biasing` only for
-schmidiscribe (saving sends only fields the connected backend reported).
+**Unified frontend** (v0.1.16+): one userscript, one server, one URL + API key. The
+"Server: [Voxtral][Qwen3]" switcher above the tab bar only selects which **engine** a
+session uses (GM value `active_model` → `?model=` on the WS URL); it switches instantly (no
+save needed; blocked while recording). Storage keys are the dual-backend era's Voxtral
+profile keys (`server_url_voxtral`/`api_key_voxtral`, falling back to the pre-profile
+`server_url`/`api_key`; `active_backend` seeds `active_model`), so both upgrade and rollback
+keep working; the qwen profile keys stay dormant. The Einstellungen tab is a single pane
+driven by the union `GET /config`: qwen rows (`context_biasing`, language) are hidden when
+the server's `models` list lacks `"qwen"`, `delay`/`german_prime` rows appear only when the
+server reports those fields — so the script still degrades gracefully against an old
+single-model server. It replaced schmidiscribe's `schmididict.user.js` (disable that one to
+avoid duplicate mic buttons).
 
-WebSocket sessions send `?api_key=` plus `?hotwords=` (Hotwords tab, GM-stored) and
-`?patient=` (read from `#schmidi-pat-info-patientendaten` if the host page has it) — used by
-schmidiscribe's prompt biasing, ignored by voicetserver. Stopping sends the text frame `"stop"`
-and waits for the server's final flush + close (2 s fallback) — both servers implement the same
-protocol. All audio paths (ASR, Aufnehmen, 2. Durchgang) route the ScriptProcessor through a
-zero-gain GainNode instead of connecting to `destination` directly — a direct connection plays
-the mic through the speakers and browser AEC then cancels the speech it hears back.
+WebSocket sessions send `?api_key=` and `?model=` plus `?hotwords=` (Hotwords tab, GM-stored)
+and `?patient=` (read from `#schmidi-pat-info-patientendaten` if the host page has it) — used
+by the qwen engine's prompt biasing, ignored on Voxtral sessions. Stopping sends the text
+frame `"stop"` and waits for the server's final flush + close (2 s fallback). All audio paths
+(ASR, Aufnehmen, 2. Durchgang) route the ScriptProcessor through a zero-gain GainNode instead
+of connecting to `destination` directly — a direct connection plays the mic through the
+speakers and browser AEC then cancels the speech it hears back.
 
 All HTTP requests go through `authFetch()`, which injects `X-Api-Key: <stored key>` on every call
 (browsers cannot send headers on the WS upgrade, hence the query param there).
@@ -447,7 +516,7 @@ Korrekturen" from `GET /edits/report`), **Hotwords** (client-side GM-stored list
 via `?hotwords=`; biasing only on Qwen3), **Aufnehmen** (record calibration sentences),
 **2. Durchgang** (record once-recorded sentences — `pair_ids.length === 1` — a second time),
 **Training** (review pairs, delete, LoRA), **Diktate** (real-dictation review, below),
-**Einstellungen** (backend profile URL/key, hotkey, runtime params).
+**Einstellungen** (server URL/key, hotkey, runtime params).
 
 **Audio capture (all paths — ASR, Aufnehmen, 2. Durchgang):** `createCaptureContext()` requests
 an `AudioContext({ sampleRate: 16000 })` so the **browser** resamples the mic stream with proper
@@ -461,13 +530,13 @@ transcript — the edited overlay text in commit mode). Saving (overlay 💾 but
 or "💾 Letztes Diktat speichern" in the tab) POSTs it to `/training/review`. The tab lists all
 candidates with ▶ playback and ✕ delete; selecting one opens a detail area with an editable
 transcript, "↻ Voxtral" / "↻ Qwen3" re-transcription (fetches the stored WAV, parses PCM16
-client-side, replays it through the chosen backend's normal WS session — `transcribePcm()`,
-works because both servers speak the same protocol), and "✓ Als Trainingspaar übernehmen" →
+client-side, replays it through a normal WS session with the chosen `?model=` —
+`transcribePcm()`), and "✓ Als Trainingspaar übernehmen" →
 `POST /training/review/{id}/accept` with the corrected text.
 
 **Aufnehmen tab:** shows only unrecorded sentences (recorded ones are hidden). Navigate ◀/▶, edit/add/remove sentences inline, record via ScriptProcessor (raw f32 LE PCM, same as ASR path), preview recording client-side before saving (Web Audio API, no server round-trip), save to commit pair.
 
-**Paare tab:** scrollable list of all recorded pairs (id, text, duration) with per-pair ▶ playback and ✕ delete. LoRA training run + status log. **LoRA verwenden** checkbox: checked → load adapter (`POST /lora/reload` with `lora_dir` from `GET /config`), unchecked → unload (`DELETE /lora`); reflects `lora_active` on tab open. Lets you A/B the adapter against the base model live (useful when an adapter trained on read-aloud audio hurts free-speech accuracy).
+**Paare tab:** scrollable list of all recorded pairs (id, text, duration) with per-pair ▶ playback and ✕ delete. LoRA training run + status log (the train/reload buttons act on the currently selected model — `?model=` on `POST /training/run`). **LoRA verwenden** is one checkbox **per model**: checked → load that model's adapter (`POST /lora/reload?model=` with `lora_dir_<model>` from `GET /config`), unchecked → unload (`DELETE /lora?model=`); reflects `lora_active_voxtral`/`_qwen` on tab open (qwen row hidden when the server reports no qwen state). Lets you A/B each adapter against its base model live (useful when an adapter trained on read-aloud audio hurts free-speech accuracy).
 
 ## WebSocket reconnect / mic lifecycle
 
@@ -493,11 +562,23 @@ Custom word correction is applied to the text returned by `take_text_buf()` befo
 - `assets/mel_filters.bin` — precomputed mel filterbank (commit this)
 - `config/medical_terms_de.txt` — German medical seed terms (source list; not auto-loaded — add entries to `~/.config/voicetserver/custom_words.txt`)
 - `docs/ubuntu_dependencies.md` — package list by phase
+- `docs/unified_server_migration_plan.md` — the plan that produced the two-engine server
 - `scripts/generate_mel_filters.py` — mel filterbank generator (pure Python, no deps)
 - `schmidispeech.user.js` — browser userscript
 - `candle-fork/` — vendored Candle
+- `qwen3-asr-rs/` — vendored Qwen3-ASR inference library (candle deps repointed at `candle-fork/`)
+- `tools/` — installer, prebuilt CUDA binary, trainer scripts (`train_lora_voxtral.py`, `train_lora_qwen.py`), `import_pairs.py`
 - `README.private.md` — private deploy notes (gitignored)
 - `releases/` — local versioned binary copies (gitignored)
+
+# Predecessor projects (deprecation)
+
+The qwen engine was ported from **schmidiscribe** (standalone Qwen3-ASR server, port 8767).
+After the unified server has burned in on production: stop/disable the schmidiscribe service,
+archive its repo with a pointer here, and optionally import its training pairs via
+`tools/import_pairs.py` first. The **schreibot** repo (failed whisper test) is unrelated and
+gets nuked independently. Until then schmidiscribe remains deployable standalone; the
+userscript degrades gracefully against it (field-presence gating in `GET /config`).
 
 # Versioning
 

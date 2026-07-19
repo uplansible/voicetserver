@@ -1,7 +1,8 @@
 # Unified server migration plan — one server, both models (Voxtral + Qwen3-ASR)
 
-Status: **planned, not started**. Written 2026-07-18. Baseline commits: voicetserver
-`ac9140c` (v0.1.22), schmidiscribe `5d9fbf9` (v0.1.17) — both pushed to `main`.
+Status: **phases 1–7 implemented** on the `unified` branch (production burn-in +
+schmidiscribe retirement pending, see phase 7 step 3). Written 2026-07-18. Baseline commits:
+voicetserver `ac9140c` (v0.1.22), schmidiscribe `5d9fbf9` (v0.1.17) — both pushed to `main`.
 
 ## Decision: where the merged code lives
 
