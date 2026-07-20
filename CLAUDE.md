@@ -8,7 +8,9 @@ config file, one data dir:
   ported from the schmidiscribe project; enabled by setting `qwen_model_dir` in config
   (unset = disabled, saves the VRAM).
 
-A WebSocket session picks its engine with `?model=voxtral|qwen` (default voxtral). Each
+A WebSocket session picks its engine with `?model=voxtral|qwen` (absent/empty = voxtral). The
+value is validated everywhere `?model=` is accepted — an unrecognised one is a 400 (HTTP) or an
+error frame (WS), never a silent fall-back to voxtral. Each
 engine has its own GPU lock, so sessions on different models run concurrently. Both engines
 share the training-pair pool, custom words, and the whole HTTP API; LoRA adapters are
 strictly per-model (different weight-key formats).
@@ -258,6 +260,11 @@ Not a CLI flag — set only via config file.
 
 Runtime-adjustable via `PATCH /config` (no restart needed): `delay`, `silence_threshold`, `silence_flush`, `min_speech`, `rms_ema`, `fuzzy_hotwords`, `fuzzy_max_ratio`, `german_prime`, `context_biasing`.
 
+`delay` is **next-session**, not mid-session: `StreamingState` fixes prefill, KV sizing and the
+drain length at construction, so an open session keeps its original value (the silence detector
+reads the session's captured `delay_tokens`, not the live atomic — otherwise finalization timing
+desyncs from the actual decoder lag). New sessions pick the new value up immediately.
+
 Startup-only (require restart): `model_dir`, `qwen_model_dir`, `language`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `lora_adapter_qwen`, `venv_path`, `data_dir`, `log_file`, `log_keep_days`.
 
 `data_dir` — base directory for `custom_words.txt`, `training/`, `lora_adapter/`, `lora_adapter_qwen/`, `training_sentences.txt`. Defaults to `~/.config/voicetserver/`. Config file and PID file always stay in `~/.config/voicetserver/` regardless of this setting.
@@ -373,7 +380,10 @@ set only via config file.
 Request bodies are capped at **64 MB** via axum `DefaultBodyLimit` (review uploads are whole
 dictations as f32 PCM: 64 KB/s → ~16 min head-room).
 
-- `GET /health` — `{"status":"ready","connections":N}` — **public, no auth required**
+- `GET /health` — `{"status":"ready"|"loading","connections":N}` — **public, no auth required**.
+  `"loading"` covers startup model loading *and* the whole training window (engines unloaded →
+  trainer → reload), so a monitor can tell when ASR sessions would error. A failed reload after
+  training keeps it at `"loading"`.
 - `GET /config` — union of both engines' settings (runtime + startup snapshot); includes
   `"server":"voicetserver"` (backend identity for the shared userscript) and
   `"models":["voxtral","qwen"]` (or `["voxtral"]` when qwen is disabled — the frontend hides
@@ -383,10 +393,10 @@ dictations as f32 PCM: 64 KB/s → ~16 min head-room).
   `lora_adapter`/`lora_adapter_qwen`, else the model's default training output dir — so the
   toggle still works after `DELETE /lora`). The unsuffixed `lora_active`/`lora_dir` remain as
   voxtral aliases from the frontend transition.
-- `PATCH /config` — update settings (the union — includes `context_biasing`, `language`, `qwen_model_dir`, `lora_adapter_qwen`); runtime params apply immediately, startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1].
+- `PATCH /config` — update settings (the union — includes `context_biasing`, `language`, `qwen_model_dir`, `lora_adapter_qwen`); runtime params apply immediately (except `delay`, see above), startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `silence_threshold` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1]; `silence_flush` ∈ [1,250]; `min_speech` ∈ [1,250] (`silence_flush = 0` would silently disable silence-triggered finals).
 - `GET /words` — `{"words":[...]}`
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
-- `POST /lora/reload?model=voxtral|qwen` — hot-reload the model's LoRA adapter without restart (default voxtral; same for all `?model=` params below); optional JSON body `{"path":"..."}` to specify dir (omit to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
+- `POST /lora/reload?model=voxtral|qwen` — hot-reload the model's LoRA adapter without restart (default voxtral; same for all `?model=` params below); optional JSON body `{"path":"..."}` to specify dir (omit the body entirely — not just the field — to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
 - `DELETE /lora?model=voxtral|qwen` — unload the model's active LoRA adapter in-memory (revert to base model) without restart; adapter files on disk are left untouched; clears the model's lora path so nothing is re-applied on the next training reload
 - `ws[s]://host:port/asr?model=voxtral|qwen` — WebSocket audio stream (raw f32 LE PCM 16kHz
   mono); `?model=` picks the engine (default voxtral; `?model=qwen` on a server without
@@ -413,9 +423,13 @@ dictations as f32 PCM: 64 KB/s → ~16 min head-room).
 - `POST /training/pair?text=<url-encoded>` — body: raw f32 LE PCM at 16kHz (always; MediaRecorder path dropped — container bytes caused static); saves 16-bit WAV + appends to `pairs.jsonl`; returns `{"id","duration_s","count"}`. ID is `max(existing_ids)+1` (not line count) so deletions never cause collisions. Upload + delete are serialised via a `pair_write_lock` mutex so concurrent requests can't collide on an ID or rewrite the JSONL mid-append.
 - `GET /training/pairs` — `{"pairs":[{"id","text","duration_s"}]}` sorted by id
 - `GET /training/audio/{id}` — serve recorded WAV for playback (numeric id only)
-- `DELETE /training/pair/{id}` — remove WAV file + JSONL entry
+- `DELETE /training/pair/{id}` — remove WAV file + JSONL entry. A missing WAV does not abort the
+  delete (the JSONL entry is removed either way, so a lost recording can't leave an undeletable
+  entry that breaks the trainer); 404 only when neither existed.
 - `GET /training` — `{"count":N,"duration_sec":F}` summary
-- `DELETE /training/pairs` — remove all collected training data
+- `DELETE /training` — remove all collected training **pairs** (`training/audio/` + `pairs.jsonl`).
+  Dictation-review candidates (`training/review/` + `review.jsonl`) live under the same training
+  dir but are deliberately **kept** — they are a separate, unaccepted pool.
 
 **LoRA:**
 - `POST /training/run?model=voxtral|qwen` — unloads **both** engines from VRAM (frees ~9.5 GB for the trainer), then spawns the model's trainer script (`tools/train_lora_voxtral.py` / `tools/train_lora_qwen.py`; voxtral falls back to the legacy `train_lora.py` name for old installs); 202 if started, 409 if already running (one `training_status` — only one training at a time regardless of model). The shared pairs pool trains both models' LoRAs. Both engines are reloaded automatically when training finishes; ASR requests on either engine error with "Server is training…" until then.

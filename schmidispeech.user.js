@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.16
+// @version      0.1.18
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -263,11 +263,12 @@
 
     async function addWordPair(wrong, correct) {
         try {
-            await authFetch(`${getHttpBase()}/words`, {
+            const res = await authFetch(`${getHttpBase()}/words`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ add: [`${wrong}=${correct}`], remove: [] }),
             });
+            if (!res.ok) throw new Error(await res.text());
             const current = overlayTextDiv.textContent;
             if (current.includes(wrong)) {
                 const updated = current.split(wrong).join(correct);
@@ -591,7 +592,18 @@
     // ---- Model switching ----
     let currentTab = "einstellungen";
 
+    // If the stored model is not among the server's loaded engines (e.g. qwen
+    // saved from another server, engine since disabled), fall back to voxtral —
+    // otherwise the switcher button is greyed out while every session still goes
+    // to the unavailable engine and errors.
+    function ensureModelAvailable() {
+        if (!lastCfg.models || lastCfg.models.includes(activeModel())) return;
+        GM_setValue("active_model", "voxtral");
+        updateBtnTitle();
+    }
+
     function styleModelButtons() {
+        ensureModelAvailable();
         const active = activeModel();
         // "qwen" may be absent from the server's models list (engine disabled) —
         // gray the button out then. Unknown until the first GET /config; a
@@ -1457,6 +1469,7 @@
                 qwenBox.checked = !!cfg.lora_active_qwen;
                 qwenBox.dataset.loraDir = cfg.lora_dir_qwen || '';
             }
+            styleModelButtons();
             updateTrainButtonLabel();
         } catch (_) { /* leave checkboxes as-is on error */ }
     }
@@ -1470,8 +1483,24 @@
         if (relBtn) relBtn.textContent = `↺ LoRA neu laden (${label})`;
     }
 
+    // Audio elements fed from an object URL: keep the URL on the element so it
+    // can be revoked whenever playback ends *or* is cut short (switching rows,
+    // re-rendering the list) — revoking only on 'ended' leaked the whole WAV.
+    function blobAudio(blobUrl) {
+        const audio = new Audio(blobUrl);
+        audio.dataset.blobUrl = blobUrl;
+        audio.addEventListener('ended', () => revokeAudioUrl(audio), { once: true });
+        return audio;
+    }
+    function revokeAudioUrl(audio) {
+        if (audio && audio.dataset.blobUrl) {
+            URL.revokeObjectURL(audio.dataset.blobUrl);
+            delete audio.dataset.blobUrl;
+        }
+    }
+
     function renderPairsList() {
-        if (paaresCurrentAudio) { paaresCurrentAudio.pause(); paaresCurrentAudio.src = ''; paaresCurrentAudio = null; paaresCurrentPlayId = null; }
+        if (paaresCurrentAudio) { paaresCurrentAudio.pause(); revokeAudioUrl(paaresCurrentAudio); paaresCurrentAudio.src = ''; paaresCurrentAudio = null; paaresCurrentPlayId = null; }
         const listEl  = configPanel.querySelector('#schmidi-pairs-list');
         const countEl = configPanel.querySelector('#schmidi-training-count');
         if (!listEl) return;
@@ -1503,6 +1532,7 @@
                 const id = playBtn.dataset.id;
                 if (paaresCurrentAudio) {
                     paaresCurrentAudio.pause();
+                    revokeAudioUrl(paaresCurrentAudio);
                     paaresCurrentAudio.src = '';
                     const prevBtn = listEl.querySelector(`.sp-play[data-id="${paaresCurrentPlayId}"]`);
                     if (prevBtn) prevBtn.textContent = '▶';
@@ -1517,9 +1547,7 @@
                 try {
                     const res = await authFetch(`${getHttpBase()}/training/audio/${id}`);
                     if (!res.ok) throw new Error(await res.text());
-                    const blobUrl = URL.createObjectURL(await res.blob());
-                    audio = new Audio(blobUrl);
-                    audio.addEventListener('ended', () => URL.revokeObjectURL(blobUrl), { once: true });
+                    audio = blobAudio(URL.createObjectURL(await res.blob()));
                 } catch (err) {
                     setPaareStatus('Wiedergabe: ' + err.message, true);
                     return;
@@ -1528,6 +1556,7 @@
                 paaresCurrentPlayId = id;
                 playBtn.textContent = '⏹';
                 audio.play().catch(err => {
+                    revokeAudioUrl(audio);
                     paaresCurrentAudio  = null;
                     paaresCurrentPlayId = null;
                     playBtn.textContent = '▶';
@@ -1570,10 +1599,16 @@
             const dir = box.dataset.loraDir || '';
             setPaareStatus(`Lade LoRA (${label})…`, false);
             try {
+                // Only declare a JSON body when there is one — sending
+                // Content-Type: application/json with an empty body is what
+                // the "reload current path" call used to do, and the server
+                // rejected it.
                 const res  = await authFetch(`${getHttpBase()}/lora/reload?model=${model}`, {
                     method:  'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body:    dir ? JSON.stringify({ path: dir }) : undefined,
+                    ...(dir ? {
+                        headers: { 'Content-Type': 'application/json' },
+                        body:    JSON.stringify({ path: dir }),
+                    } : {}),
                 });
                 // Error bodies may be plain text, so parse defensively instead
                 // of assuming JSON.
@@ -1702,7 +1737,7 @@
 
     function renderReviewList() {
         if (reviewCurrentAudio) {
-            reviewCurrentAudio.pause(); reviewCurrentAudio.src = '';
+            reviewCurrentAudio.pause(); revokeAudioUrl(reviewCurrentAudio); reviewCurrentAudio.src = '';
             reviewCurrentAudio = null; reviewCurrentPlayId = null;
         }
         const listEl = configPanel.querySelector('#schmidi-dikt-list');
@@ -1736,10 +1771,14 @@
         };
     }
 
-    function selectReview(id) {
+    // `id` may come from a dataset attribute (string) while reviewItems carry
+    // numeric JSON ids — normalise, otherwise every strict compare below (and
+    // the selection check in renderReviewList) silently fails.
+    function selectReview(rawId) {
+        const id = Number(rawId);
         reviewSelectedId = id;
         configPanel.querySelectorAll('.sp-dikt-row').forEach(r => {
-            r.style.background = r.dataset.id === id ? '#26364a' : '';
+            r.style.background = Number(r.dataset.id) === id ? '#26364a' : '';
         });
         const item = reviewItems.find(r => r.id === id);
         const ta   = configPanel.querySelector('#schmidi-dikt-text');
@@ -1754,6 +1793,7 @@
         const listEl = configPanel.querySelector('#schmidi-dikt-list');
         if (reviewCurrentAudio) {
             reviewCurrentAudio.pause();
+            revokeAudioUrl(reviewCurrentAudio);
             reviewCurrentAudio.src = '';
             const prevBtn = listEl.querySelector(`.sp-dikt-play[data-id="${reviewCurrentPlayId}"]`);
             if (prevBtn) prevBtn.textContent = '▶';
@@ -1767,9 +1807,7 @@
         try {
             const res = await authFetch(`${getHttpBase()}/training/review/audio/${id}`);
             if (!res.ok) throw new Error(await res.text());
-            const blobUrl = URL.createObjectURL(await res.blob());
-            audio = new Audio(blobUrl);
-            audio.addEventListener('ended', () => URL.revokeObjectURL(blobUrl), { once: true });
+            audio = blobAudio(URL.createObjectURL(await res.blob()));
         } catch (err) {
             setDiktStatus('Wiedergabe: ' + err.message, true);
             return;
@@ -1778,6 +1816,7 @@
         reviewCurrentPlayId = id;
         playBtn.textContent = '⏹';
         audio.play().catch(err => {
+            revokeAudioUrl(audio);
             reviewCurrentAudio  = null;
             reviewCurrentPlayId = null;
             playBtn.textContent = '▶';
@@ -1906,13 +1945,12 @@
     }
 
     configPanel.querySelector('#schmidi-dikt-save-last').addEventListener('click', async () => {
-        const ok = await saveDictationAsReview(undefined, (m) => setDiktStatus(m, false));
+        const ok = await saveDictationAsReview(undefined, setDiktStatus);
         if (ok) await loadReviews();
     });
     configPanel.querySelector('#schmidi-dikt-transcribe-voxtral').addEventListener('click', () => transcribeReview('voxtral'));
     configPanel.querySelector('#schmidi-dikt-transcribe-qwen').addEventListener('click', () => transcribeReview('qwen'));
     configPanel.querySelector('#schmidi-dikt-accept').addEventListener('click', acceptReview);
-    configPanel.querySelector('#schmidi-dikt-text').addEventListener('keydown', (e) => e.stopPropagation());
 
     configPanel.querySelectorAll("input").forEach((input) => {
         input.addEventListener("keydown", (e) => {
@@ -1920,8 +1958,9 @@
             e.stopPropagation();
         });
     });
-    configPanel.querySelector("#schmidi-words").addEventListener("keydown", (e) => {
-        e.stopPropagation();
+    // Keep panel typing out of the host page's own keyboard shortcuts.
+    configPanel.querySelectorAll("textarea").forEach((ta) => {
+        ta.addEventListener("keydown", (e) => e.stopPropagation());
     });
     configPanel.querySelector("#schmidi-words").addEventListener("input", () => {
         setWordsStatus("", false);
@@ -2125,10 +2164,12 @@
 
     // POST the last dictation (audio + transcript) to the server's review queue.
     // `text` overrides the snapshot transcript (e.g. the edited overlay text).
+    // `statusFn(msg, isError)` — defaults to a toast (whose second parameter is a
+    // duration, so it must not receive the isError flag).
     async function saveDictationAsReview(text, statusFn) {
-        const report = statusFn || showToast;
+        const report = statusFn || ((m) => showToast(m));
         if (!lastDictation || lastDictation.pcm.length === 0) {
-            report("Kein Diktat vorhanden");
+            report("Kein Diktat vorhanden", true);
             return false;
         }
         const t = (text !== undefined ? text : lastDictation.text) || "";
@@ -2140,10 +2181,10 @@
             if (!res.ok) throw new Error(await res.text());
             const data = await res.json();
             lastDictation.saved = true;
-            report(`Diktat gespeichert ✓ (${data.id}, ${data.duration_s.toFixed(1)}s) — Review im Diktate-Tab`);
+            report(`Diktat gespeichert ✓ (${data.id}, ${data.duration_s.toFixed(1)}s) — Review im Diktate-Tab`, false);
             return true;
         } catch (e) {
-            report("Fehler beim Speichern: " + e.message);
+            report("Fehler beim Speichern: " + e.message, true);
             return false;
         }
     }
@@ -2241,13 +2282,18 @@
             el.focus();
             document.execCommand("insertText", false, text);
         } else {
-            const start  = el.selectionStart;
-            const end    = el.selectionEnd;
+            // selectionStart/End are null on input types that don't expose a
+            // text cursor (number, email, …) — substring(0, null) would return ""
+            // and silently wipe the field, so append at the end instead.
+            const start  = el.selectionStart ?? el.value.length;
+            const end    = el.selectionEnd   ?? el.value.length;
             const before = el.value.substring(0, start);
             const after  = el.value.substring(end);
             el.value = before + text + after;
             const newPos = start + text.length;
-            el.setSelectionRange(newPos, newPos);
+            // Throws on the same cursor-less input types — not fatal, the text
+            // is already inserted.
+            try { el.setSelectionRange(newPos, newPos); } catch (_) {}
             el.dispatchEvent(new InputEvent("input", {
                 bubbles: true, cancelable: true, inputType: "insertText", data: text,
             }));

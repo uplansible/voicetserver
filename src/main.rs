@@ -1247,9 +1247,17 @@ mod server {
 
     // ---- /health ----
 
+    /// Reports the real engine state, not a constant: while the engines are
+    /// unloaded for LoRA training (plus the ~10–30 s reload) the server still
+    /// accepts connections but errors every ASR session, and a monitor or load
+    /// balancer needs to be able to tell.
     async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         let connections = state.connection_count.load(Ordering::Relaxed);
-        Json(json!({ "status": "ready", "connections": connections }))
+        let status = match state.settings.state.load(Ordering::Relaxed) {
+            crate::settings::STATE_READY => "ready",
+            _                            => "loading",
+        };
+        Json(json!({ "status": status, "connections": connections }))
     }
 
     // ---- /asr WebSocket ----
@@ -1312,10 +1320,14 @@ mod server {
         state.connection_count.fetch_add(1, Ordering::Relaxed);
         eprintln!("New connection (total: {})", state.connection_count.load(Ordering::Relaxed));
 
-        // Engine dispatch on ?model= — default Voxtral.
+        // Engine dispatch on ?model= — default Voxtral. An unknown value is an
+        // error frame, not a silent fall-back: `?model=qwem` would otherwise
+        // transcribe with the wrong engine while looking like it worked.
         let result = match params.model.as_deref() {
             Some("qwen") => handle_qwen_session(&mut socket, &state, &params).await,
-            _            => handle_asr_session(&mut socket, &state).await,
+            None | Some("") | Some("voxtral") => handle_asr_session(&mut socket, &state).await,
+            Some(other) => Err(anyhow::anyhow!(
+                "unknown model '{other}' — expected 'voxtral' or 'qwen'")),
         };
         if let Err(e) = result {
             eprintln!("ASR session error: {}", e);
@@ -1432,7 +1444,7 @@ mod server {
                 // flush remaining text as a final, then close — the client waits
                 // for onclose before finalizing, so the final is never lost the
                 // way it can be when the client just closes the socket.
-                Some(Ok(Message::Text(text))) if text.trim() == "stop" => break true,
+                Some(Ok(Message::Text(text))) if text.trim().eq_ignore_ascii_case("stop") => break true,
                 // Fallback: client disconnected without sending "stop" — same flush,
                 // though the final may be lost if the client is already gone.
                 Some(Ok(Message::Close(_))) | None => break true,
@@ -1545,7 +1557,7 @@ mod server {
                     }
                 }
                 // Graceful stop (shared protocol): finish inference, send final, close.
-                Some(Ok(Message::Text(text))) if text.trim() == "stop" => {
+                Some(Ok(Message::Text(text))) if text.trim().eq_ignore_ascii_case("stop") => {
                     let result = tokio::task::spawn_blocking(move || stream_state.finish()).await?;
                     let raw = result?;
                     if !raw.is_empty() {
@@ -1703,6 +1715,24 @@ mod server {
             if !(0.0..=1.0).contains(&r) {
                 return (StatusCode::UNPROCESSABLE_ENTITY,
                     format!("fuzzy_max_ratio must be between 0.0 and 1.0, got {}", r)).into_response();
+            }
+        }
+        if let Some(f) = patch.silence_flush {
+            // 0 disables silence-triggered finals entirely (see the early return in
+            // SilenceDetector::process_chunk) — dictation then produces nothing until
+            // the client presses stop, with no hint as to why. Reject it instead.
+            if !(1..=250).contains(&f) {
+                return (StatusCode::UNPROCESSABLE_ENTITY, format!(
+                    "silence_flush must be between 1 and 250 chunks (80ms each), got {} \
+                     (0 would disable silence-triggered finals)", f)).into_response();
+            }
+        }
+        if let Some(m) = patch.min_speech {
+            // Arms silence detection after this many speech chunks; an absurdly large
+            // value never arms it, which looks identical to silence_flush = 0.
+            if !(1..=250).contains(&m) {
+                return (StatusCode::UNPROCESSABLE_ENTITY, format!(
+                    "min_speech must be between 1 and 250 chunks (80ms each), got {}", m)).into_response();
             }
         }
 
@@ -1900,20 +1930,27 @@ mod server {
         let wav_path  = state.paths.training_audio_dir.join(format!("{id}.wav"));
         let pairs_path = &state.paths.training_pairs;
 
-        if !wav_path.exists() {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-
         // Hold the write lock so a concurrent upload can't append to the JSONL while we
         // rewrite it, and so two concurrent deletes don't interleave.
         let _guard = state.pair_write_lock.lock().await;
 
-        if let Err(e) = tokio::fs::remove_file(&wav_path).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to remove WAV: {e}")).into_response();
+        // A missing WAV must NOT abort the delete: if the audio was lost (manual
+        // cleanup, failed write) the JSONL entry would otherwise be stuck in the
+        // pool forever and the trainer would fail on it. The existence check
+        // gates only the file removal.
+        let had_wav = wav_path.exists();
+        if had_wav {
+            if let Err(e) = tokio::fs::remove_file(&wav_path).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to remove WAV: {e}")).into_response();
+            }
         }
 
         // Rewrite pairs.jsonl without the deleted entry
-        remove_jsonl_entry(pairs_path, &id).await;
+        let had_entry = remove_jsonl_entry(pairs_path, &id).await;
+
+        if !had_wav && !had_entry {
+            return StatusCode::NOT_FOUND.into_response();
+        }
 
         Json(json!({ "deleted": id })).into_response()
     }
@@ -2137,13 +2174,32 @@ mod server {
         Json(json!({ "count": count, "duration_sec": duration_s })).into_response()
     }
 
-    /// DELETE /training/pairs — remove all collected training data
+    /// DELETE /training — remove all collected training *pairs*.
+    ///
+    /// Deletes only `training/audio/` + `pairs.jsonl`. The dictation-review
+    /// candidates (`training/review/` + `review.jsonl`) live under the same
+    /// training dir but are a separate, unaccepted pool — wiping them here
+    /// (as an earlier `remove_dir_all(training_dir)` did) destroyed work the
+    /// user never asked to delete.
     async fn training_delete_handler(State(state): State<Arc<AppState>>) -> Response {
-        let dir = &state.paths.training_dir;
-        if dir.exists() {
-            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+        // Same lock as every other training-file mutation: without it a
+        // concurrent POST /training/pair can write a WAV between the directory
+        // removal and its JSONL append, orphaning it under an ID that the next
+        // upload (numbering restarted at 1) would later overwrite.
+        let _guard = state.pair_write_lock.lock().await;
+
+        let audio_dir = &state.paths.training_audio_dir;
+        if audio_dir.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&audio_dir).await {
                 return (StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to delete training data: {e}")).into_response();
+                    format!("Failed to delete training audio: {e}")).into_response();
+            }
+        }
+        let pairs = &state.paths.training_pairs;
+        if pairs.exists() {
+            if let Err(e) = tokio::fs::remove_file(&pairs).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to delete pairs.jsonl: {e}")).into_response();
             }
         }
         Json(json!({ "deleted": true })).into_response()
@@ -2158,7 +2214,10 @@ mod server {
     ) -> Response {
         // Validate prerequisites before touching the status, so a failed validation
         // never leaves the status stuck on "running".
-        let train_qwen = scope.is_qwen();
+        let train_qwen = match scope.resolve() {
+            Ok(q)  => q,
+            Err(r) => return r,
+        };
 
         // Locate the trainer: try cwd/tools/, binary dir/tools/, config dir/tools/.
         // Voxtral falls back to the pre-phase-4 script name for existing installs.
@@ -2214,6 +2273,8 @@ mod server {
         // progress" error until the engines are reloaded. Note: a qwen session
         // already in flight keeps its Arc handle alive (its VRAM frees when the
         // session ends); new sessions are blocked immediately.
+        // Flip /health to "loading" for the whole unload → train → reload window.
+        state.settings.state.store(crate::settings::STATE_LOADING, Ordering::SeqCst);
         {
             let mut guard = state.model.inner.lock().await;
             *guard = None; // drop enc+dec → frees their VRAM
@@ -2239,6 +2300,7 @@ mod server {
         let lora_path       = Arc::clone(&state.lora_path);
         let qwen_engine     = state.qwen.clone();
         let qwen_lora_path  = Arc::clone(&state.qwen_lora_path);
+        let settings        = Arc::clone(&state.settings);
         tokio::spawn(async move {
             run_training_subprocess(training_status, script, data_dir, model_dir, output_dir, venv_path).await;
 
@@ -2249,9 +2311,11 @@ mod server {
             let reloaded = tokio::task::spawn_blocking(move || {
                 load_enc_dec(&m.model_dir, &m.device, m.dtype, lora.as_deref())
             }).await;
+            let mut voxtral_ready = false;
             match reloaded {
                 Ok(Ok(inner)) => {
                     *model.inner.lock().await = Some(inner);
+                    voxtral_ready = true;
                     eprintln!("Model reloaded into VRAM after training.");
                 }
                 Ok(Err(e)) => eprintln!("ERROR: model reload after training failed: {e}"),
@@ -2267,6 +2331,12 @@ mod server {
                     Ok(Err(e)) => eprintln!("ERROR: qwen reload after training failed: {e}"),
                     Err(e)     => eprintln!("ERROR: qwen reload task panicked: {e}"),
                 }
+            }
+            // Only report ready again if the primary engine actually came back —
+            // a failed reload leaves the server unable to transcribe, which
+            // /health should keep showing.
+            if voxtral_ready {
+                settings.state.store(crate::settings::STATE_READY, Ordering::SeqCst);
             }
         });
 
@@ -2292,8 +2362,16 @@ mod server {
     }
 
     impl ModelQuery {
-        fn is_qwen(&self) -> bool {
-            self.model.as_deref() == Some("qwen")
+        /// Resolve `?model=` to an engine. An unknown value is an error rather
+        /// than a silent fall-back to voxtral: `?model=qwem` used to train the
+        /// voxtral LoRA and report success.
+        fn resolve(&self) -> Result<bool, Response> {
+            match self.model.as_deref() {
+                None | Some("") | Some("voxtral") => Ok(false),
+                Some("qwen") => Ok(true),
+                Some(other) => Err((StatusCode::BAD_REQUEST, format!(
+                    "unknown model '{other}' — expected 'voxtral' or 'qwen'")).into_response()),
+            }
         }
     }
 
@@ -2303,17 +2381,34 @@ mod server {
     /// Optional JSON body: `{"path": "/abs/path/to/adapter_dir"}`.
     /// If omitted, reloads from the currently active path.
     /// If the path does not contain adapter files, the LoRA is cleared (base model).
+    ///
+    /// The body is taken as raw `Bytes`, not `Option<Json<…>>`: axum only yields
+    /// `None` for the latter when the Content-Type header is *absent*, so a
+    /// client sending `application/json` with an empty body (the "reload current
+    /// path" case) was rejected with 400 instead of falling through.
     async fn lora_reload_handler(
         State(state): State<Arc<AppState>>,
         Query(scope): Query<ModelQuery>,
-        body: Option<Json<serde_json::Value>>,
-    ) -> impl IntoResponse {
-        let requested = body.as_ref()
-            .and_then(|b| b.get("path"))
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from);
+        body: axum::body::Bytes,
+    ) -> Response {
+        let is_qwen = match scope.resolve() {
+            Ok(q)  => q,
+            Err(r) => return r,
+        };
 
-        if scope.is_qwen() {
+        let requested = if body.is_empty() {
+            None
+        } else {
+            match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(v) => v.get("path")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from),
+                Err(e) => return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid JSON body: {e}")}))).into_response(),
+            }
+        };
+
+        if is_qwen {
             return qwen_lora_reload(&state, requested).await;
         }
 
@@ -2450,7 +2545,11 @@ mod server {
         State(state): State<Arc<AppState>>,
         Query(scope): Query<ModelQuery>,
     ) -> Response {
-        if scope.is_qwen() {
+        let is_qwen = match scope.resolve() {
+            Ok(q)  => q,
+            Err(r) => return r,
+        };
+        if is_qwen {
             let Some(qwen) = state.qwen.as_ref() else {
                 return (StatusCode::UNPROCESSABLE_ENTITY,
                     Json(json!({"error": "Qwen engine not enabled — set qwen_model_dir in config.toml"}))).into_response();
@@ -2754,15 +2853,20 @@ mod server {
     }
 
     /// Rewrite a `{"id":…}` JSONL file without the entry matching `id`.
+    /// Returns true if an entry was actually removed.
     /// Caller must hold `pair_write_lock`.
-    async fn remove_jsonl_entry(jsonl_path: &std::path::Path, id: &str) {
+    async fn remove_jsonl_entry(jsonl_path: &std::path::Path, id: &str) -> bool {
+        let mut removed = false;
         if let Ok(content) = tokio::fs::read_to_string(jsonl_path).await {
             let new_content: String = content
                 .lines()
                 .filter(|l| {
                     if l.trim().is_empty() { return false; }
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
-                        return v["id"].as_str() != Some(id);
+                        if v["id"].as_str() == Some(id) {
+                            removed = true;
+                            return false;
+                        }
                     }
                     true
                 })
@@ -2770,6 +2874,7 @@ mod server {
                 .collect();
             let _ = tokio::fs::write(jsonl_path, new_content).await;
         }
+        removed
     }
 
     // ---- Training helpers ----

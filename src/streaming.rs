@@ -75,7 +75,13 @@ impl SilenceDetector {
     }
 
     /// Process one 80ms chunk of audio. Returns true if a silence/paragraph event should fire.
-    pub fn process_chunk(&mut self, rms: f32, settings: &SharedSettings) -> bool {
+    ///
+    /// `delay_tokens` is the value the *session* was built with, not the live
+    /// atomic: prefill, KV sizing and the drain length are all fixed at
+    /// construction, so reading the atomic here made a mid-session
+    /// `PATCH /config` desync finalization timing from the actual decoder lag.
+    /// A changed `delay` takes effect on the next session.
+    pub fn process_chunk(&mut self, rms: f32, delay_tokens: usize, settings: &SharedSettings) -> bool {
         use std::sync::atomic::Ordering;
         let sil_thresh = settings.silence_threshold.load(Ordering::Relaxed);
         let rms_alpha = settings.rms_ema_alpha.load(Ordering::Relaxed);
@@ -117,8 +123,7 @@ impl SilenceDetector {
         if self.silence_detected && !self.silence_emitted {
             let para_delay = {
                 use std::sync::atomic::Ordering;
-                settings.delay_tokens.load(Ordering::Relaxed)
-                    + settings.paragraph_delay_offset.load(Ordering::Relaxed)
+                delay_tokens + settings.paragraph_delay_offset.load(Ordering::Relaxed)
             };
             if self.paragraph_delay_counter >= para_delay {
                 self.silence_emitted = true;
@@ -289,7 +294,7 @@ impl StreamingState {
             let rms = (self.sample_buf_for_silence[..SAMPLES_PER_TOKEN]
                 .iter().map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
             self.sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
-            if self.silence.process_chunk(rms, settings) {
+            if self.silence.process_chunk(rms, self.delay_tokens, settings) {
                 // Take + clear the buffer here (not in the caller) so tokens decoded
                 // later in this same chunk start fresh instead of being re-sent as
                 // part of the next partial.
