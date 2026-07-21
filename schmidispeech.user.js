@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.20
+// @version      0.1.21
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -2326,12 +2326,47 @@
     function commitTarget() {
         const el = targetEl;
         if (!el || (!isEditable(el) && !isContentEditable(el))) return;
+        // Snapshot the cursor so it can be restored after the blur-triggered save.
+        const savedSel = captureSelection(el);
         // `change` is what most save-on-blur handlers actually listen for; blur()
         // drops focus so native handlers fire; the synthetic focusout (bubbles)
         // covers pages that watch the bubbling event rather than the element's blur.
         el.dispatchEvent(new Event("change", { bubbles: true }));
         el.blur();
         el.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+        // Re-focus on the next macrotask, not synchronously: the page's blur/save
+        // handlers (often a setTimeout registered during blur()) run first and see
+        // focus gone — so the save proceeds — then we put the cursor back. The value
+        // is already committed, so re-focusing can't undo it.
+        setTimeout(() => restoreSelection(el, savedSel), 0);
+    }
+
+    // Capture the current caret/selection so commitTarget() can restore it after
+    // blurring. Returns null when there's nothing sensible to restore.
+    function captureSelection(el) {
+        if (isEditable(el)) {
+            return { kind: "input", start: el.selectionStart, end: el.selectionEnd };
+        }
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount && el.contains(sel.anchorNode)) {
+            return { kind: "range", range: sel.getRangeAt(0).cloneRange() };
+        }
+        return null;
+    }
+
+    function restoreSelection(el, saved) {
+        if (!el.isConnected) return;  // field was re-rendered away by the save
+        try {
+            el.focus({ preventScroll: true });
+            if (!saved) return;
+            if (saved.kind === "input") {
+                if (saved.start != null) el.setSelectionRange(saved.start, saved.end);
+            } else if (saved.kind === "range" && el.contains(saved.range.startContainer)) {
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(saved.range);
+            }
+        } catch (_) { /* cursor-less inputs / stale range — focus alone is fine */ }
     }
 
     function isEditable(el) {
