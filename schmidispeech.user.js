@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.18
+// @version      0.1.20
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -40,6 +40,19 @@
         return GM_getValue("server_url_voxtral", GM_getValue("server_url", DEFAULT_SERVER_URL));
     }
     function setServerUrl(url) { GM_setValue("server_url_voxtral", url); }
+    // The stored URL is user-typed and historically forgiving: getHttpBase()
+    // accepts http(s):// and a missing /asr path, so a URL like
+    // "https://host:8765" configures the panel fine while the raw string is a
+    // broken WebSocket endpoint (browsers coerce https→wss but never add a
+    // path, so the upgrade hits "/" and 404s before reaching the handler).
+    // Normalise the same way here: coerce the scheme and append /asr if absent.
+    function getWsUrl() {
+        let url = getServerUrl().trim()
+            .replace(/^http(s?):\/\//, "ws$1://")
+            .replace(/\/+$/, "");
+        if (!/\/asr$/.test(url)) url += "/asr";
+        return url;
+    }
     function getHotkey() { return GM_getValue("hotkey", DEFAULT_HOTKEY); }
     function setHotkey(k) { GM_setValue("hotkey", k.toLowerCase().trim()); }
     function isCommitMode() { return GM_getValue("commit_mode", false); }
@@ -309,6 +322,7 @@
         const text = overlayTextDiv.textContent.trimEnd();
         if (text) {
             injectAtCursor(text);
+            commitTarget();  // blur so the host page saves the inserted text
             if (originalTranscribed && text !== originalTranscribed) {
                 authFetch(`${getHttpBase()}/log/edit`, {
                     method: "POST",
@@ -1866,7 +1880,7 @@
     // transcript (all finals + trailing partial).
     function transcribePcm(pcm, model) {
         return new Promise((resolve, reject) => {
-            let url = getServerUrl();
+            let url = getWsUrl();
             const params = ['model=' + encodeURIComponent(model)];
             const key = apiKey();
             if (key) params.push('api_key=' + encodeURIComponent(key));
@@ -2141,6 +2155,9 @@
         } else {
             // Live mode: inject any trailing partial, briefly keep overlay
             if (currentPartial) injectAtCursor(currentPartial);
+            // Blur the field once, only if we actually inserted something this
+            // session — so the host page saves without a manual click-away.
+            if (accumulatedText.trim() || currentPartial.trim()) commitTarget();
             snapshotDictation(accumulatedText + currentPartial);
             accumulatedText = "";
             currentPartial  = "";
@@ -2199,7 +2216,7 @@
         // ?model= picks the engine on the unified server; hotwords/patient feed
         // the qwen engine's prompt biasing. Old servers ignore unknown query
         // params, so all of them are always safe to send.
-        let url = getServerUrl();
+        let url = getWsUrl();
         const params = ["model=" + encodeURIComponent(activeModel())];
         const key = apiKey();
         if (key) params.push("api_key=" + encodeURIComponent(key));
@@ -2298,6 +2315,23 @@
                 bubbles: true, cancelable: true, inputType: "insertText", data: text,
             }));
         }
+    }
+
+    // ---- Commit the target field — fire change + blur so the host page saves ----
+    // Many pages persist a field only on the change/blur that a real "leave the
+    // field" produces; live injection dispatches `input` but never blurs, so those
+    // pages never save. Called once when a dictation is finished (live-mode stop or
+    // the commit-mode ↵ button). We already hold the exact element in `targetEl`, so
+    // no field detection is needed.
+    function commitTarget() {
+        const el = targetEl;
+        if (!el || (!isEditable(el) && !isContentEditable(el))) return;
+        // `change` is what most save-on-blur handlers actually listen for; blur()
+        // drops focus so native handlers fire; the synthetic focusout (bubbles)
+        // covers pages that watch the bubbling event rather than the element's blur.
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.blur();
+        el.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
     }
 
     function isEditable(el) {
