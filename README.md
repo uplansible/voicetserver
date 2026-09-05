@@ -38,6 +38,11 @@ KEY="$CERT_DIR/$SERVER_HOST.key"
 WSS_URL="wss://$SERVER_HOST:8765/asr"
 ```
 
+`CERT`, `KEY` and `WSS_URL` belong to the legacy setup in which the server holds its own
+certificate. Behind a Tailscale Service the first two are unused and the URL is
+`wss://<service>.<tailnet>.ts.net/asr`, without a port — see
+[Reaching the server](#reaching-the-server-one-time-on-the-gpu-server).
+
 ---
 
 ## Build
@@ -101,10 +106,54 @@ $MODEL_DIR/
 
 ---
 
-## Tailscale TLS setup (one-time, on the GPU server)
+## Reaching the server (one-time, on the GPU server)
 
-Tailscale can provision a valid TLS certificate for your machine's FQDN at no cost,
-so the browser trusts the `wss://` connection without any self-signed cert warnings.
+The browser needs a `wss://` origin with a certificate it already trusts. There are two ways
+to get one, and they are mutually exclusive.
+
+### Recommended — a Tailscale Service
+
+`tailscaled` terminates TLS on a virtual IP of its own and proxies to the server on
+loopback. The server speaks plain HTTP, binds `127.0.0.1`, and is unreachable from the LAN.
+Nothing has to renew a certificate, so an expired one can no longer stop dictation.
+
+**Step 1 — define the service** in the admin console: **Services → Advertise → Define a
+Service**, name `voicet`, endpoint `tcp:443`, tag field empty.
+
+> The order matters. `tailscale serve --service=` does **not** create a service. Point it at
+> a name that was never defined and it writes local config, reports that admin approval is
+> required, and appears nowhere in the console.
+
+The machine must also carry an ACL tag — a service host cannot be a node with an owner.
+
+**Step 2 — configure the server** in `~/.config/voicetserver/config.toml`:
+
+```toml
+bind_addr = "127.0.0.1"
+# no tls_cert / tls_key — the proxy handles TLS
+```
+
+> With `tls_cert` still set, the server speaks TLS and the proxy speaks plain HTTP into it,
+> which answers **502**. Either drop the cert (preferred) or forward with
+> `https+insecure://127.0.0.1:8765` — `insecure` because the cert names the node FQDN while
+> the connection goes to `127.0.0.1`.
+
+**Step 3 — advertise it**, then approve the host in the console:
+
+```bash
+sudo tailscale serve --service=svc:voicet --https=443 http://127.0.0.1:8765
+```
+
+If it still reports that approval is required *after* you approved it, the daemon is holding
+stale state — `tailscale serve clear svc:voicet`, wait two seconds, run it again.
+
+The URL becomes `wss://voicet.<tailnet>.ts.net/asr` — no port. WebSockets pass through the
+HTTPS endpoint, so no TLS-terminated TCP endpoint is needed.
+
+### Legacy — the server holds its own certificate
+
+Works, but binds `0.0.0.0` (reachable from the whole LAN, not just the tailnet) and needs a
+renewal timer; a lapsed cert breaks dictation silently.
 
 **Step 1 — Enable HTTPS in the Tailscale admin console**
 
@@ -127,6 +176,70 @@ sudo chown "$SERVER_USER":"$SERVER_USER" "$CERT" "$KEY"
 echo "0 3 * * 1 root tailscale cert $SERVER_HOST && chown $SERVER_USER:$SERVER_USER $CERT $KEY" \
   | sudo tee /etc/cron.d/tailscale-cert
 ```
+
+`tools/install.sh` offers both and writes the matching config either way.
+
+---
+
+## Running as a service
+
+Started from a shell, the server dies with that shell and does not come back after a reboot.
+`tools/install.sh` offers to write this unit; by hand:
+
+```ini
+[Unit]
+Description=voicetserver — two-engine ASR server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/home/youruser
+ExecStart=/home/youruser/.local/bin/voicetserver
+Environment=LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64
+Environment=PATH=/home/youruser/.local/bin:/usr/local/cuda-12.8/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+⚠️ **The `Environment=` lines are the point of failure, not decoration.** A login shell gets
+`LD_LIBRARY_PATH` from `~/.bashrc` or `/etc/profile.d`; a systemd service inherits nothing.
+Without it the server exits immediately with
+
+```
+Loading safetensors...
+Error: CublasError(CUBLAS_STATUS_NOT_INITIALIZED)
+```
+
+which reads like a driver or GPU fault and is neither. Use the values from a shell where the
+binary is known to run (`echo $LD_LIBRARY_PATH`).
+
+Pin the CUDA version in the path. `/usr/local/cuda` is usually a symlink into
+`/etc/alternatives`, which a package upgrade can repoint; the binary needs `libcudart.so.12`
+by SONAME, so a move to a newer major version breaks it silently at the next boot. A CUDA
+major upgrade requires rebuilding anyway.
+
+**The same error has a second cause:** another instance already holds the GPU. Check
+`nvidia-smi` is empty before starting the unit, and never run a hand-started server
+alongside it.
+
+To separate the two — environment or occupied card — reproduce the service environment
+without the unit:
+
+```bash
+env | sort > /tmp/env-login
+sudo systemd-run --uid=$(id -u) --gid=$(id -g) --pty --working-directory=$HOME \
+  /bin/bash -c 'env | sort' > /tmp/env-systemd
+diff /tmp/env-login /tmp/env-systemd
+```
+
+If `systemd-run` fails the same way, it is the environment and the diff names the missing
+line.
 
 ---
 
@@ -161,7 +274,16 @@ Runtime-adjustable without restart: `delay`, `silence_threshold`, `silence_flush
 
 ## Start the server
 
-**Foreground (logs stream to terminal):**
+In production, run it from the [systemd unit](#running-as-a-service) — the commands below are
+for development and first tests. A hand-started server dies with its shell, and a second
+instance cannot get the GPU while the first holds it.
+
+**Behind a Tailscale Service** (recommended — no TLS flags, loopback only):
+```bash
+./target/release/voicetserver --model-dir "$MODEL_DIR" --bind-addr 127.0.0.1
+```
+
+**Foreground with its own certificate (legacy):**
 ```bash
 ./target/release/voicetserver --model-dir "$MODEL_DIR" --bind-addr 0.0.0.0 --tls-cert "$CERT" --tls-key "$KEY"
 # Press 'd' to detach (logs switch to file, shell prompt returns)
@@ -188,9 +310,14 @@ Starting a second instance while one is running prints an error.
 
 **Health check:**
 ```bash
-curl https://"$SERVER_HOST":8765/health
+curl https://"$SERVER_HOST":8765/health          # legacy, server holds the cert
+curl https://voicet.<tailnet>.ts.net/health      # behind a Tailscale Service
 # {"status":"ready","connections":0}
 ```
+
+A **502** from the service address means the proxy is fine and the backend is not answering
+as asked — either the server is not running, or it still speaks TLS while the service
+forwards plain HTTP.
 
 **Offline WAV test:**
 ```bash

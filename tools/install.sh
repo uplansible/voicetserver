@@ -423,61 +423,146 @@ else
     echo "~/.local/bin already in PATH"
 fi
 
-# --- TLS certificate via tailscale cert ---
+# --- Exposure: Tailscale Service (recommended) or self-hosted TLS ---
+#
+# Two ways to reach the server from another machine:
+#
+#   [1] Tailscale Service — tailscaled terminates TLS on a per-service virtual IP and
+#       proxies to 127.0.0.1. The server speaks plain HTTP and is not reachable from the
+#       LAN at all. No cert to renew: an expired cert can no longer kill dictation.
+#   [2] Self-hosted TLS   — the server holds a `tailscale cert` for the node FQDN and binds
+#       0.0.0.0. This is what earlier versions of this installer did; it works, but it
+#       exposes the port to the whole LAN and needs a weekly renewal timer.
+#
+# Mode [1] needs the *service* to exist before a node can advertise it — see the prompt.
 echo ""
+
+# Comment a key out rather than deleting it, so the previous value stays visible.
+unset_config_value() {
+    local key="$1"
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    sed -i "s|^[[:space:]]*${key}[[:space:]]*=|# ${key} =|" "$CONFIG_FILE"
+}
+
+# Port the server listens on — config wins, else the compiled default.
+SERVICE_PORT=8765
+if [[ -f "$CONFIG_FILE" ]] && grep -qE '^[[:space:]]*port[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+    CFG_PORT=$(grep -E '^[[:space:]]*port[[:space:]]*=' "$CONFIG_FILE" | head -1 \
+        | grep -oE '[0-9]+' | head -1)
+    [[ -n "$CFG_PORT" ]] && SERVICE_PORT="$CFG_PORT"
+fi
+
 CERT_CONFIGURED=false
 if command -v tailscale &>/dev/null; then
     TS_HOST=$(tailscale status --json 2>/dev/null \
         | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Self',{}).get('DNSName','').rstrip('.'))" \
         2>/dev/null || true)
 
-    if [[ -z "$TS_HOST" ]]; then
-        echo "Warning: tailscale connected but hostname not available — TLS cert setup skipped."
-    else
-        CERT_DIR="/etc/tailscale/certs"
-        CERT_FILE="$CERT_DIR/${TS_HOST}.crt"
-        KEY_FILE="$CERT_DIR/${TS_HOST}.key"
-        CURRENT_USER=$(id -un)
-        TIMER_UNIT="tailscale-cert-renewal"
+    echo "How should voicetserver be reachable from other machines?"
+    echo "  [1] Tailscale Service — TLS at the proxy, server binds 127.0.0.1   (recommended)"
+    echo "  [2] Self-hosted TLS   — server holds the cert, binds 0.0.0.0       (legacy)"
+    echo "  [3] Skip — configure exposure later"
+    printf "Choice [1]: "
+    read -r EXPOSURE_CHOICE
+    EXPOSURE_CHOICE="${EXPOSURE_CHOICE:-1}"
 
-        if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
-            echo "TLS cert already present: $CERT_FILE"
-            CERT_CONFIGURED=true
-        else
-            printf "Provision Tailscale TLS cert for %s? [Y/n]: " "$TS_HOST"
-            read -r CERT_CHOICE
-            if [[ "${CERT_CHOICE,,}" != "n" ]]; then
-                sudo mkdir -p "$CERT_DIR"
-                if sudo tailscale cert --cert-file "$CERT_FILE" --key-file "$KEY_FILE" "$TS_HOST"; then
-                    sudo chmod 644 "$CERT_FILE"
-                    sudo chmod 640 "$KEY_FILE"
-                    sudo chown "root:${CURRENT_USER}" "$KEY_FILE"
-                    echo "Cert provisioned: $CERT_FILE"
-                    CERT_CONFIGURED=true
-                else
-                    echo "Warning: cert provisioning failed — configure TLS manually." >&2
-                    echo "  sudo tailscale cert --cert-file $CERT_FILE --key-file $KEY_FILE $TS_HOST" >&2
-                fi
+    if [[ "$EXPOSURE_CHOICE" == "1" ]]; then
+        printf "Service name (without the svc: prefix) [voicet]: "
+        read -r SVC_NAME
+        SVC_NAME="${SVC_NAME:-voicet}"
+
+        echo ""
+        echo "Two things must already be true — neither can be done from here:"
+        echo "  1. This machine carries an ACL tag. A service host cannot be an owned node;"
+        echo "     tag it in the admin console under Machine -> Edit ACL tags."
+        echo "  2. The service exists: Services -> Advertise -> Define a Service,"
+        echo "     name '${SVC_NAME}', endpoint 'tcp:443', tag field left empty."
+        echo "     'tailscale serve --service=' does NOT create it. Advertising a service"
+        echo "     that was never defined writes local config, reports that approval is"
+        echo "     required, and shows up nowhere in the console."
+        printf "Both done? [y/N]: "
+        read -r SVC_READY
+
+        if [[ "${SVC_READY,,}" == "y" ]]; then
+            set_config_value "bind_addr" "127.0.0.1"
+            # Must go: a proxy sending plain HTTP into a TLS listener answers 502.
+            unset_config_value "tls_cert"
+            unset_config_value "tls_key"
+            echo "Config updated: bind_addr=127.0.0.1, tls_cert/tls_key disabled"
+
+            if sudo tailscale serve --service="svc:${SVC_NAME}" --https=443 \
+                    "http://127.0.0.1:${SERVICE_PORT}"; then
+                CERT_CONFIGURED=true
+                echo ""
+                echo "Approve the host: Services -> ${SVC_NAME} -> Service hosts -> Approve."
+                echo "Until then the address does not resolve to anything and a browser"
+                echo "reports that it cannot establish a secure connection."
+                echo ""
+                echo "If it still reports 'approval from an admin is required' after you"
+                echo "approved it, the daemon is holding the old state:"
+                echo "  tailscale serve clear svc:${SVC_NAME}"
+                echo "  sleep 2"
+                echo "  sudo tailscale serve --service=svc:${SVC_NAME} --https=443 http://127.0.0.1:${SERVICE_PORT}"
             else
-                echo "Skipped. To provision later:"
-                echo "  sudo tailscale cert --cert-file $CERT_FILE --key-file $KEY_FILE $TS_HOST"
+                echo "Warning: advertising the service failed — run it manually:" >&2
+                echo "  sudo tailscale serve --service=svc:${SVC_NAME} --https=443 http://127.0.0.1:${SERVICE_PORT}" >&2
             fi
+        else
+            echo "Skipped. Once both are done:"
+            echo "  sudo tailscale serve --service=svc:${SVC_NAME} --https=443 http://127.0.0.1:${SERVICE_PORT}"
+            echo "and set bind_addr = \"127.0.0.1\" with tls_cert/tls_key removed in:"
+            echo "  $CONFIG_FILE"
         fi
 
-        if [[ "$CERT_CONFIGURED" == true ]]; then
-            set_config_value "tls_cert" "$CERT_FILE"
-            set_config_value "tls_key" "$KEY_FILE"
-            set_config_value "bind_addr" "0.0.0.0"
-            echo "Config updated: tls_cert, tls_key, bind_addr=0.0.0.0"
+    elif [[ "$EXPOSURE_CHOICE" == "2" ]]; then
+        if [[ -z "$TS_HOST" ]]; then
+            echo "Warning: tailscale connected but hostname not available — TLS cert setup skipped."
+        else
+            CERT_DIR="/etc/tailscale/certs"
+            CERT_FILE="$CERT_DIR/${TS_HOST}.crt"
+            KEY_FILE="$CERT_DIR/${TS_HOST}.key"
+            CURRENT_USER=$(id -un)
+            TIMER_UNIT="tailscale-cert-renewal"
 
-            # Install systemd renewal timer
-            if systemctl is-active --quiet "${TIMER_UNIT}.timer" 2>/dev/null; then
-                echo "Renewal timer already active: ${TIMER_UNIT}.timer"
+            if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+                echo "TLS cert already present: $CERT_FILE"
+                CERT_CONFIGURED=true
             else
-                printf "Install systemd renewal timer (weekly cert check)? [Y/n]: "
-                read -r TIMER_CHOICE
-                if [[ "${TIMER_CHOICE,,}" != "n" ]]; then
-                    sudo tee /etc/systemd/system/${TIMER_UNIT}.service > /dev/null <<EOF
+                printf "Provision Tailscale TLS cert for %s? [Y/n]: " "$TS_HOST"
+                read -r CERT_CHOICE
+                if [[ "${CERT_CHOICE,,}" != "n" ]]; then
+                    sudo mkdir -p "$CERT_DIR"
+                    if sudo tailscale cert --cert-file "$CERT_FILE" --key-file "$KEY_FILE" "$TS_HOST"; then
+                        sudo chmod 644 "$CERT_FILE"
+                        sudo chmod 640 "$KEY_FILE"
+                        sudo chown "root:${CURRENT_USER}" "$KEY_FILE"
+                        echo "Cert provisioned: $CERT_FILE"
+                        CERT_CONFIGURED=true
+                    else
+                        echo "Warning: cert provisioning failed — configure TLS manually." >&2
+                        echo "  sudo tailscale cert --cert-file $CERT_FILE --key-file $KEY_FILE $TS_HOST" >&2
+                    fi
+                else
+                    echo "Skipped. To provision later:"
+                    echo "  sudo tailscale cert --cert-file $CERT_FILE --key-file $KEY_FILE $TS_HOST"
+                fi
+            fi
+
+            if [[ "$CERT_CONFIGURED" == true ]]; then
+                set_config_value "tls_cert" "$CERT_FILE"
+                set_config_value "tls_key" "$KEY_FILE"
+                set_config_value "bind_addr" "0.0.0.0"
+                echo "Config updated: tls_cert, tls_key, bind_addr=0.0.0.0"
+                echo "Note: this exposes ${SERVICE_PORT} to the whole LAN, not just the tailnet."
+
+                # Install systemd renewal timer
+                if systemctl is-active --quiet "${TIMER_UNIT}.timer" 2>/dev/null; then
+                    echo "Renewal timer already active: ${TIMER_UNIT}.timer"
+                else
+                    printf "Install systemd renewal timer (weekly cert check)? [Y/n]: "
+                    read -r TIMER_CHOICE
+                    if [[ "${TIMER_CHOICE,,}" != "n" ]]; then
+                        sudo tee /etc/systemd/system/${TIMER_UNIT}.service > /dev/null <<EOF
 [Unit]
 Description=Renew Tailscale TLS cert for voicetserver
 After=network.target tailscaled.service
@@ -488,7 +573,7 @@ ExecStart=/usr/bin/tailscale cert --cert-file ${CERT_FILE} --key-file ${KEY_FILE
 ExecStartPost=/bin/chmod 640 ${KEY_FILE}
 ExecStartPost=/bin/chown root:${CURRENT_USER} ${KEY_FILE}
 EOF
-                    sudo tee /etc/systemd/system/${TIMER_UNIT}.timer > /dev/null <<EOF
+                        sudo tee /etc/systemd/system/${TIMER_UNIT}.timer > /dev/null <<EOF
 [Unit]
 Description=Weekly Tailscale cert renewal for voicetserver
 
@@ -499,18 +584,81 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-                    sudo systemctl daemon-reload
-                    sudo systemctl enable --now "${TIMER_UNIT}.timer"
-                    echo "Renewal timer enabled: ${TIMER_UNIT}.timer"
-                else
-                    echo "Skipped. To install later: see CLAUDE.md"
+                        sudo systemctl daemon-reload
+                        sudo systemctl enable --now "${TIMER_UNIT}.timer"
+                        echo "Renewal timer enabled: ${TIMER_UNIT}.timer"
+                    else
+                        echo "Skipped. To install later: see CLAUDE.md"
+                    fi
                 fi
             fi
         fi
+    else
+        echo "Exposure setup skipped."
     fi
 else
-    echo "tailscale not found — TLS cert setup skipped."
+    echo "tailscale not found — exposure setup skipped."
     echo "  Install Tailscale and re-run the installer."
+fi
+
+# --- systemd unit for the server itself ---
+#
+# Without this the server only ever runs as long as the shell that started it, and after a
+# reboot it is simply gone. The two Environment= lines are the crux: a login shell picks up
+# LD_LIBRARY_PATH (CUDA) from ~/.bashrc or /etc/profile.d, a systemd service inherits
+# nothing. Missing it, the server dies at startup with
+#     Error: CublasError(CUBLAS_STATUS_NOT_INITIALIZED)
+# which reads like a driver or GPU fault and is not one. We copy the values out of the shell
+# running this installer, because that is an environment the binary is known to work in.
+echo ""
+UNIT_FILE="/etc/systemd/system/voicetserver.service"
+BIN_PATH="$HOME/.local/bin/voicetserver"
+if [[ -f "$UNIT_FILE" ]]; then
+    echo "systemd unit already present: $UNIT_FILE"
+elif [[ ! -x "$BIN_PATH" ]]; then
+    echo "No binary at $BIN_PATH — skipping systemd unit."
+else
+    printf "Install systemd unit so the server starts at boot? [Y/n]: "
+    read -r SVC_UNIT_CHOICE
+    if [[ "${SVC_UNIT_CHOICE,,}" != "n" ]]; then
+        {
+            echo "[Unit]"
+            echo "Description=voicetserver — two-engine ASR server"
+            echo "After=network.target"
+            echo "Wants=network.target"
+            echo ""
+            echo "[Service]"
+            echo "Type=simple"
+            echo "User=$(id -un)"
+            echo "WorkingDirectory=$HOME"
+            echo "ExecStart=${BIN_PATH}"
+            [[ -n "${LD_LIBRARY_PATH:-}" ]] && echo "Environment=LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+            echo "Environment=PATH=${PATH}"
+            echo "Restart=always"
+            echo "RestartSec=5"
+            echo "NoNewPrivileges=true"
+            echo ""
+            echo "[Install]"
+            echo "WantedBy=multi-user.target"
+        } | sudo tee "$UNIT_FILE" > /dev/null
+
+        if [[ -z "${LD_LIBRARY_PATH:-}" ]]; then
+            echo "Note: LD_LIBRARY_PATH is empty in this shell, so the unit has no CUDA path."
+            echo "  If the service fails with CUBLAS_STATUS_NOT_INITIALIZED, add it by hand."
+        fi
+
+        sudo systemctl daemon-reload
+        echo "Unit written: $UNIT_FILE"
+        echo ""
+        echo "Only ONE instance may hold the GPU. Stop any hand-started server first —"
+        echo "a second one fails with the same CUBLAS error, which looks like a unit fault"
+        echo "but is just an occupied card (check with nvidia-smi):"
+        echo "  pkill -x voicetserver && sleep 3"
+        echo "  sudo systemctl enable --now voicetserver"
+        echo "  journalctl -u voicetserver -f"
+    else
+        echo "Skipped. The server then only runs for as long as you keep a shell open."
+    fi
 fi
 
 echo ""
