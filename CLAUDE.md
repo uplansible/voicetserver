@@ -304,7 +304,7 @@ polls `/proc/<pid>` for up to 5 s, deletes PID file.
 # Custom words
 
 `~/.config/voicetserver/custom_words.txt` — one entry per line:
-- `wrong=correct` — replacement pair: every occurrence of `wrong` in transcribed text is replaced with `correct`
+- `wrong=correct` — replacement pair: every occurrence of `wrong` in transcribed text is replaced with `correct`. The **correction side** is canonical vocabulary too, so it also serves as a fuzzy / acronym target (no need to repeat it as a plain line)
 - `PlainTerm` — fuzzy phonetic target: transcribed words that *sound like* it are snapped onto this canonical spelling (see below)
 - `# comment` — ignored
 
@@ -319,8 +319,13 @@ The model often transcribes unfamiliar proper names / medical terms with a sligh
 `wrong=correct` pairs cannot keep up. Every **final** transcription is post-processed by a
 `FuzzyMatcher` (`src/words.rs`) that snaps phonetically-close words onto the canonical spelling.
 
-- Targets = the **plain terms** in `custom_words.txt` (lines without `=`), exposed via
-  `WordsCorrector::plain_terms()`. Rebuilt whenever `POST /words` updates the file.
+- Targets = the canonical terms of `custom_words.txt` — the **plain terms** (lines without `=`)
+  **plus the correction side (RHS) of every `wrong=correct` pair** — exposed via
+  `WordsCorrector::fuzzy_terms()` (order-preserving, deduped; malformed pairs with an empty side
+  skipped, like `from_str`). The RHS belongs there because the model rarely mishears a term the
+  same way twice: `Migration=Miktion` catches only that one variant, while the fuzzy pass also
+  snaps `Miktzion`/`Micktion`. `plain_terms()` still exists and feeds the qwen context biasing.
+  Rebuilt whenever `POST /words` updates the file.
 - Matching: **near Kölner Phonetik** (Cologne phonetics) code **AND** normalized Levenshtein
   distance ≤ `fuzzy_max_ratio`. Both gates required → low false-positive risk.
   - Phonetic gate is *near*, not *identical*: a leading `0` (edge-vowel code) is stripped before
@@ -329,6 +334,19 @@ The model often transcribes unfamiliar proper names / medical terms with a sligh
     further — most often a prepended/dropped edge vowel turning `1264` "Betmiga" into `01264`
     "Epetmika". An identical-code requirement rejected these; the relaxed gate snaps them while the
     orthographic Levenshtein ratio remains the false-positive backstop.
+- **Inflection-aware**: matching runs on *stems* — the dictated word and each canonical term may
+  each shed one German inflection ending (`INFLECTION_SUFFIXES`: `e n s en es er em ns ern innen`;
+  a stem must keep ≥ `STEM_MIN_LEN` = 5 chars). Two consequences:
+  - Word-stem == target-stem → the word *is* the term in another grammatical form and is returned
+    verbatim, so declension survives (`zweizeitigen`, `Miktionen`, `Betmigas` are no longer
+    flattened onto `zweizeitige` / `Miktion` / `Betmiga`).
+  - A misspelled inflected form is repaired on the stem and keeps its own ending:
+    `zweiseitigen` → `zweizeitige` + `n` = `zweizeitigen`.
+  - Replacements always come from a **whole** canonical term; a shortened target stem is used only
+    for the recognition test above (`Gutwein` minus `n` would otherwise pull `gute` → `Gutwei`).
+    The ending is not carried over when the term already ends that way (no `Besten` + `en`).
+  - Candidates rank by edit distance, then by shortest stripped word-suffix — so an unsplit match
+    wins a tie (`Tovias` → `Toviaz`, not `Toviazs`).
 - Only single all-alphabetic terms are fuzzy targets (multi-word / hyphenated / digit-bearing
   terms like `TUR-B` are excluded — the word scanner splits on non-alphabetic chars). They still
   work as literal `wrong=correct` pairs.
@@ -349,8 +367,9 @@ as a fuzzy target (hyphen), and a dictated acronym comes out as German **letter 
 → `Em Er I` / `EM-ER-I` — separate tokens the word-by-word scanner never joins. The
 `AbbrevExpander` (`src/words.rs`) handles them:
 
-- **Targets** are auto-detected from the plain (non-`=`) custom_words.txt terms: only
-  letters/digits/hyphens with **2–6 letters, all uppercase** (`MRI`, `PSA`, `EKG`, `TUR-B`).
+- **Targets** are auto-detected from the same canonical terms (`fuzzy_terms()`: plain lines +
+  pair RHS, so `Türb=TUR-B` registers `TUR-B`): only letters/digits/hyphens with **2–6 letters,
+  all uppercase** (`MRI`, `PSA`, `EKG`, `TUR-B`).
   Matching key = letters only (`TUR-B` → `TURB`). Rebuilt on `POST /words`, like the fuzzy matcher.
 - **Scan**: finals are scanned for runs of **≥2 adjacent tokens that are ALL recognized German
   letter names** (`em→M, er→R, es→S, pe→P, te→T, ka→K, …`; a single alphabetic char stands for

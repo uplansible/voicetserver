@@ -6,11 +6,14 @@
 //   PlainTerm                — fuzzy phonetic target: transcribed words that sound like it
 //                              are snapped onto this canonical spelling (see FuzzyMatcher)
 //
+// Both the plain terms *and* the correction side of a pair are canonical
+// vocabulary, so both feed the fuzzy / abbreviation passes (see `fuzzy_terms`).
+//
 // Example:
-//   Migration=Miktion
-//   Miktion
+//   Migration=Miktion        — "Miktion" is also a fuzzy target, no extra line needed
 //   Diurese
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -76,6 +79,30 @@ impl WordsCorrector {
             .collect()
     }
 
+    /// Canonical vocabulary terms used as targets by the fuzzy phonetic matcher
+    /// and the abbreviation expander: the plain terms **plus** the correction
+    /// side of every `wrong=correct` pair (the RHS is a canonical spelling too —
+    /// the model rarely mishears it the same way twice, so the literal pair
+    /// alone cannot keep up). Order-preserving, duplicates removed.
+    pub fn fuzzy_terms(&self) -> Vec<&str> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out: Vec<&str> = Vec::new();
+        for line in &self.raw_lines {
+            let term = match line.split_once('=') {
+                None => line.as_str(),
+                Some((pat, rep)) => {
+                    // Skip malformed pairs — from_str ignores them too.
+                    if pat.trim().is_empty() { continue; }
+                    rep.trim()
+                }
+            };
+            if !term.is_empty() && seen.insert(term) {
+                out.push(term);
+            }
+        }
+        out
+    }
+
     /// Apply all replacement pairs to `text` and return the corrected string.
     /// Returns the input unchanged if no replacement pairs are defined.
     pub fn apply(&self, text: &str) -> String {
@@ -95,7 +122,8 @@ impl WordsCorrector {
 // `wrong=correct` pairs cannot keep up. The FuzzyMatcher snaps any transcribed
 // word that is *phonetically close* to a known hotword onto the canonical
 // spelling, regardless of which variant the model emitted. Targets are the
-// plain (non-`=`) terms in custom_words.txt.
+// canonical terms of custom_words.txt: the plain (non-`=`) lines plus the
+// correction side of every `wrong=correct` pair.
 //
 // Matching is gated by BOTH a *near* Kölner Phonetik (Cologne phonetics) code
 // AND a bounded normalized Levenshtein distance, to avoid replacing legitimately
@@ -119,30 +147,84 @@ const FUZZY_MIN_LEN: usize = 4;
 /// leading-`0` normalisation. Kept small so the orthographic gate dominates.
 const FUZZY_MAX_CODE_DIST: usize = 1;
 
+/// German inflection endings that may be stripped off a transcribed word — or
+/// off a canonical term — before the two matching gates are applied. The list
+/// is deliberately small: only endings that carry grammar, never derivational
+/// suffixes (which change the word, not its form).
+const INFLECTION_SUFFIXES: &[&str] = &["innen", "ern", "en", "em", "er", "es", "ns", "e", "n", "s"];
+
+/// A stem must retain at least this many characters; stripping "en" off a
+/// five-letter word would compare noise.
+const STEM_MIN_LEN: usize = 5;
+
+/// Every (stem, suffix) split of `word` that a German inflection ending allows,
+/// always including the unsplit word itself (suffix ""). Original casing is
+/// preserved: target stems supply the replacement prefix, word suffixes the
+/// inflection to carry over.
+fn inflection_splits(word: &str) -> Vec<(String, String)> {
+    let mut out = vec![(word.to_string(), String::new())];
+    let lower = word.to_lowercase();
+    let n = word.chars().count();
+    for suf in INFLECTION_SUFFIXES {
+        let k = suf.chars().count();
+        if n < k + STEM_MIN_LEN || !lower.ends_with(suf) {
+            continue;
+        }
+        out.push((
+            word.chars().take(n - k).collect(),
+            word.chars().skip(n - k).collect(),
+        ));
+    }
+    out
+}
+
+/// One canonical term stem (the full term, or the term minus one inflection
+/// ending) with its comparison key and phonetic code.
+struct TargetSplit {
+    /// Stem in the canonical term's own casing — the replacement prefix.
+    stem: String,
+    /// Lowercased stem — the comparison key.
+    key:  String,
+    /// Kölner Phonetik code of the stem.
+    code: String,
+    /// Characters stripped off the canonical term (0 = the full term).
+    cut:  usize,
+}
+
 /// Fuzzy matcher built from the canonical hotword/vocabulary terms
-/// (the plain terms in custom_words.txt).
+/// (`WordsCorrector::fuzzy_terms`).
 pub struct FuzzyMatcher {
-    /// (canonical spelling, Kölner Phonetik code) for each single-word target.
-    /// Multi-word / hyphenated / digit-bearing terms are excluded because the
-    /// word scanner splits on non-alphabetic characters and could not match them.
-    targets: Vec<(String, String)>,
+    /// Every inflection split of every single-word target. Multi-word /
+    /// hyphenated / digit-bearing terms are excluded because the word scanner
+    /// splits on non-alphabetic characters and could not match them.
+    targets: Vec<TargetSplit>,
 }
 
 impl FuzzyMatcher {
     /// Build a matcher from the canonical hotword terms.
     pub fn new(terms: &[String]) -> Self {
-        let targets = terms
-            .iter()
-            .filter(|t| is_single_word(t))
-            .map(|t| (t.clone(), koelner_phonetik(t)))
-            .filter(|(_, code)| !code.is_empty())
-            .collect();
+        let mut targets = Vec::new();
+        for term in terms.iter().filter(|t| is_single_word(t)) {
+            for (stem, suf) in inflection_splits(term) {
+                let code = koelner_phonetik(&stem);
+                if code.is_empty() {
+                    continue;
+                }
+                targets.push(TargetSplit {
+                    key: stem.to_lowercase(),
+                    stem,
+                    code,
+                    cut: suf.chars().count(),
+                });
+            }
+        }
         Self { targets }
     }
 
-    /// Build a matcher directly from a WordsCorrector's plain terms.
+    /// Build a matcher directly from a WordsCorrector's canonical terms
+    /// (plain terms + the correction side of every replacement pair).
     pub fn from_corrector(corrector: &WordsCorrector) -> Self {
-        let terms: Vec<String> = corrector.plain_terms().iter().map(|s| s.to_string()).collect();
+        let terms: Vec<String> = corrector.fuzzy_terms().iter().map(|s| s.to_string()).collect();
         Self::new(&terms)
     }
 
@@ -152,7 +234,7 @@ impl FuzzyMatcher {
 
     /// Snap phonetically-close words in `text` onto their canonical hotword
     /// spelling. `max_ratio` is the maximum normalized Levenshtein distance
-    /// (distance / longer-word-length) accepted as a match. Word separators
+    /// (distance / longer-stem-length) accepted as a match. Word separators
     /// (spaces, punctuation) are preserved verbatim.
     pub fn correct(&self, text: &str, max_ratio: f32) -> String {
         if self.targets.is_empty() {
@@ -178,41 +260,71 @@ impl FuzzyMatcher {
     }
 
     /// Decide whether a single word should be replaced by a canonical hotword.
-    /// Returns the canonical spelling on a match, otherwise the word unchanged.
+    ///
+    /// Matching runs on *stems*: both the word and each target may shed one
+    /// German inflection ending first. Two consequences:
+    ///   * If the word's stem already equals a target's stem, the word is the
+    ///     canonical term in a different grammatical form ("zweizeitigen" vs
+    ///     "zweizeitige") — it is returned untouched, so declension survives.
+    ///   * A misspelled inflected form is repaired stem-first and keeps its own
+    ///     ending: "zweiseitigen" → "zweizeitige" + "n".
+    /// Replacements always come from a *whole* canonical term; a shortened
+    /// target stem is only ever used for the recognition test, because a
+    /// truncated stem is not a word ("Gutwein" minus "n" would swallow "gute").
     fn snap(&self, word: &str, max_ratio: f32) -> String {
         if word.chars().count() < FUZZY_MIN_LEN {
             return word.to_string();
         }
-        let code = koelner_phonetik(word);
-        if code.is_empty() {
+        let splits: Vec<(String, String, String)> = inflection_splits(word)
+            .into_iter()
+            .filter_map(|(stem, suf)| {
+                let code = koelner_phonetik(&stem);
+                (!code.is_empty()).then(|| (stem.to_lowercase(), suf, code))
+            })
+            .collect();
+        if splits.is_empty() {
             return word.to_string();
         }
-        let code_n = strip_leading_zero(&code);
-        let wl = word.to_lowercase();
 
-        let mut best: Option<(&str, usize)> = None;
-        for (canon, ccode) in &self.targets {
-            // Phonetic gate: near (not identical) codes, ignoring a leading edge-vowel `0`.
-            if levenshtein(strip_leading_zero(ccode), code_n) > FUZZY_MAX_CODE_DIST {
-                continue;
-            }
-            let cl = canon.to_lowercase();
-            if cl == wl {
-                // Already the canonical spelling — leave untouched.
-                return word.to_string();
-            }
-            let d = levenshtein(&wl, &cl);
-            let maxlen = wl.chars().count().max(cl.chars().count());
-            if maxlen == 0 {
-                continue;
-            }
-            if (d as f32 / maxlen as f32) <= max_ratio
-                && best.map_or(true, |(_, bd)| d < bd)
-            {
-                best = Some((canon, d));
+        // (replacement, distance, chars cut off the target, chars of word suffix)
+        let mut best: Option<(String, usize, usize, usize)> = None;
+        for (wkey, wsuf, wcode) in &splits {
+            let wcode_n = strip_leading_zero(wcode);
+            for t in &self.targets {
+                // Phonetic gate: near (not identical) codes, ignoring a leading edge-vowel `0`.
+                if levenshtein(strip_leading_zero(&t.code), wcode_n) > FUZZY_MAX_CODE_DIST {
+                    continue;
+                }
+                if t.key == *wkey {
+                    // Already the canonical stem — only the inflection differs.
+                    return word.to_string();
+                }
+                // A shortened target stem may only *recognise* an inflection
+                // (above), never supply a replacement: "Gutwein" minus its "n"
+                // would otherwise pull the everyday word "gute" onto "Gutwei".
+                if t.cut > 0 {
+                    continue;
+                }
+                let d = levenshtein(wkey, &t.key);
+                let maxlen = wkey.chars().count().max(t.key.chars().count());
+                if maxlen == 0 || (d as f32 / maxlen as f32) > max_ratio {
+                    continue;
+                }
+                // Carry the word's own ending over to the canonical term —
+                // unless the term already ends that way, which would double it
+                // ("Besten" + "en").
+                let repl = if wsuf.is_empty() || t.key.ends_with(&wsuf.to_lowercase()) {
+                    t.stem.clone()
+                } else {
+                    format!("{}{}", t.stem, wsuf)
+                };
+                let cand = (repl, d, t.cut, wsuf.chars().count());
+                if best.as_ref().map_or(true, |b| (cand.1, cand.2, cand.3) < (b.1, b.2, b.3)) {
+                    best = Some(cand);
+                }
             }
         }
-        best.map_or_else(|| word.to_string(), |(canon, _)| canon.to_string())
+        best.map_or_else(|| word.to_string(), |(res, ..)| res)
     }
 }
 
@@ -225,8 +337,9 @@ impl FuzzyMatcher {
 // matcher can never join, and hyphen/digit-bearing targets like `TUR-B` are
 // excluded from fuzzy matching entirely. This pass handles them:
 //
-//   1. Targets are the plain custom_words.txt terms that *look like* acronyms:
-//      2–6 letters, all uppercase, only letters/digits/hyphens (MRI, PSA, TUR-B).
+//   1. Targets are the canonical custom_words.txt terms (plain lines + the
+//      correction side of pairs) that *look like* acronyms: 2–6 letters, all
+//      uppercase, only letters/digits/hyphens (MRI, PSA, TUR-B).
 //   2. The final transcript is scanned for runs of ≥2 adjacent tokens that are
 //      ALL recognized German letter names (`em→M, er→R, i→I, …`; a single
 //      alphabetic character stands for itself).
@@ -263,7 +376,7 @@ impl AbbrevExpander {
     }
 
     pub fn from_corrector(corrector: &WordsCorrector) -> Self {
-        let terms: Vec<String> = corrector.plain_terms().iter().map(|s| s.to_string()).collect();
+        let terms: Vec<String> = corrector.fuzzy_terms().iter().map(|s| s.to_string()).collect();
         Self::new(&terms)
     }
 
@@ -590,11 +703,84 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_targets_from_plain_terms_only() {
-        // Replacement pairs (with '=') must not become fuzzy targets.
+    fn fuzzy_targets_include_pair_corrections() {
+        // Plain terms and the correction side of a pair are both fuzzy targets;
+        // the wrong side (LHS) never is — it is handled by the literal pass.
         let c = WordsCorrector::from_str("Migration=Miktion\nBetmiga\nToviaz\n");
+        assert_eq!(c.fuzzy_terms(), vec!["Miktion", "Betmiga", "Toviaz"]);
         let m = FuzzyMatcher::from_corrector(&c);
         assert_eq!(m.correct("Bedmika", 0.34), "Betmiga");
+        // "Miktzion" is not caught by the literal pair but sounds like Miktion.
+        assert_eq!(m.correct("Miktzion", 0.34), "Miktion");
+    }
+
+    #[test]
+    fn fuzzy_keeps_inflected_forms_of_a_target() {
+        // A declined form of a canonical term is the term, not a misspelling —
+        // stem equality must leave it exactly as dictated.
+        let terms = vec!["zweizeitige".to_string(), "Miktion".to_string(),
+                         "Betmiga".to_string(), "Hodentumor".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        for w in ["zweizeitige", "zweizeitigen", "zweizeitiger", "zweizeitig",
+                  "Miktion", "Miktionen", "Betmigas", "Hodentumoren"] {
+            assert_eq!(m.correct(w, 0.34), w, "{w} must survive untouched");
+        }
+        assert_eq!(m.correct("die zweizeitigen Eingriffe", 0.34), "die zweizeitigen Eingriffe");
+    }
+
+    #[test]
+    fn fuzzy_repairs_stem_and_keeps_the_ending() {
+        // Misspelled *and* inflected: fix the stem, carry the dictated ending over.
+        let terms = vec!["zweizeitige".to_string(), "Miktion".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        assert_eq!(m.correct("eine zweiseitigen Resektion", 0.34), "eine zweizeitigen Resektion");
+        assert_eq!(m.correct("Miktzionen", 0.34), "Miktionen");
+        // Uninflected misspelling still snaps to the plain canonical spelling.
+        assert_eq!(m.correct("Miktzion", 0.34), "Miktion");
+    }
+
+    #[test]
+    fn fuzzy_never_replaces_from_a_shortened_target() {
+        // "Gutwein" minus its "n" is not a word; used as a replacement it would
+        // swallow the everyday "gute". Shortened stems recognise only.
+        let terms = vec!["Gutwein".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        assert_eq!(m.correct("gute", 0.34), "gute");
+        assert_eq!(m.correct("Gutweins", 0.34), "Gutweins");
+    }
+
+    #[test]
+    fn fuzzy_does_not_double_an_ending() {
+        // The word's ending is only carried over when the canonical term does
+        // not already end that way — otherwise "Besten" + "en" = "Bestenen".
+        let terms = vec!["Besten".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        assert_eq!(m.correct("bestehen", 0.34), "Besten");
+    }
+
+    #[test]
+    fn fuzzy_prefers_the_whole_word_match_on_a_tie() {
+        // "Tovias" matches both as a whole word (d=1) and via a stripped "s"
+        // (d=1); the unsplit candidate must win, else "Toviazs".
+        let terms = vec!["Toviaz".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        assert_eq!(m.correct("Tovias", 0.34), "Toviaz");
+    }
+
+    #[test]
+    fn fuzzy_terms_dedupes_and_skips_malformed() {
+        // RHS repeated as a plain line -> one target; malformed pairs with an
+        // empty side are skipped (from_str ignores them too).
+        let c = WordsCorrector::from_str("Migration=Miktion\nMiktion\n=Leer\nToviaz=\n");
+        assert_eq!(c.fuzzy_terms(), vec!["Miktion"]);
+    }
+
+    #[test]
+    fn abbrev_targets_include_pair_corrections() {
+        let c = WordsCorrector::from_str("Türb=TUR-B\nMRI\n");
+        let a = AbbrevExpander::from_corrector(&c);
+        assert_eq!(a.expand("Zustand nach Te U Er Be im März."),
+                   "Zustand nach TUR-B im März.");
     }
 
     #[test]
