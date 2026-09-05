@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.21
+// @version      0.1.22
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -859,33 +859,30 @@
     }
 
     async function saveWords() {
-        const rawLines = configPanel
-            .querySelector("#schmidi-words")
-            .value.split("\n")
-            .map((s) => s.trim())
-            .filter(Boolean);
+        const ta = configPanel.querySelector("#schmidi-words");
+        const allLines = ta.value.split("\n").map((s) => s.trim()).filter(Boolean);
 
-        // Duplicate check (skip comment lines)
+        // Duplicate handling: drop later duplicates (the first occurrence wins,
+        // matching the server's aho-corasick LeftmostFirst behaviour), warn about
+        // what was removed, and save the cleaned list. Comment lines are exempt.
         const lhsSet   = new Set();
         const plainSet = new Set();
-        for (const line of rawLines) {
-            if (line.startsWith("#")) continue;
+        const dropped  = [];
+        const rawLines = [];
+        for (const line of allLines) {
+            if (line.startsWith("#")) { rawLines.push(line); continue; }
             if (line.includes("=")) {
                 const lhs = line.split("=")[0].trim().toLowerCase();
-                if (lhsSet.has(lhs)) {
-                    setWordsStatus(`Doppelter Eintrag: "${lhs}" — bitte korrigieren`, true);
-                    return;
-                }
+                if (lhsSet.has(lhs)) { dropped.push(line); continue; }
                 lhsSet.add(lhs);
             } else {
                 const low = line.toLowerCase();
-                if (plainSet.has(low)) {
-                    setWordsStatus(`Doppelter Eintrag: "${line}" — bitte korrigieren`, true);
-                    return;
-                }
+                if (plainSet.has(low)) { dropped.push(line); continue; }
                 plainSet.add(low);
             }
+            rawLines.push(line);
         }
+        if (dropped.length) ta.value = rawLines.join("\n") + "\n";
 
         setWordsStatus("Speichere Wörter…", false);
         try {
@@ -901,7 +898,10 @@
                 body: JSON.stringify({ add, remove }),
             });
             if (!res.ok) throw new Error(await res.text());
-            setWordsStatus(`Gespeichert ✓ (${rawLines.length} Einträge)`, false);
+            const dupMsg = dropped.length
+                ? ` — ${dropped.length} Duplikat${dropped.length > 1 ? "e" : ""} entfernt: ${dropped.join(", ")}`
+                : "";
+            setWordsStatus(`Gespeichert ✓ (${rawLines.length} Einträge)${dupMsg}`, dropped.length > 0);
         } catch (e) {
             setWordsStatus("Fehler: " + e.message, true);
         }
