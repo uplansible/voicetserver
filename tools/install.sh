@@ -452,6 +452,10 @@ if [[ -f "$CONFIG_FILE" ]] && grep -qE '^[[:space:]]*port[[:space:]]*=' "$CONFIG
     [[ -n "$CFG_PORT" ]] && SERVICE_PORT="$CFG_PORT"
 fi
 
+# Which exposure the run actually configured — decides the closing summary.
+# CERT_CONFIGURED stays specific to the self-hosted-TLS branch (it gates the
+# renewal timer); it must not be set by the service branch, which has no cert.
+EXPOSURE_MODE=none
 CERT_CONFIGURED=false
 if command -v tailscale &>/dev/null; then
     TS_HOST=$(tailscale status --json 2>/dev/null \
@@ -492,7 +496,7 @@ if command -v tailscale &>/dev/null; then
 
             if sudo tailscale serve --service="svc:${SVC_NAME}" --https=443 \
                     "http://127.0.0.1:${SERVICE_PORT}"; then
-                CERT_CONFIGURED=true
+                EXPOSURE_MODE=service
                 echo ""
                 echo "Approve the host: Services -> ${SVC_NAME} -> Service hosts -> Approve."
                 echo "Until then the address does not resolve to anything and a browser"
@@ -549,6 +553,7 @@ if command -v tailscale &>/dev/null; then
             fi
 
             if [[ "$CERT_CONFIGURED" == true ]]; then
+                EXPOSURE_MODE=tls
                 set_config_value "tls_cert" "$CERT_FILE"
                 set_config_value "tls_key" "$KEY_FILE"
                 set_config_value "bind_addr" "0.0.0.0"
@@ -674,7 +679,13 @@ if [[ -n "$QWEN_DIR" ]]; then
 else
     echo "  Qwen3:    disabled (qwen_model_dir not set)"
 fi
-if [[ "$CERT_CONFIGURED" == true ]]; then
+if [[ "$EXPOSURE_MODE" == "service" ]]; then
+    # TLS ends at the proxy, so the service URL carries no port. The tailnet is
+    # the node FQDN minus its first label (gpu.tail1234.ts.net -> tail1234.ts.net).
+    TAILNET="${TS_HOST:-}"; TAILNET="${TAILNET#*.}"
+    echo "  Exposure: Tailscale Service svc:${SVC_NAME} -> 127.0.0.1:${SERVICE_PORT}"
+    echo "  External: wss://${SVC_NAME}.${TAILNET:-<tailnet>.ts.net}/asr"
+elif [[ "$EXPOSURE_MODE" == "tls" ]]; then
     echo "  TLS cert: $CERT_FILE"
-    echo "  External: wss://${TS_HOST}:8765"
+    echo "  External: wss://${TS_HOST}:${SERVICE_PORT}/asr"
 fi
