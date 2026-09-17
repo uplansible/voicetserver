@@ -312,11 +312,16 @@ impl FuzzyMatcher {
                 }
                 // Carry the word's own ending over to the canonical term —
                 // unless the term already ends that way, which would double it
-                // ("Besten" + "en").
+                // ("Besten" + "en"). The ending is re-cased after the canonical
+                // term rather than kept as dictated: the term supplies the
+                // spelling, so an all-caps "MIKTZIONEN" must yield "Miktionen"
+                // and not the mixed-case "MiktionEN".
                 let repl = if wsuf.is_empty() || t.key.ends_with(&wsuf.to_lowercase()) {
                     t.stem.clone()
+                } else if t.stem.chars().any(|c| c.is_lowercase()) {
+                    format!("{}{}", t.stem, wsuf.to_lowercase())
                 } else {
-                    format!("{}{}", t.stem, wsuf)
+                    format!("{}{}", t.stem, wsuf.to_uppercase())
                 };
                 let cand = (repl, d, t.cut, wsuf.chars().count());
                 if best.as_ref().map_or(true, |b| (cand.1, cand.2, cand.3) < (b.1, b.2, b.3)) {
@@ -737,6 +742,16 @@ mod tests {
         assert_eq!(m.correct("Miktzionen", 0.34), "Miktionen");
         // Uninflected misspelling still snaps to the plain canonical spelling.
         assert_eq!(m.correct("Miktzion", 0.34), "Miktion");
+    }
+
+    #[test]
+    fn fuzzy_recases_the_carried_ending() {
+        // The canonical term dictates the spelling of the whole replacement, so
+        // a shouted "MIKTZIONEN" must not come back as "MiktionEN".
+        let terms = vec!["Miktion".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        assert_eq!(m.correct("MIKTZIONEN", 0.34), "Miktionen");
+        assert_eq!(m.correct("Miktzionen", 0.34), "Miktionen");
     }
 
     #[test]
