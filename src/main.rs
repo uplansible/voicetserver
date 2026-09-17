@@ -1796,12 +1796,16 @@ mod server {
         remove: Option<Vec<String>>,
     }
 
-    async fn words_post_handler(
-        State(state): State<Arc<AppState>>,
-        Json(body): Json<WordsPatch>,
-    ) -> Response {
+    /// Read-modify-write custom_words.txt and rebuild the in-memory corrector +
+    /// fuzzy matcher + acronym expander. Shared by POST /words (explicit user edits)
+    /// and log_edit_handler (auto-added edit-log corrections).
+    async fn apply_words_patch(
+        state: &Arc<AppState>,
+        add: Vec<String>,
+        remove: Vec<String>,
+    ) -> std::io::Result<Vec<String>> {
         // Hold the corrector write lock across the whole read-modify-write so two
-        // concurrent POST /words requests cannot lose each other's changes.
+        // concurrent callers cannot lose each other's changes.
         let mut words_guard = state.words.write().await;
 
         // Preserve comment lines (in their original order) and manage only the actual
@@ -1821,26 +1825,33 @@ mod server {
             }
         }
 
-        for w in body.add.unwrap_or_default() {
+        for w in add {
             let w = w.trim().to_string();
             if !w.is_empty() { words.insert(w); }
         }
-        for w in body.remove.unwrap_or_default() { words.remove(w.trim()); }
+        for w in remove { words.remove(w.trim()); }
 
         let mut new_content = String::new();
         for c in &comments { new_content.push_str(c); new_content.push('\n'); }
         for w in &words    { new_content.push_str(w); new_content.push('\n'); }
-        match tokio::fs::write(&state.words_path, new_content).await {
-            Ok(_) => {
-                // Rebuild the in-memory corrector + fuzzy matcher + acronym
-                // expander from the updated file
-                let new_corrector = WordsCorrector::load(&state.words_path);
-                let raw_lines = new_corrector.raw_lines.clone();
-                *state.fuzzy.write().await = FuzzyMatcher::from_corrector(&new_corrector);
-                *state.abbrev.write().await = AbbrevExpander::from_corrector(&new_corrector);
-                *words_guard = new_corrector;
-                Json(json!({ "words": raw_lines })).into_response()
-            }
+        tokio::fs::write(&state.words_path, new_content).await?;
+
+        // Rebuild the in-memory corrector + fuzzy matcher + acronym
+        // expander from the updated file
+        let new_corrector = WordsCorrector::load(&state.words_path);
+        let raw_lines = new_corrector.raw_lines.clone();
+        *state.fuzzy.write().await = FuzzyMatcher::from_corrector(&new_corrector);
+        *state.abbrev.write().await = AbbrevExpander::from_corrector(&new_corrector);
+        *words_guard = new_corrector;
+        Ok(raw_lines)
+    }
+
+    async fn words_post_handler(
+        State(state): State<Arc<AppState>>,
+        Json(body): Json<WordsPatch>,
+    ) -> Response {
+        match apply_words_patch(&state, body.add.unwrap_or_default(), body.remove.unwrap_or_default()).await {
+            Ok(raw_lines) => Json(json!({ "words": raw_lines })).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
     }
@@ -2605,6 +2616,21 @@ mod server {
         if let Err(e) = f.write_all(line.as_bytes()).await {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
+
+        // Auto-add every word-level correction from this edit directly as a
+        // wrong=correct custom_words pair — no separate "suggestions" review step.
+        // Unwanted ones are removed like any other custom word (delete the line,
+        // dictate it again to re-derive a fresh correction if still needed).
+        let pairs: Vec<String> = word_diffs(&body.original, &body.edited)
+            .into_iter()
+            .map(|(o, e)| format!("{o}={e}"))
+            .collect();
+        if !pairs.is_empty() {
+            if let Err(e) = apply_words_patch(&state, pairs, Vec::new()).await {
+                eprintln!("log_edit_handler: failed to auto-add word pairs: {e}");
+            }
+        }
+
         Json(json!({ "status": "ok" })).into_response()
     }
 

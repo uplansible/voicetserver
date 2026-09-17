@@ -97,9 +97,24 @@ files (`tekken.json`, `consolidated.safetensors`) from
 `tokenizer.json` is not on HuggingFace and is generated via `transformers` — installed into
 the venv on demand), installs the binary to `~/.local/bin/voicetserver` (prebuilt **gpu**
 from `tools/voicetserver-cuda`, prebuilt **cpu** if present, or **compile** from source),
-ensures `~/.local/bin` is on PATH, and provisions a Tailscale TLS cert + weekly systemd
-renewal timer. All choices have sensible defaults; existing model/venv/config are detected
-and skipped. Writes/updates `~/.config/voicetserver/config.toml`.
+ensures `~/.local/bin` is on PATH, asks how the server should be reachable, and offers a
+`voicetserver.service` systemd unit so it survives a reboot. All choices have sensible
+defaults; existing model/venv/config are detected and skipped. Writes/updates
+`~/.config/voicetserver/config.toml`.
+
+Exposure has two modes:
+- **Tailscale Service** (default) — `tailscale serve --service=svc:<name> --https=443` puts
+  TLS on a per-service virtual IP proxying to loopback, so the server binds `127.0.0.1` and
+  holds no cert (`tls_cert`/`tls_key` are commented out). URL: `wss://<svc>.<tailnet>.ts.net/asr`,
+  no port. Needs a tagged node and a service already defined in the admin console — the
+  installer only advertises, it cannot create either.
+- **Self-hosted TLS** (legacy) — `tailscale cert` for the node FQDN, `bind_addr = 0.0.0.0`,
+  plus the weekly `tailscale-cert-renewal.timer`. Exposes the port to the whole LAN.
+
+The unit copies `LD_LIBRARY_PATH` and `PATH` out of the installing shell: a login shell picks
+CUDA up from `~/.bashrc`, a systemd service inherits nothing, and without it the server dies
+with `CublasError(CUBLAS_STATUS_NOT_INITIALIZED)` — which also happens when a second instance
+already holds the card.
 
 # Test
 
@@ -344,7 +359,9 @@ The model often transcribes unfamiliar proper names / medical terms with a sligh
     `zweiseitigen` → `zweizeitige` + `n` = `zweizeitigen`.
   - Replacements always come from a **whole** canonical term; a shortened target stem is used only
     for the recognition test above (`Gutwein` minus `n` would otherwise pull `gute` → `Gutwei`).
-    The ending is not carried over when the term already ends that way (no `Besten` + `en`).
+    The ending is not carried over when the term already ends that way (no `Besten` + `en`),
+    and it is re-cased after the canonical term rather than kept as dictated (`MIKTZIONEN` →
+    `Miktionen`, not `MiktionEN`).
   - Candidates rank by edit distance, then by shortest stripped word-suffix — so an unsplit match
     wins a tie (`Tovias` → `Toviaz`, not `Toviazs`).
 - Only single all-alphabetic terms are fuzzy targets (multi-word / hyphenated / digit-bearing
@@ -468,8 +485,8 @@ invisible to the trainer until accepted.
 - `DELETE /training/review/{id}` — discard candidate (WAV + JSONL entry)
 
 **Edit-log mining:**
-- `POST /log/edit` — `{"original","edited","timestamp"}` — appended to `edit_log.jsonl` by the userscript when a commit-mode dictation is edited before insertion
-- `GET /edits/report` — `{"entries":N,"suggestions":[{"original","edited","count"},…]}` — aggregates the edit log into the most frequent word-level corrections (LCS word diff per entry, changed runs ≤4 words paired as removed→inserted, punctuation-only changes skipped, top 30 by count). Direct candidates for custom_words `wrong=correct` entries; surfaced by the userscript's "💡 Vorschläge aus Korrekturen" button in the Eigene Wörter tab.
+- `POST /log/edit` — `{"original","edited","timestamp"}` — appended to `edit_log.jsonl` by the userscript when a commit-mode dictation is edited before insertion. The handler then runs `word_diffs(original, edited)` (LCS word diff; changed runs ≤4 words paired as removed→inserted, punctuation-only changes skipped) and auto-adds each pair as a `wrong=correct` line straight into `custom_words.txt` via the same read-modify-write + corrector-rebuild path as `POST /words` (`apply_words_patch`) — no separate suggestions/review step. An unwanted auto-added pair is removed the same way any custom word is: delete the line in the Eigene Wörter tab; dictating the correction again re-derives it if still needed.
+- `GET /edits/report` — `{"entries":N,"suggestions":[{"original","edited","count"},…]}` — aggregates the edit log into the most frequent word-level corrections, same `word_diffs` logic, top 30 by count. Diagnostic only now (no UI reads it) since corrections are auto-added on every edit.
 
 Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl` (one
 pool — it trains both models' LoRAs). Adapter output is per-model:
@@ -544,8 +561,9 @@ Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Einstellun
 Text is inserted live at cursor on each `final`; trailing partial inserted on stop.
 Falls back to clipboard if no editable element was captured.
 
-Right-click → seven tabs: **Eigene Wörter** (server-side custom words + "💡 Vorschläge aus
-Korrekturen" from `GET /edits/report`), **Hotwords** (client-side GM-stored list sent per session
+Right-click → seven tabs: **Eigene Wörter** (server-side custom words — commit-mode edit-log
+corrections are auto-added here server-side, see Edit-log mining above; no in-tab review step),
+**Hotwords** (client-side GM-stored list sent per session
 via `?hotwords=`; biasing only on Qwen3), **Aufnehmen** (record calibration sentences),
 **2. Durchgang** (record once-recorded sentences — `pair_ids.length === 1` — a second time),
 **Training** (review pairs, delete, LoRA), **Diktate** (real-dictation review, below),

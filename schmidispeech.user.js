@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.22
+// @version      0.1.24
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -109,6 +109,8 @@
     let pendingText = "";          // commit mode: accumulated text not yet injected
     let originalTranscribed = "";  // commit mode: model output snapshot for edit-log diff
     let overlayUserEdited = false; // commit mode: user has started editing the overlay div
+    let discardOnStop = false;     // Insert clicked mid-recording: ignore the server's drained
+                                   // tail instead of reopening the overlay with it
     let dictationPcmBuffers = [];  // 16 kHz PCM chunks of the running dictation
     let lastDictation = null;      // { pcm, text, saved } — last finished dictation
                                    // (kept so it can be saved as a training-pair candidate)
@@ -335,6 +337,14 @@
                 }).catch(() => {});
             }
         }
+        if (recording) {
+            // Insert can be pressed mid-recording: stop the mic/session too and
+            // discard whatever the server drains afterward instead of the overlay
+            // reopening with the trailing tail once the flush arrives.
+            discardOnStop = true;
+            stopRecording();
+            setIdle();
+        }
         clearOverlay();
     });
 
@@ -463,8 +473,6 @@
         <div id="schmidi-pane-woerter" style="display:none;flex-direction:column;gap:6px;">
             <div style="${LABEL_STYLE}">Eigene Wörter (ein Wort pro Zeile; falsch=richtig für Ersetzungen)</div>
             <textarea id="schmidi-words" rows="8" style="${INPUT_STYLE}font-family:monospace;resize:vertical;"></textarea>
-            <button id="schmidi-words-suggest" style="${BTN_CANCEL};width:100%;" title="Häufigste Wort-Korrekturen aus dem Edit-Log (Diktat-bestätigen-Modus)">💡 Vorschläge aus Korrekturen</button>
-            <div id="schmidi-words-suggest-list" style="display:none;max-height:120px;overflow-y:auto;border:1px solid #333;border-radius:6px;"></div>
             <div id="schmidi-words-status" style="color:#aaa;font-size:11px;min-height:14px;"></div>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
                 <button id="schmidi-cancel-woerter" style="${BTN_CANCEL}">Schließen</button>
@@ -777,46 +785,9 @@
         }
     }
 
-    // ---- Eigene Wörter: suggestions mined from the edit log ----
-    // GET /edits/report aggregates commit-mode original→edited diffs into the
-    // most frequent word-level corrections; ＋ appends a wrong=correct line to
-    // the textarea (the user still saves explicitly).
-    async function loadWordSuggestions() {
-        const listEl = configPanel.querySelector('#schmidi-words-suggest-list');
-        if (!listEl) return;
-        listEl.style.display = 'block';
-        listEl.innerHTML = '<div style="padding:6px;color:#666;font-size:11px;">Lade…</div>';
-        try {
-            const res = await authFetch(`${getHttpBase()}/edits/report`);
-            if (!res.ok) throw new Error(res.status === 404
-                ? 'Auf diesem Server nicht verfügbar' : 'GET /edits/report: ' + res.status);
-            const data = await res.json();
-            const sugg = data.suggestions || [];
-            if (sugg.length === 0) {
-                listEl.innerHTML = `<div style="padding:6px;color:#666;font-size:11px;">Keine Korrekturen im Edit-Log (${data.entries || 0} Diktate)</div>`;
-                return;
-            }
-            listEl.innerHTML = sugg.map(s => `
-                <div style="display:flex;align-items:center;gap:4px;padding:3px 6px;border-bottom:1px solid #2a2a2a;">
-                    <span style="flex:1;font-size:11px;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(s.original)} → ${escapeHtml(s.edited)}">${escapeHtml(s.original)} → ${escapeHtml(s.edited)}</span>
-                    <span style="color:#888;font-size:10px;">${s.count}×</span>
-                    <button class="sp-sugg-add" data-line="${escapeHtml(`${s.original}=${s.edited}`)}" style="background:#333;color:#8f8;border:1px solid #555;border-radius:4px;padding:1px 6px;cursor:pointer;font-size:11px;">＋</button>
-                </div>`).join('');
-            listEl.onclick = (e) => {
-                const addBtn = e.target.closest('.sp-sugg-add');
-                if (!addBtn) return;
-                const ta   = configPanel.querySelector('#schmidi-words');
-                const line = addBtn.dataset.line;
-                const lines = ta.value.split('\n').map(l => l.trim());
-                if (lines.includes(line)) { setWordsStatus('Bereits vorhanden', false); return; }
-                ta.value = ta.value.replace(/\s*$/, '') + (ta.value.trim() ? '\n' : '') + line + '\n';
-                setWordsStatus(`Hinzugefügt: ${line} — Speichern nicht vergessen`, false);
-            };
-        } catch (e) {
-            listEl.innerHTML = `<div style="padding:6px;color:#e74c3c;font-size:11px;">${escapeHtml(e.message)}</div>`;
-        }
-    }
-    configPanel.querySelector('#schmidi-words-suggest').addEventListener('click', loadWordSuggestions);
+    // Commit-mode edit-log corrections are now auto-added to custom_words.txt
+    // server-side on every POST /log/edit (see CLAUDE.md — Edit-log mining) — no
+    // client-side suggestions review step; reload the tab to see them appear.
 
     // Parse a numeric input field. Returns undefined for empty/invalid input,
     // but preserves a legitimate 0 (which `value || undefined` would wrongly drop).
@@ -873,6 +844,10 @@
             if (line.startsWith("#")) { rawLines.push(line); continue; }
             if (line.includes("=")) {
                 const lhs = line.split("=")[0].trim().toLowerCase();
+                // A pair with no left side is malformed, not a duplicate — the
+                // server ignores it either way. Keying them all on "" would make
+                // every one after the first vanish as a bogus "Duplikat".
+                if (!lhs) { rawLines.push(line); continue; }
                 if (lhsSet.has(lhs)) { dropped.push(line); continue; }
                 lhsSet.add(lhs);
             } else {
@@ -2142,6 +2117,18 @@
         awaitingFinalFlush = false;
         if (ws) { ws.close(); ws = null; }
 
+        if (discardOnStop) {
+            // Insert already injected the text and closed the overlay — just
+            // finish tearing the session down, nothing left to show.
+            discardOnStop  = false;
+            pendingText    = "";
+            currentPartial = "";
+            dictationPcmBuffers = [];
+            setIdle();
+            updateOverlay();
+            return;
+        }
+
         if (isCommitMode()) {
             // Add trailing partial to pending text; snapshot for edit-log
             if (currentPartial) pendingText += currentPartial;
@@ -2245,7 +2232,7 @@
             } else if (msg.type === "final") {
                 // Fallback to currentPartial if server sends empty final
                 const text = msg.text || currentPartial;
-                if (text) {
+                if (text && !discardOnStop) {
                     if (isCommitMode()) {
                         pendingText += text;
                         if (!overlayUserEdited) {
