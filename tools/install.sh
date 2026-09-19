@@ -299,6 +299,84 @@ else
     fi
 fi
 
+# --- Optional second Qwen3-ASR size (hot-swappable at runtime via the
+#     userscript's size selector / POST /qwen/switch — only one is ever loaded
+#     at once, so this is an addition, not a replacement of $QWEN_DIR above) ---
+if [[ -n "$QWEN_DIR" ]]; then
+    EXISTING_QWEN_ALT_DIR=""
+    if grep -qE '^[[:space:]]*qwen_model_dir_alt[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+        EXISTING_QWEN_ALT_DIR=$(grep -E '^[[:space:]]*qwen_model_dir_alt[[:space:]]*=' "$CONFIG_FILE" \
+            | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+    fi
+    echo ""
+    if [[ -n "$EXISTING_QWEN_ALT_DIR" && -f "$EXISTING_QWEN_ALT_DIR/model.safetensors" ]]; then
+        echo "Second Qwen3 size already configured at $EXISTING_QWEN_ALT_DIR — keeping it."
+    else
+        printf "Also install a second Qwen3-ASR size, hot-swappable at runtime (0.6B <-> 1.7B, download ~4 GB for 1.7B)? [y/N]: "
+        read -r QWEN_ALT_CHOICE
+        if [[ "${QWEN_ALT_CHOICE,,}" == "y" ]]; then
+            printf "Which size? [0.6b/1.7b, default: 1.7b]: "
+            read -r QWEN_ALT_SIZE
+            QWEN_ALT_SIZE="${QWEN_ALT_SIZE:-1.7b}"
+            ALT_HF_REPO="" ; ALT_LABEL=""
+            case "${QWEN_ALT_SIZE,,}" in
+                0.6b) ALT_HF_REPO="Qwen/Qwen3-ASR-0.6B"; ALT_LABEL="0.6B" ;;
+                1.7b) ALT_HF_REPO="Qwen/Qwen3-ASR-1.7B"; ALT_LABEL="1.7B" ;;
+                *) echo "Unknown size '$QWEN_ALT_SIZE' — skipping second slot." >&2 ;;
+            esac
+            if [[ -n "$ALT_HF_REPO" ]]; then
+                DEFAULT_QWEN_ALT_DIR="$HOME/models/Qwen3-ASR-${ALT_LABEL}"
+                printf "Directory for %s [%s]: " "$ALT_LABEL" "$DEFAULT_QWEN_ALT_DIR"
+                read -r QWEN_ALT_DIR
+                QWEN_ALT_DIR="${QWEN_ALT_DIR:-$DEFAULT_QWEN_ALT_DIR}"
+                if [[ "$QWEN_ALT_DIR" == "$QWEN_DIR" ]]; then
+                    echo "Error: second slot directory must differ from the primary ($QWEN_DIR) — skipping." >&2
+                else
+                    mkdir -p "$QWEN_ALT_DIR"
+                    echo "Downloading Qwen3-ASR-$ALT_LABEL files to: $QWEN_ALT_DIR"
+                    ALT_HF_BASE="https://huggingface.co/$ALT_HF_REPO/resolve/main"
+                    ALT_QWEN_FILES=(config.json tokenizer.json tokenizer_config.json vocab.json
+                                     merges.txt preprocessor_config.json generation_config.json
+                                     model.safetensors)
+                    for f in "${ALT_QWEN_FILES[@]}"; do
+                        if [[ -f "$QWEN_ALT_DIR/$f" ]]; then
+                            echo "  $f — already present, skipping"
+                        else
+                            echo "  Downloading $f ..."
+                            if ! wget -q --show-progress -O "$QWEN_ALT_DIR/$f" "$ALT_HF_BASE/$f"; then
+                                rm -f "$QWEN_ALT_DIR/$f"
+                                echo "  Warning: $f not available from HuggingFace" >&2
+                            fi
+                        fi
+                    done
+                    if [[ -f "$QWEN_ALT_DIR/model.safetensors" && ! -f "$QWEN_ALT_DIR/tokenizer.json" ]]; then
+                        echo "tokenizer.json not found — generating from tokenizer config ..."
+                        if ! "$VENV_PATH/bin/python3" -c "import transformers" 2>/dev/null; then
+                            TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir transformers
+                        fi
+                        QWEN_ALT_DIR="$QWEN_ALT_DIR" "$VENV_PATH/bin/python3" -c "
+import os
+model_dir = os.environ['QWEN_ALT_DIR']
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+tok.save_pretrained(model_dir)
+print('  tokenizer.json written to', model_dir)
+" || echo "  Warning: could not generate tokenizer.json — see CLAUDE.md for the manual command." >&2
+                    fi
+                    set_config_value "qwen_model_dir_alt" "$QWEN_ALT_DIR"
+                    set_config_value "qwen_model_size_alt" "$ALT_LABEL"
+                    # Label the primary slot too if unset, so the userscript's
+                    # size selector shows a real size instead of a placeholder.
+                    if ! grep -qE '^[[:space:]]*qwen_model_size[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+                        set_config_value "qwen_model_size" "0.6B"
+                    fi
+                    echo "qwen_model_dir_alt set to: $QWEN_ALT_DIR ($ALT_LABEL)"
+                fi
+            fi
+        fi
+    fi
+fi
+
 # --- Generate tokenizer.json if missing ---
 # tokenizer.json is not published on HuggingFace; derive it from the tokenizer
 # config using transformers (installed into the venv on demand — the trainers

@@ -45,13 +45,29 @@ pub struct ConfigFile {
     pub tls_cert:     Option<String>,
     pub tls_key:      Option<String>,
     pub lora_adapter: Option<String>,
-    /// Qwen LoRA adapter directory (adapters are per-model — weight-key formats differ).
+    /// Qwen LoRA adapter directory for the primary slot (adapters are per-model
+    /// and per-size — weight-key formats / shapes differ).
     pub lora_adapter_qwen: Option<String>,
+    /// Qwen LoRA adapter directory for the secondary slot.
+    pub lora_adapter_qwen_alt: Option<String>,
     pub venv_path:    Option<String>,
     pub data_dir:     Option<String>,
-    /// Qwen3-ASR model directory. When unset the qwen engine is disabled and
-    /// `/asr?model=qwen` sessions get an error frame.
+    /// Qwen3-ASR model directory (primary slot). When unset the qwen engine is
+    /// disabled and `/asr?model=qwen` sessions get an error frame.
     pub qwen_model_dir: Option<String>,
+    /// Display label for the primary qwen slot (e.g. "0.6B") — cosmetic, shown
+    /// in the userscript's size selector.
+    pub qwen_model_size: Option<String>,
+    /// Secondary qwen model directory — a second checkpoint hot-swappable at
+    /// runtime via POST /qwen/switch (e.g. a Qwen3-ASR-1.7B checkout). Unset =
+    /// only the primary slot exists and no size selector is shown client-side.
+    pub qwen_model_dir_alt: Option<String>,
+    /// Display label for the secondary qwen slot.
+    pub qwen_model_size_alt: Option<String>,
+    /// Which qwen slot is loaded at startup ("primary"|"secondary", default
+    /// "primary"). Persisted on every POST /qwen/switch so a restart resumes
+    /// on the last-used size.
+    pub qwen_active_slot: Option<String>,
     /// Transcription language for the qwen engine (Voxtral has no language control).
     pub language:     Option<String>,
     /// API key for authenticating HTTP/WebSocket requests. Auto-generated on first
@@ -87,14 +103,25 @@ pub struct MergedConfig {
     pub bind_addr: Sourced<String>,
     pub tls_cert:  Sourced<Option<String>>,
     pub tls_key:   Sourced<Option<String>>,
-    /// Qwen3-ASR model directory; None = qwen engine disabled.
+    /// Qwen3-ASR model directory (primary slot); None = qwen engine disabled.
     pub qwen_model_dir: Sourced<Option<String>>,
     // Plain merged
     pub device:       usize,
     pub port:         u16,
     pub lora_adapter: Option<String>,
-    /// Qwen LoRA adapter directory (config file only, no CLI flag).
+    /// Qwen LoRA adapter directory, primary slot (config file only, no CLI flag).
     pub lora_adapter_qwen: Option<String>,
+    /// Display label for the primary qwen slot (e.g. "0.6B").
+    pub qwen_model_size: Option<String>,
+    /// Secondary qwen model directory (config file only, no CLI flag) — a
+    /// second checkpoint hot-swappable via POST /qwen/switch.
+    pub qwen_model_dir_alt: Option<String>,
+    /// Display label for the secondary qwen slot.
+    pub qwen_model_size_alt: Option<String>,
+    /// Qwen LoRA adapter directory, secondary slot.
+    pub lora_adapter_qwen_alt: Option<String>,
+    /// Which qwen slot is active at startup ("primary"|"secondary").
+    pub qwen_active_slot: String,
     pub venv_path:    Option<String>,
     /// Base directory for custom_words.txt, training/, lora_adapter/, training_sentences.txt.
     /// Defaults to config_dir() (~/.config/voicetserver/) when not set.
@@ -154,7 +181,8 @@ pub struct WorkspacePaths {
     pub training_pairs:     PathBuf,  // {data_dir}/training/pairs.jsonl
     pub training_sentences: PathBuf,  // {data_dir}/training_sentences.txt
     pub lora_output_dir:    PathBuf,  // {data_dir}/lora_adapter/ (voxtral)
-    pub lora_output_dir_qwen: PathBuf, // {data_dir}/lora_adapter_qwen/
+    pub lora_output_dir_qwen: PathBuf, // {data_dir}/lora_adapter_qwen/ (primary slot)
+    pub lora_output_dir_qwen_alt: PathBuf, // {data_dir}/lora_adapter_qwen_alt/ (secondary slot)
     pub edit_log:           PathBuf,  // {data_dir}/edit_log.jsonl
     pub review_dir:         PathBuf,  // {data_dir}/training/review/ (candidate WAVs)
     pub review_jsonl:       PathBuf,  // {data_dir}/training/review.jsonl
@@ -171,6 +199,7 @@ impl WorkspacePaths {
             training_sentences: data_dir.join("training_sentences.txt"),
             lora_output_dir:    data_dir.join("lora_adapter"),
             lora_output_dir_qwen: data_dir.join("lora_adapter_qwen"),
+            lora_output_dir_qwen_alt: data_dir.join("lora_adapter_qwen_alt"),
             edit_log:           data_dir.join("edit_log.jsonl"),
             review_dir:         training.join("review"),
             review_jsonl:       training.join("review.jsonl"),
@@ -184,12 +213,24 @@ impl WorkspacePaths {
 
 const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # All fields are optional — omit to use the compiled default.
-# Restart required for: model_dir, qwen_model_dir, language, device, port, bind_addr, tls_cert, tls_key, lora_adapter, lora_adapter_qwen
+# Restart required for: model_dir, qwen_model_dir, qwen_model_size, qwen_model_dir_alt, qwen_model_size_alt,
+#   language, device, port, bind_addr, tls_cert, tls_key, lora_adapter, lora_adapter_qwen, lora_adapter_qwen_alt
 # Runtime-adjustable via PATCH /config: delay, silence_threshold, silence_flush, min_speech, rms_ema, fuzzy_hotwords, fuzzy_max_ratio, german_prime, context_biasing
+# Runtime-switchable (no restart) via POST /qwen/switch: qwen_active_slot
 
 # model_dir = "/path/to/Voxtral-Mini-4B-Realtime"
 # qwen_model_dir = "/path/to/Qwen3-ASR-0.6B"   # second engine (model.safetensors, config.json,
 #                                               # tokenizer.json); omit to disable qwen
+# qwen_model_size = "0.6B"                      # cosmetic label for the primary slot
+
+# Optional second qwen checkpoint (e.g. Qwen3-ASR-1.7B), hot-swappable at
+# runtime via POST /qwen/switch (no restart) — only one is loaded at a time.
+# Omit both _alt fields to disable the size selector entirely.
+# qwen_model_dir_alt  = "/path/to/Qwen3-ASR-1.7B"
+# qwen_model_size_alt = "1.7B"
+# qwen_active_slot = "primary"   # "primary"|"secondary" — which slot loads at startup;
+#                                 # rewritten automatically by POST /qwen/switch
+
 # language = "German"                           # qwen transcription language (Voxtral auto-detects)
 # bind_addr = "127.0.0.1"
 # port = 8765
@@ -198,7 +239,8 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # device = 0
 # venv_path = "/mnt/ssdupl/voicetserver-venv"   # Python venv for LoRA training
 # lora_adapter = "/path/to/lora_adapter"          # Voxtral LoRA adapter loaded at startup
-# lora_adapter_qwen = "/path/to/lora_adapter_qwen" # Qwen LoRA adapter (per-model — key formats differ)
+# lora_adapter_qwen = "/path/to/lora_adapter_qwen" # Qwen LoRA adapter, primary slot (per-size — key formats/shapes differ)
+# lora_adapter_qwen_alt = "/path/to/lora_adapter_qwen_alt" # Qwen LoRA adapter, secondary slot
 # data_dir = "/path/to/data"   # base for custom_words.txt, training/, lora_adapter/, training_sentences.txt
 #                               # defaults to ~/.config/voicetserver/ when unset
 
@@ -367,8 +409,13 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let (qwen_model_dir_val, qwen_model_dir_src) =
         merge_opt_str(&cli.qwen_model_dir, &file.qwen_model_dir);
     let lora_adapter = cli.lora_adapter.clone().or_else(|| file.lora_adapter.clone());
-    // Qwen adapter: config file only (no CLI flag), like fuzzy_hotwords.
+    // Qwen adapters + secondary slot: config file only (no CLI flag), like fuzzy_hotwords.
     let lora_adapter_qwen = file.lora_adapter_qwen.clone();
+    let qwen_model_size = file.qwen_model_size.clone();
+    let qwen_model_dir_alt = file.qwen_model_dir_alt.clone();
+    let qwen_model_size_alt = file.qwen_model_size_alt.clone();
+    let lora_adapter_qwen_alt = file.lora_adapter_qwen_alt.clone();
+    let qwen_active_slot = file.qwen_active_slot.clone().unwrap_or_else(|| "primary".to_string());
     let venv_path    = cli.venv_path.clone().or_else(|| file.venv_path.clone());
     let log_file      = cli.log_file.clone().or_else(|| file.log_file.clone());
     let log_keep_days = cli.log_keep_days.or(file.log_keep_days).unwrap_or(7);
@@ -387,6 +434,11 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
         port,
         lora_adapter,
         lora_adapter_qwen,
+        qwen_model_size,
+        qwen_model_dir_alt,
+        qwen_model_size_alt,
+        lora_adapter_qwen_alt,
+        qwen_active_slot,
         venv_path,
         data_dir,
         delay,

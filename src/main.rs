@@ -259,6 +259,19 @@ fn run() -> Result<()> {
     if let Some(ref dir) = merged.qwen_model_dir.value {
         check_path(dir, merged.qwen_model_dir.source, "qwen_model_dir")?;
     }
+    // Validate the secondary qwen slot if configured (config file only, no CLI flag)
+    if let Some(ref dir) = merged.qwen_model_dir_alt {
+        check_path(dir, ValueSource::ConfigFile, "qwen_model_dir_alt")?;
+    }
+    if merged.qwen_active_slot != "primary" && merged.qwen_active_slot != "secondary" {
+        anyhow::bail!(
+            "qwen_active_slot (from config file): must be \"primary\" or \"secondary\" (got \"{}\")",
+            merged.qwen_active_slot);
+    }
+    if merged.qwen_active_slot == "secondary" && merged.qwen_model_dir_alt.is_none() {
+        anyhow::bail!(
+            "qwen_active_slot is \"secondary\" (from config file) but qwen_model_dir_alt is not set");
+    }
 
     // Validate TLS paths if provided
     if let Some(ref cert) = merged.tls_cert.value {
@@ -365,9 +378,22 @@ fn run() -> Result<()> {
         if merged.fuzzy_hotwords { format!(" (max ratio {})", merged.fuzzy_max_ratio) } else { String::new() });
     println!("{:<28} {}", "German prime (experimental)",
         if merged.german_prime { "on" } else { "off" });
+    let qwen_active_dir = if merged.qwen_active_slot == "secondary" {
+        merged.qwen_model_dir_alt.as_deref()
+    } else {
+        merged.qwen_model_dir.value.as_deref()
+    };
     println!("{:<28} {}", "Qwen3 engine",
-        merged.qwen_model_dir.value.as_deref().unwrap_or("disabled (qwen_model_dir not set)"));
-    if merged.qwen_model_dir.value.is_some() {
+        qwen_active_dir.unwrap_or("disabled (qwen_model_dir not set)"));
+    if qwen_active_dir.is_some() {
+        if merged.qwen_model_dir_alt.is_some() {
+            println!("{:<28} {} ({})", "Qwen3 slot", merged.qwen_active_slot,
+                if merged.qwen_active_slot == "secondary" {
+                    merged.qwen_model_size_alt.as_deref().unwrap_or("size unset")
+                } else {
+                    merged.qwen_model_size.as_deref().unwrap_or("size unset")
+                });
+        }
         println!("{:<28} {}", "Qwen3 language", merged.language);
         println!("{:<28} {}", "Qwen3 context biasing",
             if merged.context_biasing { "on" } else { "off" });
@@ -434,15 +460,27 @@ fn run() -> Result<()> {
             // Second engine (Qwen3-ASR) — server mode only; offline WAV mode stays
             // Voxtral-only until phase 3 adds ?model= routing. Shares the candle
             // Device with Voxtral (one CUDA context, separate GPU lock per engine).
-            let qwen_engine = match merged.qwen_model_dir.value {
+            // Which slot loads at startup: "secondary" only when qwen_active_slot
+            // says so *and* a secondary dir is actually configured (validated above).
+            let qwen_dir_to_load = if merged.qwen_active_slot == "secondary" {
+                merged.qwen_model_dir_alt.clone()
+            } else {
+                merged.qwen_model_dir.value.clone()
+            };
+            let qwen_lora_to_apply = if merged.qwen_active_slot == "secondary" {
+                merged.lora_adapter_qwen_alt.clone()
+            } else {
+                merged.lora_adapter_qwen.clone()
+            };
+            let qwen_engine = match qwen_dir_to_load {
                 Some(ref dir) => {
-                    println!("Loading Qwen3-ASR engine: {}", dir);
+                    println!("Loading Qwen3-ASR engine ({} slot): {}", merged.qwen_active_slot, dir);
                     let t_qwen = Instant::now();
                     let engine = qwen::QwenEngine::load(dir, device.clone())?;
                     println!("Qwen3-ASR loaded in {:.2}s", t_qwen.elapsed().as_secs_f64());
                     // Apply the qwen LoRA adapter if configured (pre-tokio, so the
                     // blocking lock inside is safe). Warn-and-continue like Voxtral.
-                    if let Some(ref adapter_dir) = merged.lora_adapter_qwen {
+                    if let Some(ref adapter_dir) = qwen_lora_to_apply {
                         println!("Applying Qwen LoRA adapter: {}", adapter_dir);
                         match engine.apply_lora_blocking(Path::new(adapter_dir)) {
                             Ok(())  => println!("Qwen LoRA adapter applied."),
@@ -1037,6 +1075,9 @@ mod server {
         let snapshot = StartupSnapshot {
             model_dir:    merged.model_dir.value.clone(),
             qwen_model_dir: merged.qwen_model_dir.value.clone(),
+            qwen_model_size: merged.qwen_model_size.clone(),
+            qwen_model_dir_alt: merged.qwen_model_dir_alt.clone(),
+            qwen_model_size_alt: merged.qwen_model_size_alt.clone(),
             language:     merged.language.clone(),
             device:       merged.device,
             port:         merged.port,
@@ -1044,9 +1085,13 @@ mod server {
             tls_enabled,
             lora_adapter: merged.lora_adapter.clone(),
             lora_adapter_qwen: merged.lora_adapter_qwen.clone(),
+            lora_adapter_qwen_alt: merged.lora_adapter_qwen_alt.clone(),
             venv_path:    merged.venv_path.clone(),
             data_dir:     merged.data_dir.to_string_lossy().into_owned(),
         };
+        let qwen_active_slot = Arc::new(tokio::sync::RwLock::new(
+            if merged.qwen_active_slot == "secondary" { QwenSlot::Secondary } else { QwenSlot::Primary }
+        ));
 
         // SIGUSR1: redirect stdout/stderr to log file (triggered by watchdog parent on 'd' press).
         if watchdog_active {
@@ -1104,9 +1149,15 @@ mod server {
         ));
         // Only meaningful when the qwen engine is enabled; a configured
         // lora_adapter_qwen without an engine must not report lora_active_qwen.
+        // Reflects whichever slot actually loaded at startup (see qwen_active_slot).
         let qwen_lora_path = Arc::new(tokio::sync::RwLock::new(
             if qwen.is_some() {
-                snapshot.lora_adapter_qwen.as_ref().map(std::path::PathBuf::from)
+                let adapter = if merged.qwen_active_slot == "secondary" {
+                    &snapshot.lora_adapter_qwen_alt
+                } else {
+                    &snapshot.lora_adapter_qwen
+                };
+                adapter.as_ref().map(std::path::PathBuf::from)
             } else {
                 None
             }
@@ -1127,6 +1178,7 @@ mod server {
             paths,
             lora_path,
             qwen_lora_path,
+            qwen_active_slot,
             api_key,
             pair_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
@@ -1167,6 +1219,7 @@ mod server {
             .route("/training/review/audio/{id}",   get(review_audio_handler))
             .route("/lora/reload",          axum::routing::post(lora_reload_handler))
             .route("/lora",                 axum::routing::delete(lora_clear_handler))
+            .route("/qwen/switch",          axum::routing::post(qwen_switch_handler))
             .route("/log/edit",             axum::routing::post(log_edit_handler))
             .route("/edits/report",         get(edit_report_handler))
             .route_layer(middleware::from_fn_with_state(Arc::clone(&state), api_key_auth));
@@ -1213,6 +1266,52 @@ mod server {
         Ok(())
     }
 
+    /// Which qwen checkpoint is currently loaded — the runtime-switchable half
+    /// of the qwen size selector (POST /qwen/switch). The two slots' dirs/sizes/
+    /// LoRA paths themselves are fixed at startup (StartupSnapshot); only which
+    /// one is active can change without a restart.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+    #[serde(rename_all = "lowercase")]
+    enum QwenSlot {
+        Primary,
+        Secondary,
+    }
+
+    impl QwenSlot {
+        fn as_str(self) -> &'static str {
+            match self { QwenSlot::Primary => "primary", QwenSlot::Secondary => "secondary" }
+        }
+    }
+
+    /// Resolved config for whichever qwen slot is asked about — the dir/size/
+    /// default-LoRA/LoRA-output-dir quadruple that's duplicated per slot in
+    /// StartupSnapshot/WorkspacePaths. Used by GET /config, POST /qwen/switch,
+    /// and training_run_handler so all three stay in sync with the active slot.
+    struct QwenSlotConfig {
+        model_dir: Option<String>,
+        model_size: Option<String>,
+        lora_adapter: Option<String>,
+        lora_output_dir: std::path::PathBuf,
+    }
+
+    fn qwen_slot_config(state: &AppState, slot: QwenSlot) -> QwenSlotConfig {
+        let snap = &state.startup_snapshot;
+        match slot {
+            QwenSlot::Primary => QwenSlotConfig {
+                model_dir: snap.qwen_model_dir.clone(),
+                model_size: snap.qwen_model_size.clone(),
+                lora_adapter: snap.lora_adapter_qwen.clone(),
+                lora_output_dir: state.paths.lora_output_dir_qwen.clone(),
+            },
+            QwenSlot::Secondary => QwenSlotConfig {
+                model_dir: snap.qwen_model_dir_alt.clone(),
+                model_size: snap.qwen_model_size_alt.clone(),
+                lora_adapter: snap.lora_adapter_qwen_alt.clone(),
+                lora_output_dir: state.paths.lora_output_dir_qwen_alt.clone(),
+            },
+        }
+    }
+
     #[derive(Clone)]
     struct AppState {
         model:             Arc<VoxtralModel>,
@@ -1237,6 +1336,10 @@ mod server {
         /// Currently active Qwen LoRA adapter path (adapters are per-model —
         /// weight-key formats differ). Updated by POST /lora/reload?model=qwen.
         qwen_lora_path:    Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
+        /// Which qwen checkpoint (0.6B / 1.7B) is currently loaded. Updated by
+        /// POST /qwen/switch; the two slots' own config lives in
+        /// startup_snapshot/paths, fixed until restart.
+        qwen_active_slot:  Arc<tokio::sync::RwLock<QwenSlot>>,
         /// API key required on every endpoint except GET /health.
         api_key:           String,
         /// Serialises training-file writes: pair upload + delete (so concurrent
@@ -1609,10 +1712,15 @@ mod server {
         let lora_dir = active_lora.clone()
             .or_else(|| snap.lora_adapter.as_ref().map(std::path::PathBuf::from))
             .unwrap_or_else(|| state.paths.lora_output_dir.clone());
+        let active_slot = *state.qwen_active_slot.read().await;
+        let active_slot_cfg = qwen_slot_config(&state, active_slot);
         let active_lora_qwen = state.qwen_lora_path.read().await.clone();
+        // Resolved against whichever slot (0.6B/1.7B) is currently loaded, not
+        // always the primary — otherwise the "LoRA verwenden" toggle would
+        // re-apply the wrong slot's adapter after a POST /qwen/switch.
         let lora_dir_qwen = active_lora_qwen.clone()
-            .or_else(|| snap.lora_adapter_qwen.as_ref().map(std::path::PathBuf::from))
-            .unwrap_or_else(|| state.paths.lora_output_dir_qwen.clone());
+            .or_else(|| active_slot_cfg.lora_adapter.as_ref().map(std::path::PathBuf::from))
+            .unwrap_or_else(|| active_slot_cfg.lora_output_dir.clone());
         // Available engines — the frontend hides qwen UI when "qwen" is absent.
         let models: Vec<&str> = if state.qwen.is_some() {
             vec!["voxtral", "qwen"]
@@ -1637,6 +1745,13 @@ mod server {
             // Startup-only — from snapshot; changing via PATCH writes config file but requires restart
             "model_dir":         snap.model_dir,
             "qwen_model_dir":    snap.qwen_model_dir,
+            "qwen_model_size":   snap.qwen_model_size,
+            "qwen_model_dir_alt":  snap.qwen_model_dir_alt,
+            "qwen_model_size_alt": snap.qwen_model_size_alt,
+            // Which slot is currently loaded ("primary"|"secondary"); absent
+            // qwen_model_dir_alt means there's only one slot and this is always
+            // "primary" — the userscript hides the size selector in that case.
+            "qwen_active_slot": active_slot.as_str(),
             "language":          snap.language,
             "device":            snap.device,
             "port":              snap.port,
@@ -1644,6 +1759,7 @@ mod server {
             "tls_enabled":       snap.tls_enabled,
             "lora_adapter":      snap.lora_adapter,
             "lora_adapter_qwen": snap.lora_adapter_qwen,
+            "lora_adapter_qwen_alt": snap.lora_adapter_qwen_alt,
             // Per-model LoRA state; the unsuffixed pair stays as voxtral aliases
             // during the frontend transition (phase 6).
             "lora_active":          active_lora.is_some(),
@@ -1653,8 +1769,8 @@ mod server {
             "lora_active_qwen":     active_lora_qwen.is_some(),
             "lora_dir_qwen":        lora_dir_qwen.to_string_lossy(),
             "venv_path":         snap.venv_path,
-            "_startup_only":     ["model_dir", "qwen_model_dir", "language", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter", "lora_adapter_qwen", "venv_path"],
-            "_note":             "Changing startup_only fields writes to config file but requires server restart."
+            "_startup_only":     ["model_dir", "qwen_model_dir", "qwen_model_size", "qwen_model_dir_alt", "qwen_model_size_alt", "language", "device", "port", "bind_addr", "tls_cert", "tls_key", "lora_adapter", "lora_adapter_qwen", "lora_adapter_qwen_alt", "venv_path"],
+            "_note":             "Changing startup_only fields writes to config file but requires server restart. qwen_active_slot changes at runtime via POST /qwen/switch instead."
         }))
     }
 
@@ -1675,6 +1791,9 @@ mod server {
         // Startup-only (written to file, restart required)
         model_dir:    Option<String>,
         qwen_model_dir: Option<String>,
+        qwen_model_size: Option<String>,
+        qwen_model_dir_alt: Option<String>,
+        qwen_model_size_alt: Option<String>,
         language:     Option<String>,
         device:       Option<usize>,
         port:         Option<u16>,
@@ -1683,6 +1802,7 @@ mod server {
         tls_key:      Option<String>,
         lora_adapter: Option<String>,
         lora_adapter_qwen: Option<String>,
+        lora_adapter_qwen_alt: Option<String>,
         venv_path:    Option<String>,
     }
 
@@ -1762,6 +1882,9 @@ mod server {
             if patch.context_biasing.is_some()   { cfg.context_biasing   = patch.context_biasing; }
             if patch.model_dir.is_some()         { cfg.model_dir         = patch.model_dir; }
             if patch.qwen_model_dir.is_some()    { cfg.qwen_model_dir    = patch.qwen_model_dir; }
+            if patch.qwen_model_size.is_some()   { cfg.qwen_model_size   = patch.qwen_model_size; }
+            if patch.qwen_model_dir_alt.is_some() { cfg.qwen_model_dir_alt = patch.qwen_model_dir_alt; }
+            if patch.qwen_model_size_alt.is_some() { cfg.qwen_model_size_alt = patch.qwen_model_size_alt; }
             if patch.language.is_some()          { cfg.language          = patch.language; }
             if patch.device.is_some()            { cfg.device            = patch.device; }
             if patch.port.is_some()              { cfg.port              = patch.port; }
@@ -1770,6 +1893,7 @@ mod server {
             if patch.tls_key.is_some()           { cfg.tls_key           = patch.tls_key; }
             if patch.lora_adapter.is_some()      { cfg.lora_adapter      = patch.lora_adapter; }
             if patch.lora_adapter_qwen.is_some() { cfg.lora_adapter_qwen = patch.lora_adapter_qwen; }
+            if patch.lora_adapter_qwen_alt.is_some() { cfg.lora_adapter_qwen_alt = patch.lora_adapter_qwen_alt; }
             if patch.venv_path.is_some()         { cfg.venv_path         = patch.venv_path; }
 
             if let Err(e) = save_config_file(&cfg) {
@@ -2109,16 +2233,29 @@ mod server {
         text: String,
     }
 
-    /// Append one JSONL entry `{"id","text","duration_s"}` to `jsonl_path`.
+    /// Append one JSONL entry `{"id","text","duration_s"[,"events"]}` to `jsonl_path`.
+    /// `events` (Part C — control-word event capture) is a raw JSON-array string
+    /// from the client; stored verbatim when present and parseable, omitted
+    /// otherwise (calibration pairs never carry it; old review entries predate it).
     async fn append_pair_entry(
         jsonl_path: &std::path::Path,
         id: &str,
         text: &str,
         duration_s: f32,
+        events: Option<&str>,
     ) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
-        let entry = format!("{{\"id\":\"{id}\",\"text\":{},\"duration_s\":{:.3}}}\n",
-            serde_json::to_string(text).unwrap_or_default(), duration_s);
+        let mut obj = json!({
+            "id": id,
+            "text": text,
+            "duration_s": ((duration_s as f64) * 1000.0).round() / 1000.0,
+        });
+        if let Some(raw) = events {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                obj["events"] = parsed;
+            }
+        }
+        let entry = format!("{}\n", serde_json::to_string(&obj).unwrap_or_default());
         let mut f = tokio::fs::OpenOptions::new()
             .create(true).append(true).open(jsonl_path).await?;
         f.write_all(entry.as_bytes()).await?;
@@ -2134,13 +2271,14 @@ mod server {
         jsonl_path: &std::path::Path,
         text: &str,
         pcm: &[f32],
+        events: Option<&str>,
     ) -> anyhow::Result<(String, f32, usize)> {
         tokio::fs::create_dir_all(audio_dir).await?;
         let (count, next_id) = pairs_stats(jsonl_path).await;
         let id = format!("{:04}", next_id);
         let duration_s = pcm.len() as f32 / 16000.0;
         save_training_wav(&audio_dir.join(format!("{id}.wav")), pcm)?;
-        append_pair_entry(jsonl_path, &id, text, duration_s).await?;
+        append_pair_entry(jsonl_path, &id, text, duration_s, events).await?;
         Ok((id, duration_s, count + 1))
     }
 
@@ -2161,7 +2299,7 @@ mod server {
         let _guard = state.pair_write_lock.lock().await;
 
         match save_pcm_pair(&state.paths.training_audio_dir, &state.paths.training_pairs,
-                            &params.text, &pcm).await
+                            &params.text, &pcm, None).await
         {
             Ok((id, duration_s, count)) =>
                 Json(json!({ "id": id, "duration_s": duration_s, "count": count })).into_response(),
@@ -2246,8 +2384,17 @@ mod server {
         };
 
         let data_dir   = state.paths.training_dir.clone();
+        // For qwen, always target whichever slot (0.6B/1.7B) is currently
+        // loaded — a LoRA trained against the wrong slot's weight shapes would
+        // silently fail to load (or corrupt lora_adapter_qwen's directory if it
+        // pointed there by mistake).
+        let active_qwen_slot = if train_qwen {
+            Some(qwen_slot_config(&state, *state.qwen_active_slot.read().await))
+        } else {
+            None
+        };
         let model_dir  = if train_qwen {
-            match state.startup_snapshot.qwen_model_dir.clone() {
+            match active_qwen_slot.as_ref().and_then(|c| c.model_dir.clone()) {
                 Some(d) => d,
                 None => return (StatusCode::UNPROCESSABLE_ENTITY,
                     "Qwen engine not enabled — set qwen_model_dir in config.toml").into_response(),
@@ -2256,7 +2403,7 @@ mod server {
             state.startup_snapshot.model_dir.clone()
         };
         let output_dir = if train_qwen {
-            state.paths.lora_output_dir_qwen.clone()
+            active_qwen_slot.as_ref().unwrap().lora_output_dir.clone()
         } else {
             state.paths.lora_output_dir.clone()
         };
@@ -2360,6 +2507,106 @@ mod server {
         Json(json!({
             "status": ts.status,
             "log": ts.log,
+        })).into_response()
+    }
+
+    // ---- Qwen model-size switch ----
+
+    #[derive(serde::Deserialize)]
+    struct SwitchQuery {
+        slot: Option<String>,
+    }
+
+    /// POST /qwen/switch?slot=primary|secondary — hot-swap the loaded Qwen
+    /// checkpoint (e.g. 0.6B <-> 1.7B) without a restart. Only one slot is ever
+    /// loaded at a time — the target slot must be configured (qwen_model_dir /
+    /// qwen_model_dir_alt) or this 422s. `slot` is required and explicit (not a
+    /// toggle) so a client can't desync from the server's actual active slot.
+    ///
+    /// Unloads the current engine, frees its VRAM, loads the target slot's
+    /// checkpoint, re-applies that slot's own configured LoRA if any, and
+    /// persists `qwen_active_slot` to config.toml so a restart resumes here.
+    /// While switching (a few seconds), new `?model=qwen` sessions get the same
+    /// "engine not loaded" error already used during training unload.
+    async fn qwen_switch_handler(
+        State(state): State<Arc<AppState>>,
+        Query(q): Query<SwitchQuery>,
+    ) -> Response {
+        let target = match q.slot.as_deref() {
+            Some("primary")   => QwenSlot::Primary,
+            Some("secondary") => QwenSlot::Secondary,
+            _ => return (StatusCode::BAD_REQUEST,
+                "?slot= is required and must be \"primary\" or \"secondary\"").into_response(),
+        };
+
+        let Some(qwen) = state.qwen.as_ref() else {
+            return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "Qwen engine not enabled — set qwen_model_dir in config.toml"}))).into_response();
+        };
+
+        let current = *state.qwen_active_slot.read().await;
+        if current == target {
+            let cfg = qwen_slot_config(&state, target);
+            return Json(json!({
+                "status": "ok",
+                "active_slot": target.as_str(),
+                "model_dir": cfg.model_dir,
+                "model_size": cfg.model_size,
+                "lora_active": state.qwen_lora_path.read().await.is_some(),
+            })).into_response();
+        }
+
+        let target_cfg = qwen_slot_config(&state, target);
+        let Some(target_dir) = target_cfg.model_dir.clone() else {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+                "error": format!("qwen {} slot is not configured", target.as_str())
+            }))).into_response();
+        };
+
+        state.settings.state.store(crate::settings::STATE_LOADING, Ordering::SeqCst);
+
+        let qwen2 = Arc::clone(qwen);
+        let lora_dir = target_cfg.lora_adapter.clone().map(std::path::PathBuf::from);
+        let device = state.model.device.clone();
+        let switch_result = tokio::task::spawn_blocking(move || -> Result<()> {
+            qwen2.switch_model_blocking(&target_dir, lora_dir.as_deref())?;
+            // Release the old checkpoint's VRAM before/independent of the new
+            // load succeeding — switch_model_blocking already dropped it.
+            device.synchronize()?;
+            release_cuda_pool(&device)?;
+            Ok(())
+        }).await;
+
+        state.settings.state.store(crate::settings::STATE_READY, Ordering::SeqCst);
+
+        match switch_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Qwen model switch failed: {e}")}))).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Qwen model switch task panicked: {e}")}))).into_response(),
+        }
+
+        *state.qwen_active_slot.write().await = target;
+        *state.qwen_lora_path.write().await = target_cfg.lora_adapter.clone()
+            .map(std::path::PathBuf::from);
+
+        // Persist so a restart resumes on the last-used slot.
+        {
+            let mut cfg = state.config_file.lock().await;
+            cfg.qwen_active_slot = Some(target.as_str().to_string());
+            if let Err(e) = save_config_file(&cfg) {
+                eprintln!("Warning: failed to persist qwen_active_slot: {}", e);
+            }
+        }
+
+        eprintln!("Qwen model switched to {} slot: {}", target.as_str(), target_cfg.model_dir.as_deref().unwrap_or(""));
+        Json(json!({
+            "status": "ok",
+            "active_slot": target.as_str(),
+            "model_dir": target_cfg.model_dir,
+            "model_size": target_cfg.model_size,
+            "lora_active": state.qwen_lora_path.read().await.is_some(),
         })).into_response()
     }
 
@@ -2740,11 +2987,21 @@ mod server {
     // into pairs.jsonl or discards it. Candidates live in training/review/ +
     // review.jsonl and are invisible to the trainer until accepted.
 
-    /// POST /training/review?text=... — body raw f32 LE PCM 16kHz, `text` = model
-    /// transcript at save time.
+    #[derive(serde::Deserialize)]
+    struct ReviewQuery {
+        text: String,
+        /// Optional url-encoded JSON array of per-final events for this dictation
+        /// (Part C — audio + control-word markers): `{"type":"text"|"control",...}`
+        /// entries pushed client-side by the userscript. Stored verbatim in
+        /// review.jsonl; absent for older clients.
+        events: Option<String>,
+    }
+
+    /// POST /training/review?text=...[&events=...] — body raw f32 LE PCM 16kHz,
+    /// `text` = model transcript at save time, `events` = optional JSON event log.
     async fn review_add_handler(
         State(state): State<Arc<AppState>>,
-        Query(params): Query<TrainingPairQuery>,
+        Query(params): Query<ReviewQuery>,
         body: Bytes,
     ) -> Response {
         let pcm = crate::audio::decode_audio_bytes(&body);
@@ -2753,7 +3010,7 @@ mod server {
         }
         let _guard = state.pair_write_lock.lock().await;
         match save_pcm_pair(&state.paths.review_dir, &state.paths.review_jsonl,
-                            &params.text, &pcm).await
+                            &params.text, &pcm, params.events.as_deref()).await
         {
             Ok((id, duration_s, count)) =>
                 Json(json!({ "id": id, "duration_s": duration_s, "count": count })).into_response(),
@@ -2870,7 +3127,7 @@ mod server {
             return (StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to move WAV: {e}")).into_response();
         }
-        if let Err(e) = append_pair_entry(&state.paths.training_pairs, &new_id, &text, duration_s).await {
+        if let Err(e) = append_pair_entry(&state.paths.training_pairs, &new_id, &text, duration_s, None).await {
             return (StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Pair append error: {e}")).into_response();
         }

@@ -27,8 +27,15 @@ impl AtomicF32 {
 #[derive(serde::Serialize, Clone)]
 pub struct StartupSnapshot {
     pub model_dir:    String,
-    /// Qwen3-ASR model directory; None = qwen engine disabled.
+    /// Qwen3-ASR model directory, primary slot; None = qwen engine disabled.
     pub qwen_model_dir: Option<String>,
+    /// Display label for the primary qwen slot (e.g. "0.6B").
+    pub qwen_model_size: Option<String>,
+    /// Secondary qwen model directory (hot-swappable via POST /qwen/switch);
+    /// None = no second slot configured, size selector stays hidden client-side.
+    pub qwen_model_dir_alt: Option<String>,
+    /// Display label for the secondary qwen slot.
+    pub qwen_model_size_alt: Option<String>,
     /// Qwen transcription language (Voxtral auto-detects; no control).
     pub language:     String,
     pub device:       usize,
@@ -36,8 +43,10 @@ pub struct StartupSnapshot {
     pub bind_addr:    String,
     pub tls_enabled:  bool,
     pub lora_adapter: Option<String>,
-    /// Qwen LoRA adapter directory (adapters are per-model — key formats differ).
+    /// Qwen LoRA adapter directory, primary slot (adapters are per-model/size — key formats differ).
     pub lora_adapter_qwen: Option<String>,
+    /// Qwen LoRA adapter directory, secondary slot.
+    pub lora_adapter_qwen_alt: Option<String>,
     pub venv_path:    Option<String>,
     pub data_dir:     String,
 }

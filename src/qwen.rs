@@ -26,7 +26,10 @@ pub struct QwenEngine {
     /// `None` while unloaded for LoRA training (same pattern as `VoxtralModel::inner`).
     pub inner: tokio::sync::Mutex<Option<Arc<qwen3_asr::AsrInference>>>,
     /// Model directory — used to rebuild the engine when reloading after training.
-    pub model_dir: String,
+    /// Behind a plain std Mutex (not async) because it changes only briefly
+    /// during a training reload or a runtime `switch_model_blocking` call, both
+    /// of which already run on a blocking thread.
+    pub model_dir: std::sync::Mutex<String>,
     /// Device shared with the Voxtral engine (one CUDA context for both).
     pub device: Device,
 }
@@ -37,7 +40,7 @@ impl QwenEngine {
         let engine = load_inference(model_dir, &device)?;
         Ok(Self {
             inner: tokio::sync::Mutex::new(Some(Arc::new(engine))),
-            model_dir: model_dir.to_string(),
+            model_dir: std::sync::Mutex::new(model_dir.to_string()),
             device,
         })
     }
@@ -46,7 +49,8 @@ impl QwenEngine {
     /// LoRA adapter. Sync (model load takes seconds) — call from `spawn_blocking`
     /// or before the tokio runtime starts; `blocking_lock` panics in async context.
     pub fn reload_blocking(&self, lora_dir: Option<&Path>) -> Result<()> {
-        let engine = load_inference(&self.model_dir, &self.device)?;
+        let dir = self.model_dir.lock().unwrap().clone();
+        let engine = load_inference(&dir, &self.device)?;
         // Warn-and-continue on LoRA failure so a bad adapter never leaves the
         // engine unloaded (same semantics as the Voxtral load_enc_dec reload).
         if let Some(dir) = lora_dir {
@@ -54,6 +58,26 @@ impl QwenEngine {
                 eprintln!("Warning: Qwen LoRA reload failed ({}): {}", dir.display(), e);
             }
         }
+        *self.inner.blocking_lock() = Some(Arc::new(engine));
+        Ok(())
+    }
+
+    /// Hot-swap to a different model checkpoint at runtime (the Qwen size
+    /// selector: 0.6B <-> 1.7B), optionally re-applying that slot's own LoRA
+    /// adapter. Sync — same calling constraints as `reload_blocking`. Drops the
+    /// old engine (freeing its VRAM) before loading the new one, same order as
+    /// the training unload/reload cycle. On load failure the old model_dir is
+    /// left untouched and the engine stays unloaded (caller surfaces the error;
+    /// no silent partial state).
+    pub fn switch_model_blocking(&self, new_dir: &str, lora_dir: Option<&Path>) -> Result<()> {
+        *self.inner.blocking_lock() = None;
+        let engine = load_inference(new_dir, &self.device)?;
+        if let Some(dir) = lora_dir {
+            if let Err(e) = engine.load_lora(dir) {
+                eprintln!("Warning: Qwen LoRA load failed after model switch ({}): {}", dir.display(), e);
+            }
+        }
+        *self.model_dir.lock().unwrap() = new_dir.to_string();
         *self.inner.blocking_lock() = Some(Arc::new(engine));
         Ok(())
     }

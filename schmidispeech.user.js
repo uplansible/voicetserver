@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.24
+// @version      0.1.25
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -61,6 +61,49 @@
     function getHotwords() { return GM_getValue("hotwords", ""); }
     function setHotwords(v) { GM_setValue("hotwords", v); }
 
+    // Control words: spoken commands that delete the last word/sentence/
+    // punctuation-mark/newline instead of being inserted as text — for
+    // pause-heavy dictation where a mistake needs fixing mid-flow. Client-side
+    // only (GM storage, no server round-trip), same pattern as hotwords.
+    // "Phrase=action" per line; a whole pause-bounded final must match a phrase
+    // exactly (after normalization) to be treated as a command.
+    const DEFAULT_CONTROL_WORDS =
+`lösch das=delete_word
+letztes wort löschen=delete_word
+wort löschen=delete_word
+satz löschen=delete_sentence
+letzten satz löschen=delete_sentence
+satzzeichen löschen=delete_punctuation
+zeichen löschen=delete_punctuation
+zeilenumbruch löschen=delete_newline
+zeile löschen=delete_newline`;
+    function getControlWords() { return GM_getValue("control_words", DEFAULT_CONTROL_WORDS); }
+    function setControlWords(v) { GM_setValue("control_words", v); }
+
+    function normalizeControlPhrase(s) {
+        return (s || "").trim().toLowerCase().replace(/[.!?,;:]+$/, "").replace(/\s+/g, " ");
+    }
+
+    function controlWordMap() {
+        const map = new Map();
+        getControlWords().split("\n").forEach((line) => {
+            const idx = line.indexOf("=");
+            if (idx < 1) return;
+            const phrase = normalizeControlPhrase(line.slice(0, idx));
+            const action = line.slice(idx + 1).trim();
+            if (phrase && action) map.set(phrase, action);
+        });
+        return map;
+    }
+
+    // A whole final must match a configured phrase exactly (not a substring) —
+    // finals are already pause-bounded by the server's silence detector, so
+    // this keeps false positives low without needing fuzzy matching.
+    function matchControlWord(text) {
+        const key = normalizeControlPhrase(text);
+        return key ? (controlWordMap().get(key) || null) : null;
+    }
+
     // Hotwords stored as free text (one per line / comma separated); normalise to a
     // single comma-separated list for the ?hotwords= query parameter.
     function hotwordsForUrl() {
@@ -112,7 +155,9 @@
     let discardOnStop = false;     // Insert clicked mid-recording: ignore the server's drained
                                    // tail instead of reopening the overlay with it
     let dictationPcmBuffers = [];  // 16 kHz PCM chunks of the running dictation
-    let lastDictation = null;      // { pcm, text, saved } — last finished dictation
+    let dictationEvents = [];      // per-final {type:"text"|"control", text|action, t} log
+    let dictationStartedAt = 0;    // Date.now() at session start, for dictationEvents' t
+    let lastDictation = null;      // { pcm, text, events, saved } — last finished dictation
                                    // (kept so it can be saved as a training-pair candidate)
 
     // ---- Styles ----
@@ -429,9 +474,18 @@
             <button id="schmidi-model-voxtral" data-model="voxtral" style="${BTN_CANCEL};flex:1;">Voxtral</button>
             <button id="schmidi-model-qwen"    data-model="qwen"    style="${BTN_CANCEL};flex:1;">Qwen3</button>
         </div>
+        <!-- Qwen size selector: only shown when the server has a second qwen
+             checkpoint configured (qwen_model_dir_alt); switching hot-swaps the
+             loaded model server-side via POST /qwen/switch, no restart. -->
+        <div id="schmidi-qwen-size-row" style="display:none;gap:4px;margin-bottom:4px;align-items:center;">
+            <span style="${LABEL_STYLE}">Qwen-Größe:</span>
+            <button id="schmidi-qwen-size-primary"   data-slot="primary"   style="${BTN_CANCEL};flex:1;">–</button>
+            <button id="schmidi-qwen-size-secondary" data-slot="secondary" style="${BTN_CANCEL};flex:1;">–</button>
+        </div>
         <div style="display:flex;gap:0;border-bottom:1px solid #444;margin-bottom:4px;flex-wrap:wrap;">
             <button id="schmidi-tab-woerter"       style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Eigene Wörter</button>
             <button id="schmidi-tab-hotwords"      style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Hotwords</button>
+            <button id="schmidi-tab-steuerwoerter" style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Steuerwörter</button>
             <button id="schmidi-tab-aufnehmen"     style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Aufnehmen</button>
             <button id="schmidi-tab-zweiterdurchgang" style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">2. Durchgang</button>
             <button id="schmidi-tab-training"         style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Training</button>
@@ -447,6 +501,20 @@
             <div style="display:flex;gap:8px;justify-content:flex-end;">
                 <button id="schmidi-cancel-hotwords" style="${BTN_CANCEL}">Schließen</button>
                 <button id="schmidi-save-hotwords"   style="${BTN_PRIMARY}">Speichern</button>
+            </div>
+        </div>
+
+        <!-- Steuerwörter tab (client-side control-word vocabulary: spoken
+             commands that delete the last word/sentence/punctuation/newline
+             instead of being inserted as text — a whole pause-bounded final
+             must match a phrase exactly) -->
+        <div id="schmidi-pane-steuerwoerter" style="display:none;flex-direction:column;gap:6px;">
+            <div style="${LABEL_STYLE}">Steuerwörter (ein "Phrase=Aktion" pro Zeile; Aktionen: delete_word, delete_sentence, delete_punctuation, delete_newline)</div>
+            <textarea id="schmidi-control-words" rows="8" style="${INPUT_STYLE}font-family:monospace;resize:vertical;"></textarea>
+            <div id="schmidi-control-words-status" style="color:#aaa;font-size:11px;min-height:14px;"></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="schmidi-cancel-control-words" style="${BTN_CANCEL}">Schließen</button>
+                <button id="schmidi-save-control-words"   style="${BTN_PRIMARY}">Speichern</button>
             </div>
         </div>
 
@@ -651,6 +719,7 @@
     const TAB_LOADERS = {
         woerter: () => loadWords(),
         hotwords: () => loadHotwords(),
+        steuerwoerter: () => loadControlWordsTab(),
         aufnehmen: () => loadTrainingSentences(),
         zweiterdurchgang: () => loadSecondPassSentences(),
         training: () => loadTrainingPairs(),
@@ -671,10 +740,49 @@
         b.addEventListener("click", () => switchModel(b.dataset.model));
     });
 
+    // ---- Qwen size switching (0.6B <-> 1.7B, only when the server has both) ----
+    function styleQwenSizeButtons() {
+        const row = configPanel.querySelector("#schmidi-qwen-size-row");
+        if (!row) return;
+        const hasAlt = !!lastCfg.qwen_model_dir_alt;
+        row.style.display = hasAlt ? "flex" : "none";
+        if (!hasAlt) return;
+        const primaryBtn   = configPanel.querySelector("#schmidi-qwen-size-primary");
+        const secondaryBtn = configPanel.querySelector("#schmidi-qwen-size-secondary");
+        primaryBtn.textContent   = lastCfg.qwen_model_size     || "Primär";
+        secondaryBtn.textContent = lastCfg.qwen_model_size_alt || "Sekundär";
+        const active = lastCfg.qwen_active_slot || "primary";
+        [[primaryBtn, "primary"], [secondaryBtn, "secondary"]].forEach(([b, slot]) => {
+            const isActive = slot === active;
+            b.style.background = isActive ? "#2980b9" : "#333";
+            b.style.color      = isActive ? "#fff" : "#aaa";
+        });
+    }
+
+    async function switchQwenSize(slot) {
+        if (recording) { showToast("Modellwechsel während der Aufnahme nicht möglich"); return; }
+        if (slot === (lastCfg.qwen_active_slot || "primary")) return;
+        showToast("Wechsle Qwen-Modell…");
+        try {
+            const res = await authFetch(`${getHttpBase()}/qwen/switch?slot=${slot}`, { method: "POST" });
+            if (!res.ok) throw new Error("POST /qwen/switch: " + res.status);
+            await loadServerParams(); // refreshes lastCfg, size buttons, LoRA fallback dir
+            const loader = TAB_LOADERS[currentTab];
+            if (loader) loader(); // e.g. Paare tab's LoRA checkbox reflects the new slot
+            showToast("Qwen-Modell gewechselt");
+        } catch (e) {
+            showToast("Fehler beim Modellwechsel: " + e.message);
+        }
+    }
+
+    configPanel.querySelectorAll("button[data-slot]").forEach((b) => {
+        b.addEventListener("click", () => switchQwenSize(b.dataset.slot));
+    });
+
     // ---- Tab switching ----
     function switchTab(tab) {
         currentTab = tab;
-        ["woerter", "hotwords", "aufnehmen", "zweiterdurchgang", "training", "diktate", "einstellungen"].forEach((t) => {
+        ["woerter", "hotwords", "steuerwoerter", "aufnehmen", "zweiterdurchgang", "training", "diktate", "einstellungen"].forEach((t) => {
             const pane   = configPanel.querySelector(`#schmidi-pane-${t}`);
             const tabBtn = configPanel.querySelector(`#schmidi-tab-${t}`);
             if (!pane || !tabBtn) return;
@@ -687,6 +795,7 @@
     }
     configPanel.querySelector("#schmidi-tab-woerter").addEventListener("click", () => { switchTab("woerter"); loadWords(); });
     configPanel.querySelector("#schmidi-tab-hotwords").addEventListener("click", () => { switchTab("hotwords"); loadHotwords(); });
+    configPanel.querySelector("#schmidi-tab-steuerwoerter").addEventListener("click", () => { switchTab("steuerwoerter"); loadControlWordsTab(); });
     configPanel.querySelector("#schmidi-tab-aufnehmen").addEventListener("click", () => { switchTab("aufnehmen"); loadTrainingSentences(); });
     configPanel.querySelector("#schmidi-tab-zweiterdurchgang").addEventListener("click", () => { switchTab("zweiterdurchgang"); loadSecondPassSentences(); });
     configPanel.querySelector("#schmidi-tab-training").addEventListener("click", () => { switchTab("training"); loadTrainingPairs(); });
@@ -725,6 +834,22 @@
     function saveHotwords() {
         setHotwords(configPanel.querySelector("#schmidi-hotwords").value);
         setHotwordsStatus("Gespeichert ✓", false);
+    }
+
+    function setControlWordsStatus(msg, isError) {
+        const el = configPanel.querySelector("#schmidi-control-words-status");
+        if (el) { el.textContent = msg; el.style.color = isError ? "#e74c3c" : "#aaa"; }
+    }
+
+    // Control words live in GM storage only — no server round-trip.
+    function loadControlWordsTab() {
+        configPanel.querySelector("#schmidi-control-words").value = getControlWords();
+        setControlWordsStatus("", false);
+    }
+
+    function saveControlWordsTab() {
+        setControlWords(configPanel.querySelector("#schmidi-control-words").value);
+        setControlWordsStatus("Gespeichert ✓", false);
     }
 
     // Fill the client-side fields (URL, API key, hotkey, commit mode) for the
@@ -779,6 +904,7 @@
             configPanel.querySelector("#schmidi-row-context-biasing").style.display =
                 cfg.context_biasing !== undefined && hasQwen ? "flex" : "none";
             styleModelButtons();
+            styleQwenSizeButtons();
             setEinstellungenStatus("", false);
         } catch (e) {
             setEinstellungenStatus("Fehler: " + e.message, true);
@@ -911,6 +1037,7 @@
 
     configPanel.querySelector("#schmidi-cancel-woerter").addEventListener("click", closeConfig);
     configPanel.querySelector("#schmidi-cancel-hotwords").addEventListener("click", closeConfig);
+    configPanel.querySelector("#schmidi-cancel-control-words").addEventListener("click", closeConfig);
     configPanel.querySelector("#schmidi-cancel-aufnehmen").addEventListener("click", closeConfig);
     configPanel.querySelector("#sp2-close").addEventListener("click", closeConfig);
     configPanel.querySelector("#schmidi-cancel-training").addEventListener("click", closeConfig);
@@ -918,6 +1045,7 @@
     configPanel.querySelector("#schmidi-cancel-einstellungen").addEventListener("click", closeConfig);
     configPanel.querySelector("#schmidi-save-words").addEventListener("click", saveWords);
     configPanel.querySelector("#schmidi-save-hotwords").addEventListener("click", saveHotwords);
+    configPanel.querySelector("#schmidi-save-control-words").addEventListener("click", saveControlWordsTab);
     configPanel.querySelector("#schmidi-save-einstellungen").addEventListener("click", saveEinstellungen);
 
     // ---- Aufnehmen / Paare state ----
@@ -2048,6 +2176,8 @@
         originalTranscribed = "";
         overlayUserEdited   = false;
         dictationPcmBuffers = [];
+        dictationEvents     = [];
+        dictationStartedAt  = Date.now();
         navigator.mediaDevices
             .getUserMedia({ audio: true, video: false })
             .then((stream) => {
@@ -2158,12 +2288,14 @@
     function snapshotDictation(text) {
         if (dictationPcmBuffers.length > 0) {
             lastDictation = {
-                pcm:   concatPcm(dictationPcmBuffers),
-                text:  (text || "").trim(),
-                saved: false,
+                pcm:    concatPcm(dictationPcmBuffers),
+                text:   (text || "").trim(),
+                events: dictationEvents,
+                saved:  false,
             };
         }
         dictationPcmBuffers = [];
+        dictationEvents = [];
     }
 
     // POST the last dictation (audio + transcript) to the server's review queue.
@@ -2177,9 +2309,12 @@
             return false;
         }
         const t = (text !== undefined ? text : lastDictation.text) || "";
+        const events = lastDictation.events;
+        const eventsParam = (events && events.length)
+            ? `&events=${encodeURIComponent(JSON.stringify(events))}` : "";
         try {
             const res = await authFetch(
-                `${getHttpBase()}/training/review?text=${encodeURIComponent(t)}`,
+                `${getHttpBase()}/training/review?text=${encodeURIComponent(t)}${eventsParam}`,
                 { method: "POST", headers: { "Content-Type": "application/octet-stream" },
                   body: lastDictation.pcm.buffer });
             if (!res.ok) throw new Error(await res.text());
@@ -2232,7 +2367,7 @@
             } else if (msg.type === "final") {
                 // Fallback to currentPartial if server sends empty final
                 const text = msg.text || currentPartial;
-                if (text && !discardOnStop) {
+                if (text && !discardOnStop && !tryControlWord(text)) {
                     if (isCommitMode()) {
                         pendingText += text;
                         if (!overlayUserEdited) {
@@ -2242,6 +2377,7 @@
                         injectAtCursor(text);
                         accumulatedText += text;
                     }
+                    dictationEvents.push({ type: "text", text, t: Date.now() - dictationStartedAt });
                 }
                 currentPartial = "";
                 updateOverlay();
@@ -2272,6 +2408,150 @@
                 stopRecording();
             }
         };
+    }
+
+    // ---- Control words: delete last word/sentence/punctuation/newline ----
+    //
+    // A whole pause-bounded final that matches a configured phrase (see
+    // matchControlWord) is treated as a command instead of inserted text.
+    // Deletion acts backward from the current cursor position, not the
+    // absolute end of the field — matching how "scratch that"-style dictation
+    // corrections normally behave.
+
+    const CONTROL_WORD_DONE_MSG = {
+        delete_word:        "Letztes Wort gelöscht",
+        delete_sentence:    "Letzten Satz gelöscht",
+        delete_punctuation: "Satzzeichen gelöscht",
+        delete_newline:     "Zeilenumbruch gelöscht",
+    };
+    const CONTROL_WORD_EMPTY_MSG = {
+        delete_word:        "Kein Wort zum Löschen gefunden",
+        delete_sentence:    "Kein Satz zum Löschen gefunden",
+        delete_punctuation: "Kein Satzzeichen gefunden",
+        delete_newline:     "Kein Zeilenumbruch gefunden",
+    };
+
+    // How many characters to remove immediately before `pos` in `text` for the
+    // given action. Pure string function, reused for the textarea/host-element
+    // splice, the contentEditable char-count fallback, and the commit-mode
+    // overlay buffer alike.
+    function computeDeleteCount(action, text, pos) {
+        const before = text.slice(0, pos);
+        switch (action) {
+            case "delete_word": {
+                const m = before.match(/\S+\s*$/);
+                return m ? m[0].length : 0;
+            }
+            case "delete_sentence": {
+                const trimmed = before.replace(/\s+$/, "");
+                const matches = [...trimmed.matchAll(/[.!?]+/g)];
+                let start = 0;
+                if (matches.length >= 2) {
+                    const secondLast = matches[matches.length - 2];
+                    start = secondLast.index + secondLast[0].length;
+                }
+                while (start < trimmed.length && /\s/.test(trimmed[start])) start++;
+                return before.length - start;
+            }
+            case "delete_punctuation": {
+                const m = before.match(/[.,!?;:]\s*$/);
+                return m ? m[0].length : 0;
+            }
+            case "delete_newline": {
+                const m = before.match(/\n\s*$/);
+                return m ? m[0].length : 0;
+            }
+            default:
+                return 0;
+        }
+    }
+
+    // Commit-mode buffer (pendingText / overlayTextDiv text) — nothing has hit
+    // the host page yet, so this is plain string surgery on the tail, same
+    // precedent as the right-click word-correction splice above.
+    function deleteFromBuffer(action, text) {
+        const count = computeDeleteCount(action, text, text.length);
+        return count > 0 ? text.slice(0, text.length - count) : null;
+    }
+
+    // Textarea/input host element — splice el.value at the real caret.
+    function deleteInTextarea(el, action) {
+        const pos = el.selectionStart ?? el.value.length;
+        const count = computeDeleteCount(action, el.value, pos);
+        if (count === 0) return false;
+        const before = el.value.slice(0, pos - count);
+        const after  = el.value.slice(pos);
+        el.value = before + after;
+        try { el.setSelectionRange(pos - count, pos - count); } catch (_) {}
+        el.dispatchEvent(new InputEvent("input", {
+            bubbles: true, cancelable: true, inputType: "deleteContentBackward",
+        }));
+        return true;
+    }
+
+    // Plain-text serialization of everything in `el` before the current caret —
+    // used to run the same boundary regexes against an arbitrary contentEditable
+    // host element regardless of its internal DOM structure.
+    function textBeforeCaret(el) {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return "";
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.setEnd(sel.focusNode, sel.focusOffset);
+        return range.toString();
+    }
+
+    // ContentEditable host element — reuses the browser's own text model
+    // (Selection.modify + execCommand("delete")) instead of manual DOM/Range
+    // surgery, so native undo (Ctrl+Z) and the host page's own input listeners
+    // keep working. Word/sentence use native granularity (browser word/sentence
+    // segmentation); punctuation/newline delete a precomputed character count.
+    function deleteInContentEditable(el, action) {
+        const before = textBeforeCaret(el);
+        const count = computeDeleteCount(action, before, before.length);
+        if (count === 0) return false;
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return false;
+        sel.collapseToEnd();
+        if (action === "delete_word" || action === "delete_sentence") {
+            sel.modify("extend", "backward", action === "delete_word" ? "word" : "sentence");
+        } else {
+            for (let i = 0; i < count; i++) sel.modify("extend", "backward", "character");
+        }
+        el.focus();
+        document.execCommand("delete");
+        return true;
+    }
+
+    // Returns true if `text` was consumed as a control command instead of
+    // being inserted as normal dictated text.
+    function tryControlWord(text) {
+        const action = matchControlWord(text);
+        if (!action) return false;
+
+        let applied;
+        if (isCommitMode()) {
+            const buf = overlayUserEdited ? overlayTextDiv.textContent : pendingText;
+            const updated = deleteFromBuffer(action, buf);
+            applied = updated !== null;
+            if (applied) {
+                pendingText = updated;
+                overlayTextDiv.textContent = updated;
+            }
+        } else {
+            const el = targetEl;
+            if (el && isEditable(el)) {
+                applied = deleteInTextarea(el, action);
+            } else if (el && isContentEditable(el)) {
+                applied = deleteInContentEditable(el, action);
+            } else {
+                applied = false;
+            }
+        }
+        showToast(applied ? (CONTROL_WORD_DONE_MSG[action] || "Erledigt")
+                           : (CONTROL_WORD_EMPTY_MSG[action] || "Nichts zum Löschen gefunden"));
+        dictationEvents.push({ type: "control", action, matched: text, t: Date.now() - dictationStartedAt });
+        return true;
     }
 
     // ---- Text injection — insert at current cursor position in targetEl ----

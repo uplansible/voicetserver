@@ -184,6 +184,24 @@ Download from HuggingFace: `Qwen/Qwen3-ASR-0.6B`. When `qwen_model_dir` is unset
 engine is disabled — `/asr?model=qwen` sessions get an error frame and `GET /config` reports
 `"models":["voxtral"]`.
 
+### Runtime-switchable second size (0.6B <-> 1.7B)
+
+`qwen3-asr-rs` is fully `config.json`-driven — layer counts, hidden dims, attention heads all
+come from the checkpoint, so any Qwen3-ASR-architecture checkpoint (0.6B, 1.7B, …) works by
+pointing at its directory. On top of that, the server supports **two named config slots**
+("primary" = `qwen_model_dir`/`qwen_model_size`, "secondary" =
+`qwen_model_dir_alt`/`qwen_model_size_alt`), only one of which is ever loaded — switching is a
+runtime hot-swap (`POST /qwen/switch?slot=primary|secondary`), not a second engine running
+concurrently (VRAM: Voxtral ~8 GB + Qwen 1.7B ~5 GB already leaves little headroom on a 16 GB
+card for a third model). Each slot has its own LoRA adapter (`lora_adapter_qwen` /
+`lora_adapter_qwen_alt` — weight shapes differ per size, so an adapter is never reusable across
+slots) and its own training-output dir (`lora_adapter_qwen/` / `lora_adapter_qwen_alt/` under
+`data_dir`). `qwen_active_slot` (persisted on every switch) decides which slot loads at
+startup; `POST /training/run?model=qwen` always targets whichever slot is *currently* active,
+not always primary. `tools/install.sh` offers installing a second size after the primary Qwen
+download; the userscript shows a "Qwen-Größe" selector next to the model switcher only when
+`qwen_model_dir_alt` is configured (`GET /config` field).
+
 ## Model language behaviour
 
 **Voxtral** Mini 4B Realtime has **no language token mechanism**. It auto-detects language from the audio signal. There is no way to force a specific language — the model will transcribe in whatever language it hears. Confirmed by inspecting `tekken.json` (no `added_tokens`) and the reference C implementation (antirez/voxtral.c).
@@ -280,9 +298,13 @@ drain length at construction, so an open session keeps its original value (the s
 reads the session's captured `delay_tokens`, not the live atomic — otherwise finalization timing
 desyncs from the actual decoder lag). New sessions pick the new value up immediately.
 
-Startup-only (require restart): `model_dir`, `qwen_model_dir`, `language`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `lora_adapter_qwen`, `venv_path`, `data_dir`, `log_file`, `log_keep_days`.
+Startup-only (require restart): `model_dir`, `qwen_model_dir`, `qwen_model_size`, `qwen_model_dir_alt`, `qwen_model_size_alt`, `language`, `device`, `port`, `bind_addr`, `tls_cert`, `tls_key`, `lora_adapter`, `lora_adapter_qwen`, `lora_adapter_qwen_alt`, `venv_path`, `data_dir`, `log_file`, `log_keep_days`.
 
-`data_dir` — base directory for `custom_words.txt`, `training/`, `lora_adapter/`, `lora_adapter_qwen/`, `training_sentences.txt`. Defaults to `~/.config/voicetserver/`. Config file and PID file always stay in `~/.config/voicetserver/` regardless of this setting.
+Runtime-switchable, but *not* via `PATCH /config` — its own endpoint instead, since it triggers
+a model reload: `qwen_active_slot` (`"primary"|"secondary"`) via `POST /qwen/switch` (see
+Runtime-switchable second size, above). Persisted on every switch so a restart resumes there.
+
+`data_dir` — base directory for `custom_words.txt`, `training/`, `lora_adapter/`, `lora_adapter_qwen/`, `lora_adapter_qwen_alt/`, `training_sentences.txt`. Defaults to `~/.config/voicetserver/`. Config file and PID file always stay in `~/.config/voicetserver/` regardless of this setting.
 
 # Daemon mode / detach / log file
 
@@ -429,11 +451,12 @@ dictations as f32 PCM: 64 KB/s → ~16 min head-room).
   `lora_adapter`/`lora_adapter_qwen`, else the model's default training output dir — so the
   toggle still works after `DELETE /lora`). The unsuffixed `lora_active`/`lora_dir` remain as
   voxtral aliases from the frontend transition.
-- `PATCH /config` — update settings (the union — includes `context_biasing`, `language`, `qwen_model_dir`, `lora_adapter_qwen`); runtime params apply immediately (except `delay`, see above), startup params written to file. Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `silence_threshold` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1]; `silence_flush` ∈ [1,250]; `min_speech` ∈ [1,250] (`silence_flush = 0` would silently disable silence-triggered finals).
+- `PATCH /config` — update settings (the union — includes `context_biasing`, `language`, `qwen_model_dir`, `qwen_model_size`, `qwen_model_dir_alt`, `qwen_model_size_alt`, `lora_adapter_qwen`, `lora_adapter_qwen_alt`); runtime params apply immediately (except `delay`, see above), startup params written to file but need a restart (`qwen_active_slot` is the one exception — it changes at runtime via `POST /qwen/switch` instead, never via `PATCH /config`). Validates: `delay` ∈ [1,30]; `rms_ema` ∈ [0,1]; `silence_threshold` ∈ [0,1]; `fuzzy_max_ratio` ∈ [0,1]; `silence_flush` ∈ [1,250]; `min_speech` ∈ [1,250] (`silence_flush = 0` would silently disable silence-triggered finals).
 - `GET /words` — `{"words":[...]}`
 - `POST /words` — `{"add":[...],"remove":[...]}` — updates file + rebuilds corrector
 - `POST /lora/reload?model=voxtral|qwen` — hot-reload the model's LoRA adapter without restart (default voxtral; same for all `?model=` params below); optional JSON body `{"path":"..."}` to specify dir (omit the body entirely — not just the field — to reload current); returns `{"status":"ok","action":"applied"|"cleared","path":"..."}`
 - `DELETE /lora?model=voxtral|qwen` — unload the model's active LoRA adapter in-memory (revert to base model) without restart; adapter files on disk are left untouched; clears the model's lora path so nothing is re-applied on the next training reload
+- `POST /qwen/switch?slot=primary|secondary` — hot-swap the loaded Qwen checkpoint (e.g. 0.6B <-> 1.7B) without a restart; `slot` is required and explicit, not a toggle. 422 if the target slot isn't configured (`qwen_model_dir`/`qwen_model_dir_alt`). Unloads the current engine, frees its VRAM, loads the target, re-applies that slot's own LoRA if configured, and persists `qwen_active_slot` to config.toml so a restart resumes there. Returns `{"status":"ok","active_slot":...,"model_dir":...,"model_size":...,"lora_active":...}`. While switching (a few seconds), new `?model=qwen` sessions get the same "engine not loaded" error already used during training unload.
 - `ws[s]://host:port/asr?model=voxtral|qwen` — WebSocket audio stream (raw f32 LE PCM 16kHz
   mono); `?model=` picks the engine (default voxtral; `?model=qwen` on a server without
   `qwen_model_dir` gets an error frame). **Stop protocol** (identical on both engines):
@@ -478,7 +501,7 @@ optionally re-transcribes it, corrects the text, and accepts it into the trainin
 discards it. Candidates live in `training/review/*.wav` + `training/review.jsonl` and are
 invisible to the trainer until accepted.
 
-- `POST /training/review?text=<url-encoded>` — body raw f32 LE PCM 16kHz; `text` = model transcript at save time; same ID scheme + `pair_write_lock` as pairs
+- `POST /training/review?text=<url-encoded>[&events=<url-encoded-json>]` — body raw f32 LE PCM 16kHz; `text` = model transcript at save time; same ID scheme + `pair_write_lock` as pairs. `events` (optional) is a JSON array of per-final markers the userscript collected during the dictation — `{"type":"text","text":...,"t":ms}` for normal finals and `{"type":"control","action":"delete_word"|"delete_sentence"|"delete_punctuation"|"delete_newline","matched":...,"t":ms}` for each control word that fired (see Control words, below). Stored verbatim as an `events` field in the `review.jsonl` entry when present and parseable; absent for older clients or calibration pairs (`POST /training/pair` never carries it).
 - `GET /training/reviews` — `{"reviews":[{"id","text","duration_s"}]}` sorted by id
 - `GET /training/review/audio/{id}` — serve candidate WAV (playback / client-side re-transcription)
 - `POST /training/review/{id}/accept` — `{"text":"…"}` (corrected transcript) — moves the WAV into `training/audio/` under a fresh pair ID, appends to `pairs.jsonl`, removes the candidate
@@ -535,7 +558,11 @@ Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}` / `
 **Unified frontend** (v0.1.16+): one userscript, one server, one URL + API key. The
 "Server: [Voxtral][Qwen3]" switcher above the tab bar only selects which **engine** a
 session uses (GM value `active_model` → `?model=` on the WS URL); it switches instantly (no
-save needed; blocked while recording). Storage keys are the dual-backend era's Voxtral
+save needed; blocked while recording). A second row, "Qwen-Größe: [size][size]", appears
+below it only when `GET /config` reports `qwen_model_dir_alt` (a second qwen checkpoint
+configured) — clicking a size calls `POST /qwen/switch?slot=` to hot-swap the loaded model
+server-side (see Runtime-switchable second size, above); also blocked while recording.
+Storage keys are the dual-backend era's Voxtral
 profile keys (`server_url_voxtral`/`api_key_voxtral`, falling back to the pre-profile
 `server_url`/`api_key`; `active_backend` seeds `active_model`), so both upgrade and rollback
 keep working; the qwen profile keys stay dormant. The Einstellungen tab is a single pane
@@ -561,13 +588,36 @@ Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Einstellun
 Text is inserted live at cursor on each `final`; trailing partial inserted on stop.
 Falls back to clipboard if no editable element was captured.
 
-Right-click → seven tabs: **Eigene Wörter** (server-side custom words — commit-mode edit-log
+Right-click → eight tabs: **Eigene Wörter** (server-side custom words — commit-mode edit-log
 corrections are auto-added here server-side, see Edit-log mining above; no in-tab review step),
 **Hotwords** (client-side GM-stored list sent per session
-via `?hotwords=`; biasing only on Qwen3), **Aufnehmen** (record calibration sentences),
+via `?hotwords=`; biasing only on Qwen3), **Steuerwörter** (client-side GM-stored control-word
+vocabulary, see Control words below), **Aufnehmen** (record calibration sentences),
 **2. Durchgang** (record once-recorded sentences — `pair_ids.length === 1` — a second time),
 **Training** (review pairs, delete, LoRA), **Diktate** (real-dictation review, below),
 **Einstellungen** (server URL/key, hotkey, runtime params).
+
+**Control words (delete word/sentence/punctuation/newline):** for pause-heavy dictation where
+a mistake needs fixing mid-flow without reaching for the mouse. A **whole** pause-bounded
+`final` (not a substring) that matches a configured phrase is treated as a command instead of
+inserted text — matched via `matchControlWord()` against the GM-stored `control_words` list
+(Steuerwörter tab, `phrase=action` per line, defaults in `DEFAULT_CONTROL_WORDS`; purely
+client-side, no server round-trip, same storage pattern as Hotwords). Four actions:
+`delete_word`, `delete_sentence`, `delete_punctuation`, `delete_newline` — each deletes
+backward from the current cursor position (not the field's absolute end), computed once by
+`computeDeleteCount()` (word = last whitespace-delimited run; sentence = back to the
+second-to-last `[.!?]` terminator; punctuation/newline = one trailing char) and physically
+applied differently per target: `deleteInTextarea()` splices `el.value` directly;
+`deleteInContentEditable()` reuses the browser's own text model
+(`Selection.modify("extend","backward",…)` + `document.execCommand("delete")` — native
+word/sentence granularity, precomputed character count for punctuation/newline) so native undo
+(Ctrl+Z) and the host page's own input listeners keep working; in commit mode
+`deleteFromBuffer()` does plain string surgery on `pendingText`/`overlayTextDiv` (nothing has
+hit the host page yet), the same precedent as the right-click word-correction splice. Feedback
+via `showToast()`. Every text final and control-word action is pushed to a per-session
+`dictationEvents` array (reset in `startRecording()`, attached to `lastDictation.events` in
+`snapshotDictation()`) and sent as `POST /training/review`'s optional `events=` param when a
+dictation is saved — see the `events` field under `POST /training/review`, above.
 
 **Audio capture (all paths — ASR, Aufnehmen, 2. Durchgang):** `createCaptureContext()` requests
 an `AudioContext({ sampleRate: 16000 })` so the **browser** resamples the mic stream with proper
