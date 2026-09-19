@@ -46,6 +46,55 @@ fetch_missing_files() {
     done
 }
 
+# --- Helper: download a Qwen3-ASR checkpoint's weights, handling both a
+#     single-file repo (model.safetensors — e.g. the 0.6B) and a sharded one
+#     (model.safetensors.index.json + model-0000X-of-0000Y.safetensors — e.g.
+#     the 1.7B). Probing the index file first is safe: a 404 there just means
+#     "this repo isn't sharded", not an error — fetch_missing_files's QWEN_FILES
+#     list used to hardcode model.safetensors, which silently left a sharded
+#     repo's actual weights undownloaded (only a warning, install continued). ---
+fetch_qwen_weights() {
+    local dir="$1" base_url="$2"
+    if [[ -f "$dir/model.safetensors" ]]; then
+        echo "  model.safetensors — already present, skipping"
+        return
+    fi
+    if [[ -f "$dir/model.safetensors.index.json" ]] && ls "$dir"/model-*-of-*.safetensors >/dev/null 2>&1; then
+        echo "  sharded model weights — already present, skipping"
+        return
+    fi
+    echo "  Probing for sharded weights (model.safetensors.index.json) ..."
+    if wget -q -O "$dir/model.safetensors.index.json" "$base_url/model.safetensors.index.json" 2>/dev/null \
+        && [[ -s "$dir/model.safetensors.index.json" ]] \
+        && python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$dir/model.safetensors.index.json" 2>/dev/null; then
+        echo "  Sharded checkpoint detected — downloading shards listed in the index ..."
+        local shard
+        while IFS= read -r shard; do
+            [[ -z "$shard" ]] && continue
+            if [[ -f "$dir/$shard" ]]; then
+                echo "  $shard — already present, skipping"
+            else
+                echo "  Downloading $shard ..."
+                if ! wget -q --show-progress -O "$dir/$shard" "$base_url/$shard"; then
+                    rm -f "$dir/$shard"
+                    echo "  Warning: $shard not available from HuggingFace" >&2
+                fi
+            fi
+        done < <(python3 -c "
+import json
+idx = json.load(open('$dir/model.safetensors.index.json'))
+print('\n'.join(sorted(set(idx['weight_map'].values()))))
+")
+    else
+        rm -f "$dir/model.safetensors.index.json"
+        echo "  Downloading model.safetensors ..."
+        if ! wget -q --show-progress -O "$dir/model.safetensors" "$base_url/model.safetensors"; then
+            rm -f "$dir/model.safetensors"
+            echo "  Warning: model.safetensors not available from HuggingFace" >&2
+        fi
+    fi
+}
+
 # --- Helper: generate tokenizer.json for a Qwen3-ASR checkpoint dir if the
 #     model weights are present but the tokenizer isn't. tokenizer.json is not
 #     published on HuggingFace; derive it from the tokenizer config using
@@ -53,7 +102,9 @@ fetch_missing_files() {
 #     only need the lighter `tokenizers` package). ---
 generate_qwen_tokenizer() {
     local dir="$1"
-    if [[ -f "$dir/model.safetensors" && ! -f "$dir/tokenizer.json" ]]; then
+    local have_weights=0
+    [[ -f "$dir/model.safetensors" || -f "$dir/model.safetensors.index.json" ]] && have_weights=1
+    if [[ "$have_weights" -eq 1 && ! -f "$dir/tokenizer.json" ]]; then
         echo "tokenizer.json not found in $dir — generating from tokenizer config ..."
         if ! "$VENV_PATH/bin/python3" -c "import transformers" 2>/dev/null; then
             echo "Installing transformers into the venv (needed once for tokenizer generation) ..."
@@ -296,10 +347,9 @@ fi
 [[ -n "$EXISTING_QWEN_DIR" ]] && DEFAULT_QWEN_DIR="$EXISTING_QWEN_DIR"
 
 QWEN_FILES=(config.json tokenizer.json tokenizer_config.json vocab.json
-            merges.txt preprocessor_config.json generation_config.json
-            model.safetensors)
+            merges.txt preprocessor_config.json generation_config.json)
 QWEN_DIR=""
-if [[ -n "$EXISTING_QWEN_DIR" && -f "$EXISTING_QWEN_DIR/model.safetensors" ]]; then
+if [[ -n "$EXISTING_QWEN_DIR" ]] && { [[ -f "$EXISTING_QWEN_DIR/model.safetensors" ]] || [[ -f "$EXISTING_QWEN_DIR/model.safetensors.index.json" ]]; }; then
     printf "Qwen3 model already at %s — keep this location? [Y/n]: " "$EXISTING_QWEN_DIR"
     read -r KEEP_QWEN
     if [[ "${KEEP_QWEN,,}" == "n" ]]; then
@@ -313,6 +363,7 @@ if [[ -n "$EXISTING_QWEN_DIR" && -f "$EXISTING_QWEN_DIR/model.safetensors" ]]; t
         QWEN_DIR="$EXISTING_QWEN_DIR"
         echo "Checking for missing Qwen3 files in $QWEN_DIR ..."
         fetch_missing_files "$QWEN_DIR" "$HF_QWEN_BASE" "${QWEN_FILES[@]}"
+        fetch_qwen_weights "$QWEN_DIR" "$HF_QWEN_BASE"
     fi
 else
     printf "Enable the Qwen3-ASR second engine (download ~1.8 GB)? [Y/n]: "
@@ -324,6 +375,7 @@ else
         mkdir -p "$QWEN_DIR"
         echo "Downloading Qwen3 model files to: $QWEN_DIR"
         fetch_missing_files "$QWEN_DIR" "$HF_QWEN_BASE" "${QWEN_FILES[@]}"
+        fetch_qwen_weights "$QWEN_DIR" "$HF_QWEN_BASE"
         set_config_value "qwen_model_dir" "$QWEN_DIR"
         echo "qwen_model_dir set to: $QWEN_DIR"
     else
@@ -352,7 +404,7 @@ if [[ -n "$QWEN_DIR" ]]; then
             | head -1 | sed 's/.*= *"\(.*\)"/\1/')
     fi
     echo ""
-    if [[ -n "$EXISTING_QWEN_ALT_DIR" && -f "$EXISTING_QWEN_ALT_DIR/model.safetensors" ]]; then
+    if [[ -n "$EXISTING_QWEN_ALT_DIR" ]] && { [[ -f "$EXISTING_QWEN_ALT_DIR/model.safetensors" ]] || [[ -f "$EXISTING_QWEN_ALT_DIR/model.safetensors.index.json" ]]; }; then
         echo "Second Qwen3 size already configured at $EXISTING_QWEN_ALT_DIR — checking for missing files ..."
         case "${EXISTING_QWEN_ALT_SIZE,,}" in
             0.6b) ALT_HF_REPO="Qwen/Qwen3-ASR-0.6B" ;;
@@ -362,6 +414,7 @@ if [[ -n "$QWEN_DIR" ]]; then
         esac
         if [[ -n "$ALT_HF_REPO" ]]; then
             fetch_missing_files "$EXISTING_QWEN_ALT_DIR" "https://huggingface.co/$ALT_HF_REPO/resolve/main" "${QWEN_FILES[@]}"
+            fetch_qwen_weights "$EXISTING_QWEN_ALT_DIR" "https://huggingface.co/$ALT_HF_REPO/resolve/main"
             generate_qwen_tokenizer "$EXISTING_QWEN_ALT_DIR"
         fi
     else
@@ -390,6 +443,7 @@ if [[ -n "$QWEN_DIR" ]]; then
                     mkdir -p "$QWEN_ALT_DIR"
                     echo "Downloading Qwen3-ASR-$ALT_LABEL files to: $QWEN_ALT_DIR"
                     fetch_missing_files "$QWEN_ALT_DIR" "https://huggingface.co/$ALT_HF_REPO/resolve/main" "${QWEN_FILES[@]}"
+                    fetch_qwen_weights "$QWEN_ALT_DIR" "https://huggingface.co/$ALT_HF_REPO/resolve/main"
                     generate_qwen_tokenizer "$QWEN_ALT_DIR"
                     set_config_value "qwen_model_dir_alt" "$QWEN_ALT_DIR"
                     set_config_value "qwen_model_size_alt" "$ALT_LABEL"
