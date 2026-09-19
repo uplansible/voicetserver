@@ -25,6 +25,51 @@ set_config_value() {
     fi
 }
 
+# --- Helper: download any of $files[] into $dir that isn't already present.
+#     Used both for a fresh download and to backfill a directory that already
+#     exists (e.g. re-running the installer as an "update" after an interrupted
+#     download, or a directory whose location predates a newly added file) —
+#     the per-file presence check means it's always safe to call unconditionally. ---
+fetch_missing_files() {
+    local dir="$1" base_url="$2"; shift 2
+    local f
+    for f in "$@"; do
+        if [[ -f "$dir/$f" ]]; then
+            echo "  $f — already present, skipping"
+        else
+            echo "  Downloading $f ..."
+            if ! wget -q --show-progress -O "$dir/$f" "$base_url/$f"; then
+                rm -f "$dir/$f"
+                echo "  Warning: $f not available from HuggingFace" >&2
+            fi
+        fi
+    done
+}
+
+# --- Helper: generate tokenizer.json for a Qwen3-ASR checkpoint dir if the
+#     model weights are present but the tokenizer isn't. tokenizer.json is not
+#     published on HuggingFace; derive it from the tokenizer config using
+#     transformers (installed into the venv on demand — the trainers themselves
+#     only need the lighter `tokenizers` package). ---
+generate_qwen_tokenizer() {
+    local dir="$1"
+    if [[ -f "$dir/model.safetensors" && ! -f "$dir/tokenizer.json" ]]; then
+        echo "tokenizer.json not found in $dir — generating from tokenizer config ..."
+        if ! "$VENV_PATH/bin/python3" -c "import transformers" 2>/dev/null; then
+            echo "Installing transformers into the venv (needed once for tokenizer generation) ..."
+            TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir transformers
+        fi
+        QWEN_TOK_DIR="$dir" "$VENV_PATH/bin/python3" -c "
+import os
+model_dir = os.environ['QWEN_TOK_DIR']
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+tok.save_pretrained(model_dir)
+print('  tokenizer.json written to', model_dir)
+" || echo "  Warning: could not generate tokenizer.json — see CLAUDE.md for the manual command." >&2
+    fi
+}
+
 # --- Venv location ---
 if [[ -f "$CONFIG_FILE" ]] && grep -qE '^[[:space:]]*venv_path[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
     EXISTING_VENV=$(grep -E '^[[:space:]]*venv_path[[:space:]]*=' "$CONFIG_FILE" \
@@ -187,6 +232,7 @@ if grep -qE '^[[:space:]]*model_dir[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; th
 fi
 [[ -n "$EXISTING_MODEL_DIR" ]] && DEFAULT_MODEL_DIR="$EXISTING_MODEL_DIR"
 
+VOXTRAL_FILES=(tekken.json consolidated.safetensors)
 MODEL_DIR=""
 if [[ -n "$EXISTING_MODEL_DIR" && -f "$EXISTING_MODEL_DIR/consolidated.safetensors" ]]; then
     printf "Model already at %s — keep this location? [Y/n]: " "$EXISTING_MODEL_DIR"
@@ -200,6 +246,11 @@ if [[ -n "$EXISTING_MODEL_DIR" && -f "$EXISTING_MODEL_DIR/consolidated.safetenso
         echo "Note: move model files from $EXISTING_MODEL_DIR to $MODEL_DIR, or re-download."
     else
         MODEL_DIR="$EXISTING_MODEL_DIR"
+        # Re-running the installer as an "update" backfills anything that
+        # didn't finish downloading last time, instead of trusting the
+        # directory's mere existence.
+        echo "Checking for missing Voxtral files in $MODEL_DIR ..."
+        fetch_missing_files "$MODEL_DIR" "$HF_BASE" "${VOXTRAL_FILES[@]}"
     fi
 else
     printf "Download Voxtral-Mini-4B-Realtime model files (~8.9 GB)? [Y/n]: "
@@ -210,18 +261,7 @@ else
         MODEL_DIR="${MODEL_DIR:-$DEFAULT_MODEL_DIR}"
         mkdir -p "$MODEL_DIR"
         echo "Downloading model files to: $MODEL_DIR"
-        HF_FILES=(tekken.json consolidated.safetensors)
-        for f in "${HF_FILES[@]}"; do
-            if [[ -f "$MODEL_DIR/$f" ]]; then
-                echo "  $f — already present, skipping"
-            else
-                echo "  Downloading $f ..."
-                if ! wget -q --show-progress -O "$MODEL_DIR/$f" "$HF_BASE/$f"; then
-                    rm -f "$MODEL_DIR/$f"
-                    echo "  Warning: $f not available from HuggingFace" >&2
-                fi
-            fi
-        done
+        fetch_missing_files "$MODEL_DIR" "$HF_BASE" "${VOXTRAL_FILES[@]}"
     else
         printf "Model directory (will be written to config) [%s]: " "$DEFAULT_MODEL_DIR"
         read -r MODEL_DIR
@@ -255,6 +295,9 @@ if grep -qE '^[[:space:]]*qwen_model_dir[[:space:]]*=' "$CONFIG_FILE" 2>/dev/nul
 fi
 [[ -n "$EXISTING_QWEN_DIR" ]] && DEFAULT_QWEN_DIR="$EXISTING_QWEN_DIR"
 
+QWEN_FILES=(config.json tokenizer.json tokenizer_config.json vocab.json
+            merges.txt preprocessor_config.json generation_config.json
+            model.safetensors)
 QWEN_DIR=""
 if [[ -n "$EXISTING_QWEN_DIR" && -f "$EXISTING_QWEN_DIR/model.safetensors" ]]; then
     printf "Qwen3 model already at %s — keep this location? [Y/n]: " "$EXISTING_QWEN_DIR"
@@ -268,6 +311,8 @@ if [[ -n "$EXISTING_QWEN_DIR" && -f "$EXISTING_QWEN_DIR/model.safetensors" ]]; t
         echo "Note: move model files from $EXISTING_QWEN_DIR to $QWEN_DIR, or re-download."
     else
         QWEN_DIR="$EXISTING_QWEN_DIR"
+        echo "Checking for missing Qwen3 files in $QWEN_DIR ..."
+        fetch_missing_files "$QWEN_DIR" "$HF_QWEN_BASE" "${QWEN_FILES[@]}"
     fi
 else
     printf "Enable the Qwen3-ASR second engine (download ~1.8 GB)? [Y/n]: "
@@ -278,25 +323,18 @@ else
         QWEN_DIR="${QWEN_DIR:-$DEFAULT_QWEN_DIR}"
         mkdir -p "$QWEN_DIR"
         echo "Downloading Qwen3 model files to: $QWEN_DIR"
-        QWEN_FILES=(config.json tokenizer.json tokenizer_config.json vocab.json
-                    merges.txt preprocessor_config.json generation_config.json
-                    model.safetensors)
-        for f in "${QWEN_FILES[@]}"; do
-            if [[ -f "$QWEN_DIR/$f" ]]; then
-                echo "  $f — already present, skipping"
-            else
-                echo "  Downloading $f ..."
-                if ! wget -q --show-progress -O "$QWEN_DIR/$f" "$HF_QWEN_BASE/$f"; then
-                    rm -f "$QWEN_DIR/$f"
-                    echo "  Warning: $f not available from HuggingFace" >&2
-                fi
-            fi
-        done
+        fetch_missing_files "$QWEN_DIR" "$HF_QWEN_BASE" "${QWEN_FILES[@]}"
         set_config_value "qwen_model_dir" "$QWEN_DIR"
         echo "qwen_model_dir set to: $QWEN_DIR"
     else
         echo "Skipped — qwen engine disabled (set qwen_model_dir in config.toml to enable later)."
     fi
+fi
+# Cosmetic label for the userscript's model dropdown — the only primary
+# checkpoint this installer offers is 0.6B; don't overwrite a size a user may
+# have set by hand for a non-standard checkpoint.
+if [[ -n "$QWEN_DIR" ]] && ! grep -qE '^[[:space:]]*qwen_model_size[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+    set_config_value "qwen_model_size" "0.6B"
 fi
 
 # --- Optional second Qwen3-ASR size (hot-swappable at runtime via the
@@ -308,13 +346,30 @@ if [[ -n "$QWEN_DIR" ]]; then
         EXISTING_QWEN_ALT_DIR=$(grep -E '^[[:space:]]*qwen_model_dir_alt[[:space:]]*=' "$CONFIG_FILE" \
             | head -1 | sed 's/.*= *"\(.*\)"/\1/')
     fi
+    EXISTING_QWEN_ALT_SIZE=""
+    if grep -qE '^[[:space:]]*qwen_model_size_alt[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
+        EXISTING_QWEN_ALT_SIZE=$(grep -E '^[[:space:]]*qwen_model_size_alt[[:space:]]*=' "$CONFIG_FILE" \
+            | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+    fi
     echo ""
     if [[ -n "$EXISTING_QWEN_ALT_DIR" && -f "$EXISTING_QWEN_ALT_DIR/model.safetensors" ]]; then
-        echo "Second Qwen3 size already configured at $EXISTING_QWEN_ALT_DIR — keeping it."
+        echo "Second Qwen3 size already configured at $EXISTING_QWEN_ALT_DIR — checking for missing files ..."
+        case "${EXISTING_QWEN_ALT_SIZE,,}" in
+            0.6b) ALT_HF_REPO="Qwen/Qwen3-ASR-0.6B" ;;
+            1.7b) ALT_HF_REPO="Qwen/Qwen3-ASR-1.7B" ;;
+            *) ALT_HF_REPO=""
+               echo "  Warning: unknown qwen_model_size_alt \"$EXISTING_QWEN_ALT_SIZE\" — can't backfill automatically, add missing files manually if needed." >&2 ;;
+        esac
+        if [[ -n "$ALT_HF_REPO" ]]; then
+            fetch_missing_files "$EXISTING_QWEN_ALT_DIR" "https://huggingface.co/$ALT_HF_REPO/resolve/main" "${QWEN_FILES[@]}"
+            generate_qwen_tokenizer "$EXISTING_QWEN_ALT_DIR"
+        fi
     else
-        printf "Also install a second Qwen3-ASR size, hot-swappable at runtime (0.6B <-> 1.7B, download ~4 GB for 1.7B)? [y/N]: "
+        # Default yes: an install should end up with every model the userscript's
+        # dropdown can offer (Voxtral + both Qwen sizes) unless declined.
+        printf "Also install a second Qwen3-ASR size, hot-swappable at runtime (0.6B <-> 1.7B, download ~4 GB for 1.7B)? [Y/n]: "
         read -r QWEN_ALT_CHOICE
-        if [[ "${QWEN_ALT_CHOICE,,}" == "y" ]]; then
+        if [[ "${QWEN_ALT_CHOICE,,}" != "n" ]]; then
             printf "Which size? [0.6b/1.7b, default: 1.7b]: "
             read -r QWEN_ALT_SIZE
             QWEN_ALT_SIZE="${QWEN_ALT_SIZE:-1.7b}"
@@ -334,42 +389,10 @@ if [[ -n "$QWEN_DIR" ]]; then
                 else
                     mkdir -p "$QWEN_ALT_DIR"
                     echo "Downloading Qwen3-ASR-$ALT_LABEL files to: $QWEN_ALT_DIR"
-                    ALT_HF_BASE="https://huggingface.co/$ALT_HF_REPO/resolve/main"
-                    ALT_QWEN_FILES=(config.json tokenizer.json tokenizer_config.json vocab.json
-                                     merges.txt preprocessor_config.json generation_config.json
-                                     model.safetensors)
-                    for f in "${ALT_QWEN_FILES[@]}"; do
-                        if [[ -f "$QWEN_ALT_DIR/$f" ]]; then
-                            echo "  $f — already present, skipping"
-                        else
-                            echo "  Downloading $f ..."
-                            if ! wget -q --show-progress -O "$QWEN_ALT_DIR/$f" "$ALT_HF_BASE/$f"; then
-                                rm -f "$QWEN_ALT_DIR/$f"
-                                echo "  Warning: $f not available from HuggingFace" >&2
-                            fi
-                        fi
-                    done
-                    if [[ -f "$QWEN_ALT_DIR/model.safetensors" && ! -f "$QWEN_ALT_DIR/tokenizer.json" ]]; then
-                        echo "tokenizer.json not found — generating from tokenizer config ..."
-                        if ! "$VENV_PATH/bin/python3" -c "import transformers" 2>/dev/null; then
-                            TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir transformers
-                        fi
-                        QWEN_ALT_DIR="$QWEN_ALT_DIR" "$VENV_PATH/bin/python3" -c "
-import os
-model_dir = os.environ['QWEN_ALT_DIR']
-from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-tok.save_pretrained(model_dir)
-print('  tokenizer.json written to', model_dir)
-" || echo "  Warning: could not generate tokenizer.json — see CLAUDE.md for the manual command." >&2
-                    fi
+                    fetch_missing_files "$QWEN_ALT_DIR" "https://huggingface.co/$ALT_HF_REPO/resolve/main" "${QWEN_FILES[@]}"
+                    generate_qwen_tokenizer "$QWEN_ALT_DIR"
                     set_config_value "qwen_model_dir_alt" "$QWEN_ALT_DIR"
                     set_config_value "qwen_model_size_alt" "$ALT_LABEL"
-                    # Label the primary slot too if unset, so the userscript's
-                    # size selector shows a real size instead of a placeholder.
-                    if ! grep -qE '^[[:space:]]*qwen_model_size[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
-                        set_config_value "qwen_model_size" "0.6B"
-                    fi
                     echo "qwen_model_dir_alt set to: $QWEN_ALT_DIR ($ALT_LABEL)"
                 fi
             fi
@@ -377,26 +400,8 @@ print('  tokenizer.json written to', model_dir)
     fi
 fi
 
-# --- Generate tokenizer.json if missing ---
-# tokenizer.json is not published on HuggingFace; derive it from the tokenizer
-# config using transformers (installed into the venv on demand — the trainers
-# themselves only need the lighter `tokenizers` package).
-if [[ -n "$QWEN_DIR" && -f "$QWEN_DIR/model.safetensors" && ! -f "$QWEN_DIR/tokenizer.json" ]]; then
-    echo ""
-    echo "tokenizer.json not found — generating from tokenizer config ..."
-    if ! "$VENV_PATH/bin/python3" -c "import transformers" 2>/dev/null; then
-        echo "Installing transformers into the venv (needed once for tokenizer generation) ..."
-        TMPDIR="$VENV_PATH/tempdir" "$VENV_PATH/bin/pip" install --no-cache-dir transformers
-    fi
-    QWEN_DIR="$QWEN_DIR" "$VENV_PATH/bin/python3" -c "
-import os
-model_dir = os.environ['QWEN_DIR']
-from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
-tok.save_pretrained(model_dir)
-print('  tokenizer.json written to', model_dir)
-" || echo "  Warning: could not generate tokenizer.json — see CLAUDE.md for the manual command." >&2
-fi
+# --- Generate tokenizer.json for the primary Qwen slot if missing ---
+generate_qwen_tokenizer "$QWEN_DIR"
 
 # --- Install voicetserver binary ---
 echo ""

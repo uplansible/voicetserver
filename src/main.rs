@@ -2577,8 +2577,11 @@ mod server {
             Ok(())
         }).await;
 
-        state.settings.state.store(crate::settings::STATE_READY, Ordering::SeqCst);
-
+        // Only report ready again if the switch actually succeeded — on failure
+        // switch_model_blocking leaves the qwen engine unloaded (no silent
+        // partial state), so /health must keep reporting "loading" the same way
+        // a failed post-training reload does (see training_run_handler above),
+        // otherwise a monitor would see "ready" while ?model=qwen still errors.
         match switch_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR,
@@ -2586,6 +2589,8 @@ mod server {
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("Qwen model switch task panicked: {e}")}))).into_response(),
         }
+
+        state.settings.state.store(crate::settings::STATE_READY, Ordering::SeqCst);
 
         *state.qwen_active_slot.write().await = target;
         *state.qwen_lora_path.write().await = target_cfg.lora_adapter.clone()

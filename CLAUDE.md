@@ -198,9 +198,14 @@ card for a third model). Each slot has its own LoRA adapter (`lora_adapter_qwen`
 slots) and its own training-output dir (`lora_adapter_qwen/` / `lora_adapter_qwen_alt/` under
 `data_dir`). `qwen_active_slot` (persisted on every switch) decides which slot loads at
 startup; `POST /training/run?model=qwen` always targets whichever slot is *currently* active,
-not always primary. `tools/install.sh` offers installing a second size after the primary Qwen
-download; the userscript shows a "Qwen-Größe" selector next to the model switcher only when
-`qwen_model_dir_alt` is configured (`GET /config` field).
+not always primary. `tools/install.sh` downloads all three checkpoints by default (Voxtral +
+Qwen primary + Qwen secondary — the second-size prompt defaults to yes) and, on a re-run,
+backfills whichever files are missing from an already-configured model directory instead of
+trusting its mere existence, so running the installer again after a partial/interrupted
+download or as an "update" fills the gaps (`fetch_missing_files`/`generate_qwen_tokenizer`
+helpers, reused for Voxtral, the primary Qwen slot, and the secondary slot); the userscript's
+single model dropdown (see Browser client, below) offers Voxtral / Qwen primary / Qwen
+secondary and is populated from `GET /config`'s `models`/`qwen_model_dir_alt` fields.
 
 ## Model language behaviour
 
@@ -555,13 +560,16 @@ per model**, so adapters are strictly per-model:
 Sends raw 16kHz mono f32 LE PCM over WebSocket binary frames.
 Receives `{"type":"partial","text":"..."}` / `{"type":"final","text":"..."}` / `{"type":"error","text":"..."}`.
 
-**Unified frontend** (v0.1.16+): one userscript, one server, one URL + API key. The
-"Server: [Voxtral][Qwen3]" switcher above the tab bar only selects which **engine** a
-session uses (GM value `active_model` → `?model=` on the WS URL); it switches instantly (no
-save needed; blocked while recording). A second row, "Qwen-Größe: [size][size]", appears
-below it only when `GET /config` reports `qwen_model_dir_alt` (a second qwen checkpoint
-configured) — clicking a size calls `POST /qwen/switch?slot=` to hot-swap the loaded model
-server-side (see Runtime-switchable second size, above); also blocked while recording.
+**Unified frontend** (v0.1.16+): one userscript, one server, one URL + API key. A single
+"Modell:" dropdown above the tab bar (`renderModelSelect()`) covers every engine/size
+combination the server has loaded: "Voxtral" and, when the qwen engine is enabled, "Qwen
+`<primary size>`" plus — only when `qwen_model_dir_alt` is configured — "Qwen `<secondary
+size>`", labelled from `GET /config`'s `qwen_model_size`/`qwen_model_size_alt`. Its option
+values encode both halves of the state as `"voxtral"` or `"qwen:primary"`/`"qwen:secondary"`;
+selecting an option sets the client-side engine choice (GM value `active_model` → `?model=`
+on the WS URL, instant, no save needed) and, for a `"qwen:"` option, hot-swaps the loaded
+checkpoint via `POST /qwen/switch?slot=` when it differs from `qwen_active_slot` (see
+Runtime-switchable second size, above) — both blocked while recording.
 Storage keys are the dual-backend era's Voxtral
 profile keys (`server_url_voxtral`/`api_key_voxtral`, falling back to the pre-profile
 `server_url`/`api_key`; `active_backend` seeds `active_model`), so both upgrade and rollback

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.25
+// @version      0.1.26
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -469,18 +469,15 @@ zeile löschen=delete_newline`;
 
     configPanel.innerHTML = `
         <div style="font-weight:bold;margin-bottom:2px;">SCHMIDIspeech <span id="schmidi-server-version" style="color:#888;font-weight:normal;font-size:11px;"></span></div>
+        <!-- Single model dropdown covering every engine/size combination the
+             server has loaded: Voxtral, and — when configured — Qwen at its
+             primary and secondary (hot-swappable) sizes. Populated by
+             renderModelSelect() from GET /config's models/qwen_model_dir_alt
+             fields, so it degrades to just "Voxtral"/"Qwen" against an older
+             or single-size server. -->
         <div style="display:flex;gap:4px;margin-bottom:4px;align-items:center;">
             <span style="${LABEL_STYLE}">Modell:</span>
-            <button id="schmidi-model-voxtral" data-model="voxtral" style="${BTN_CANCEL};flex:1;">Voxtral</button>
-            <button id="schmidi-model-qwen"    data-model="qwen"    style="${BTN_CANCEL};flex:1;">Qwen3</button>
-        </div>
-        <!-- Qwen size selector: only shown when the server has a second qwen
-             checkpoint configured (qwen_model_dir_alt); switching hot-swaps the
-             loaded model server-side via POST /qwen/switch, no restart. -->
-        <div id="schmidi-qwen-size-row" style="display:none;gap:4px;margin-bottom:4px;align-items:center;">
-            <span style="${LABEL_STYLE}">Qwen-Größe:</span>
-            <button id="schmidi-qwen-size-primary"   data-slot="primary"   style="${BTN_CANCEL};flex:1;">–</button>
-            <button id="schmidi-qwen-size-secondary" data-slot="secondary" style="${BTN_CANCEL};flex:1;">–</button>
+            <select id="schmidi-model-select" style="${INPUT_STYLE}flex:1;padding:4px 8px;font-size:12px;"></select>
         </div>
         <div style="display:flex;gap:0;border-bottom:1px solid #444;margin-bottom:4px;flex-wrap:wrap;">
             <button id="schmidi-tab-woerter"       style="background:none;border:none;border-bottom:2px solid transparent;color:#888;padding:4px 8px;cursor:pointer;font-size:12px;">Eigene Wörter</button>
@@ -692,21 +689,31 @@ zeile löschen=delete_newline`;
         updateBtnTitle();
     }
 
-    function styleModelButtons() {
+    // Combined model+size dropdown: option values are "voxtral" or
+    // "qwen:primary"/"qwen:secondary" (the latter only when qwen_model_dir_alt
+    // is configured). Encodes both activeModel() (client-side, instant) and
+    // lastCfg.qwen_active_slot (server-side, POST /qwen/switch) as one control.
+    function renderModelSelect() {
         ensureModelAvailable();
-        const active = activeModel();
-        // "qwen" may be absent from the server's models list (engine disabled) —
-        // gray the button out then. Unknown until the first GET /config; a
-        // server without a "models" field (old single-model) allows both.
+        const sel = configPanel.querySelector("#schmidi-model-select");
+        if (!sel) return;
+        // "qwen" may be absent from the server's models list (engine disabled).
+        // Unknown until the first GET /config; a server without a "models"
+        // field (old single-model) allows both.
         const available = lastCfg.models;
-        configPanel.querySelectorAll("button[data-model]").forEach((b) => {
-            const isActive  = b.dataset.model === active;
-            const isEnabled = !available || available.includes(b.dataset.model);
-            b.style.background = isActive ? "#2980b9" : "#333";
-            b.style.color      = isActive ? "#fff" : (isEnabled ? "#aaa" : "#555");
-            b.disabled         = !isEnabled;
-            b.title            = isEnabled ? "" : "Auf dem Server nicht geladen";
-        });
+        const hasQwen = !available || available.includes("qwen");
+        const options = [{ value: "voxtral", label: MODELS.voxtral.label }];
+        if (hasQwen) {
+            options.push({ value: "qwen:primary", label: `${MODELS.qwen.label} ${lastCfg.qwen_model_size || ""}`.trim() });
+            if (lastCfg.qwen_model_dir_alt) {
+                options.push({ value: "qwen:secondary", label: `${MODELS.qwen.label} ${lastCfg.qwen_model_size_alt || ""}`.trim() });
+            }
+        }
+        sel.innerHTML = options.map((o) => `<option value="${o.value}">${o.label}</option>`).join("");
+        const active = activeModel();
+        const slot   = lastCfg.qwen_active_slot || "primary";
+        sel.value = active === "qwen" ? `qwen:${slot}` : "voxtral";
+        if (!sel.value) sel.value = options[0].value; // requested option not present (yet)
         const vEl = configPanel.querySelector("#schmidi-server-version");
         if (vEl) {
             vEl.textContent = `[${MODELS[active].label}]` +
@@ -728,55 +735,44 @@ zeile löschen=delete_newline`;
     };
 
     function switchModel(m) {
-        if (recording) { showToast("Modellwechsel während der Aufnahme nicht möglich"); return; }
         GM_setValue("active_model", m);
-        styleModelButtons();
+        renderModelSelect();
         updateBtnTitle();
         const loader = TAB_LOADERS[currentTab];
         if (loader) loader();
     }
 
-    configPanel.querySelectorAll("button[data-model]").forEach((b) => {
-        b.addEventListener("click", () => switchModel(b.dataset.model));
-    });
-
     // ---- Qwen size switching (0.6B <-> 1.7B, only when the server has both) ----
-    function styleQwenSizeButtons() {
-        const row = configPanel.querySelector("#schmidi-qwen-size-row");
-        if (!row) return;
-        const hasAlt = !!lastCfg.qwen_model_dir_alt;
-        row.style.display = hasAlt ? "flex" : "none";
-        if (!hasAlt) return;
-        const primaryBtn   = configPanel.querySelector("#schmidi-qwen-size-primary");
-        const secondaryBtn = configPanel.querySelector("#schmidi-qwen-size-secondary");
-        primaryBtn.textContent   = lastCfg.qwen_model_size     || "Primär";
-        secondaryBtn.textContent = lastCfg.qwen_model_size_alt || "Sekundär";
-        const active = lastCfg.qwen_active_slot || "primary";
-        [[primaryBtn, "primary"], [secondaryBtn, "secondary"]].forEach(([b, slot]) => {
-            const isActive = slot === active;
-            b.style.background = isActive ? "#2980b9" : "#333";
-            b.style.color      = isActive ? "#fff" : "#aaa";
-        });
-    }
-
     async function switchQwenSize(slot) {
-        if (recording) { showToast("Modellwechsel während der Aufnahme nicht möglich"); return; }
         if (slot === (lastCfg.qwen_active_slot || "primary")) return;
         showToast("Wechsle Qwen-Modell…");
         try {
             const res = await authFetch(`${getHttpBase()}/qwen/switch?slot=${slot}`, { method: "POST" });
             if (!res.ok) throw new Error("POST /qwen/switch: " + res.status);
-            await loadServerParams(); // refreshes lastCfg, size buttons, LoRA fallback dir
+            await loadServerParams(); // refreshes lastCfg, the select, LoRA fallback dir
             const loader = TAB_LOADERS[currentTab];
             if (loader) loader(); // e.g. Paare tab's LoRA checkbox reflects the new slot
             showToast("Qwen-Modell gewechselt");
         } catch (e) {
             showToast("Fehler beim Modellwechsel: " + e.message);
+            renderModelSelect(); // revert the select to the actual (unchanged) state
         }
     }
 
-    configPanel.querySelectorAll("button[data-slot]").forEach((b) => {
-        b.addEventListener("click", () => switchQwenSize(b.dataset.slot));
+    // One dropdown drives both switches: picking a plain "voxtral" entry only
+    // ever touches the client-side engine choice; picking a "qwen:<slot>" entry
+    // switches the engine (if needed) and, when that slot isn't already loaded
+    // server-side, hot-swaps it via switchQwenSize() (POST /qwen/switch).
+    configPanel.querySelector("#schmidi-model-select").addEventListener("change", async (e) => {
+        const sel = e.target;
+        if (recording) {
+            showToast("Modellwechsel während der Aufnahme nicht möglich");
+            renderModelSelect();
+            return;
+        }
+        const [engine, slot] = sel.value.split(":");
+        if (engine !== activeModel()) switchModel(engine);
+        if (engine === "qwen") await switchQwenSize(slot);
     });
 
     // ---- Tab switching ----
@@ -903,8 +899,7 @@ zeile löschen=delete_newline`;
                 cfg.german_prime !== undefined ? "flex" : "none";
             configPanel.querySelector("#schmidi-row-context-biasing").style.display =
                 cfg.context_biasing !== undefined && hasQwen ? "flex" : "none";
-            styleModelButtons();
-            styleQwenSizeButtons();
+            renderModelSelect();
             setEinstellungenStatus("", false);
         } catch (e) {
             setEinstellungenStatus("Fehler: " + e.message, true);
@@ -1025,7 +1020,7 @@ zeile löschen=delete_newline`;
 
     function openConfig() {
         fillClientFields();
-        styleModelButtons();
+        renderModelSelect();
         switchTab("einstellungen");
         loadServerParams();
         configPanel.style.display = "flex";
@@ -1586,7 +1581,7 @@ zeile löschen=delete_newline`;
                 qwenBox.checked = !!cfg.lora_active_qwen;
                 qwenBox.dataset.loraDir = cfg.lora_dir_qwen || '';
             }
-            styleModelButtons();
+            renderModelSelect();
             updateTrainButtonLabel();
         } catch (_) { /* leave checkboxes as-is on error */ }
     }
