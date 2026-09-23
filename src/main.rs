@@ -1663,11 +1663,15 @@ mod server {
                 Some(Ok(Message::Text(text))) if text.trim().eq_ignore_ascii_case("stop") => {
                     let result = tokio::task::spawn_blocking(move || stream_state.finish()).await?;
                     let raw = result?;
-                    if !raw.is_empty() {
+                    let msg = if raw.is_empty() {
+                        // Nothing (or an implausible final dropped) — clear the
+                        // client's partial so it isn't inserted as trailing text.
+                        json!({ "type": "partial", "text": "" }).to_string()
+                    } else {
                         let final_text = finalize_text(state, &raw).await;
-                        let msg = json!({ "type": "final", "text": final_text }).to_string();
-                        let _ = socket.send(Message::Text(msg.into())).await;
-                    }
+                        json!({ "type": "final", "text": final_text }).to_string()
+                    };
+                    let _ = socket.send(Message::Text(msg.into())).await;
                     break;
                 }
                 Some(Ok(Message::Close(_))) | None => {
