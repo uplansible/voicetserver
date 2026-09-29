@@ -631,7 +631,11 @@ dictation is saved — see the `events` field under `POST /training/review`, abo
 an `AudioContext({ sampleRate: 16000 })` so the **browser** resamples the mic stream with proper
 low-pass filtering. The old path decimated the native 48 kHz stream (every 3rd sample), folding
 high frequencies into the speech band as aliasing noise. Naive decimation survives only as a
-fallback (`captureChunk()`) for browsers that refuse a fixed-rate context.
+fallback (`captureChunk()`) for browsers that refuse a fixed-rate context. The mic is opened
+with `MIC_CONSTRAINTS` (`autoGainControl: false`; echo cancellation / noise suppression left at
+browser defaults): browser AGC ramps the gain up during pauses, boosting distant background
+speech into the ASR engine, where Qwen turns it into hallucinated sentences. The close-talk
+headsets in use (Jabra Evolve 65 TE / Evolve2 65) level the mic themselves.
 
 **Diktate tab (real dictations → training pairs):** every dictation's 16 kHz PCM is kept
 client-side (`dictationPcmBuffers` → `lastDictation` snapshot on stop, together with the

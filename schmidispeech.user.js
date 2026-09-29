@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.26
+// @version      0.1.27
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -1067,6 +1067,12 @@ zeile löschen=delete_newline`;
         if (el) { el.textContent = msg; el.style.color = isError ? '#e74c3c' : '#aaa'; }
     }
 
+    // Mic constraints for all capture paths (ASR, Aufnehmen, 2. Durchgang).
+    // Browser AGC is off: it ramps the gain up during pauses, amplifying distant
+    // background speech that then reaches the ASR engine (Qwen hallucinates
+    // fluent sentences from it). Headsets level the close-talk mic themselves.
+    const MIC_CONSTRAINTS = { audio: { autoGainControl: false }, video: false };
+
     // Prefer a 16 kHz capture context: the browser then resamples the mic
     // stream itself with proper low-pass filtering (same as the preview player).
     // The old path decimated the native 48 kHz stream by picking every 3rd
@@ -1257,7 +1263,7 @@ zeile löschen=delete_newline`;
         if (trainingPreviewSrc) { try { trainingPreviewSrc.stop(); } catch(_) {} trainingPreviewSrc = null; }
         if (trainingPreviewCtx) { trainingPreviewCtx.close(); trainingPreviewCtx = null; }
         trainingPcmBuffers = [];
-        navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS)
             .then((stream) => {
                 trainingMicStream = stream;
                 trainingRecording = true;
@@ -1436,7 +1442,7 @@ zeile löschen=delete_newline`;
         if (sp2PreviewSrc) { try { sp2PreviewSrc.stop(); } catch(_) {} sp2PreviewSrc = null; }
         if (sp2PreviewCtx) { sp2PreviewCtx.close(); sp2PreviewCtx = null; }
         sp2PcmBuffers = [];
-        navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS)
             .then((stream) => {
                 sp2MicStream = stream;
                 sp2Recording = true;
@@ -2174,7 +2180,7 @@ zeile löschen=delete_newline`;
         dictationEvents     = [];
         dictationStartedAt  = Date.now();
         navigator.mediaDevices
-            .getUserMedia({ audio: true, video: false })
+            .getUserMedia(MIC_CONSTRAINTS)
             .then((stream) => {
                 micStream = stream;
                 recording = true;
