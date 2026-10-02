@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.27
+// @version      0.1.29
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -150,7 +150,6 @@ zeile löschen=delete_newline`;
     let accumulatedText = "";      // live mode: displayed in overlay (finals seen so far)
     let currentPartial = "";       // current unfinalized partial (overlay only)
     let pendingText = "";          // commit mode: accumulated text not yet injected
-    let originalTranscribed = "";  // commit mode: model output snapshot for edit-log diff
     let overlayUserEdited = false; // commit mode: user has started editing the overlay div
     let discardOnStop = false;     // Insert clicked mid-recording: ignore the server's drained
                                    // tail instead of reopening the overlay with it
@@ -252,16 +251,26 @@ zeile löschen=delete_newline`;
         "background:#333;color:#aaa;border:1px solid #555;border-radius:6px;" +
         "padding:4px 12px;cursor:pointer;font-size:14px;line-height:1;";
 
-    // Save the dictation (audio + current overlay text) as a training-pair
-    // candidate for later review in the Diktate tab.
-    const trainSaveBtn = document.createElement("button");
-    trainSaveBtn.textContent = "💾";
-    trainSaveBtn.title = "Als Trainings-Diktat speichern (Review im Diktate-Tab)";
-    trainSaveBtn.style.cssText =
-        "background:#333;color:#aaa;border:1px solid #555;border-radius:6px;" +
+    // Insert like ↵, and additionally save the dictation (audio + inserted text)
+    // as a training-pair candidate for later review in the Diktate tab. Plain ↵
+    // saves nothing, so only dictations worth training on end up in the pool.
+    const commitSaveBtn = document.createElement("button");
+    commitSaveBtn.textContent = "↵💾";
+    commitSaveBtn.title = "Einfügen + als Trainings-Diktat speichern (Review im Diktate-Tab)";
+    commitSaveBtn.style.cssText =
+        "background:#333;color:#ddd;border:1px solid #555;border-radius:6px;" +
         "padding:4px 12px;cursor:pointer;font-size:14px;line-height:1;";
 
-    overlayToolbar.append(trainSaveBtn, commitBtn, cancelOverlayBtn);
+    // Play back the last dictation's audio (client-side, nothing is uploaded),
+    // to check the recording quality when the transcript came out bad.
+    const playDictBtn = document.createElement("button");
+    playDictBtn.textContent = "▶";
+    playDictBtn.title = "Aufnahme anhören";
+    playDictBtn.style.cssText =
+        "background:#333;color:#aaa;border:1px solid #555;border-radius:6px;" +
+        "padding:4px 12px;cursor:pointer;font-size:14px;line-height:1;margin-right:auto;";
+
+    overlayToolbar.append(playDictBtn, commitSaveBtn, commitBtn, cancelOverlayBtn);
     overlayCommit.append(overlayTextDiv, overlayCommitPartial, overlayToolbar);
     overlay.append(overlayLive, overlayCommit);
     document.body.appendChild(overlay);
@@ -346,8 +355,8 @@ zeile löschen=delete_newline`;
     // ---- Overlay commit / cancel ----
 
     function clearOverlay() {
+        stopDictationPlayback();
         pendingText = "";
-        originalTranscribed = "";
         overlayUserEdited = false;
         overlayTextDiv.textContent = "";
         overlayCommitPartial.textContent = "";
@@ -364,23 +373,18 @@ zeile löschen=delete_newline`;
         }
     }
 
-    commitBtn.addEventListener("click", async (e) => {
-        e.stopPropagation();
+    // Insert the overlay text at the cursor; with `save`, also store the
+    // dictation as a training-pair candidate (with the edited text).
+    function commitOverlay(save) {
         const text = overlayTextDiv.textContent.trimEnd();
+        // Insert mid-recording: the session hasn't stopped yet, so take the
+        // snapshot now from the audio captured so far (the drained tail is
+        // discarded below anyway).
+        if (recording) snapshotDictation(text);
+        if (save) saveDictationAsReview(text.trim());
         if (text) {
             injectAtCursor(text);
             commitTarget();  // blur so the host page saves the inserted text
-            if (originalTranscribed && text !== originalTranscribed) {
-                authFetch(`${getHttpBase()}/log/edit`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        original: originalTranscribed,
-                        edited: text,
-                        timestamp: new Date().toISOString(),
-                    }),
-                }).catch(() => {});
-            }
         }
         if (recording) {
             // Insert can be pressed mid-recording: stop the mic/session too and
@@ -391,6 +395,21 @@ zeile löschen=delete_newline`;
             setIdle();
         }
         clearOverlay();
+    }
+
+    commitBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        commitOverlay(false);
+    });
+
+    commitSaveBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        commitOverlay(true);
+    });
+
+    playDictBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleDictationPlayback();
     });
 
     cancelOverlayBtn.addEventListener("click", (e) => {
@@ -398,10 +417,52 @@ zeile löschen=delete_newline`;
         cancelOverlayWithConfirm();
     });
 
-    trainSaveBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        saveDictationAsReview(overlayTextDiv.textContent.trim());
-    });
+    // ---- Last-dictation playback (overlay ▶ and Diktate tab) ----
+    let dictPlayCtx = null;
+    let dictPlaySrc = null;
+
+    function setDictPlayLabels(playing) {
+        playDictBtn.textContent = playing ? "⏹" : "▶";
+        const tabBtn = configPanel.querySelector('#schmidi-dikt-play-last');
+        if (tabBtn) tabBtn.textContent = playing ? "⏹ Stopp" : "▶ Anhören";
+    }
+
+    function stopDictationPlayback() {
+        if (!dictPlaySrc) return;
+        try { dictPlaySrc.stop(); } catch (_) {}
+        dictPlaySrc = null;
+        if (dictPlayCtx) { dictPlayCtx.close(); dictPlayCtx = null; }
+        setDictPlayLabels(false);
+    }
+
+    function toggleDictationPlayback() {
+        if (dictPlaySrc) { stopDictationPlayback(); return; }
+        if (recording) { showToast("Während der Aufnahme nicht möglich"); return; }
+        if (!lastDictation || lastDictation.pcm.length === 0) {
+            showToast("Kein Diktat vorhanden");
+            return;
+        }
+        try {
+            dictPlayCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+            const ctx = dictPlayCtx;
+            const buf = ctx.createBuffer(1, lastDictation.pcm.length, SAMPLE_RATE);
+            buf.copyToChannel(lastDictation.pcm, 0);
+            dictPlaySrc = ctx.createBufferSource();
+            const src = dictPlaySrc;
+            src.buffer = buf;
+            src.connect(ctx.destination);
+            src.onended = () => {
+                if (dictPlaySrc !== src) return;  // already stopped manually
+                dictPlaySrc = null;
+                ctx.close(); dictPlayCtx = null;
+                setDictPlayLabels(false);
+            };
+            src.start();
+            setDictPlayLabels(true);
+        } catch (e) {
+            showToast("Wiedergabe: " + e.message);
+        }
+    }
 
     // ---- updateOverlay ----
     function updateOverlay() {
@@ -609,7 +670,10 @@ zeile löschen=delete_newline`;
 
         <!-- Diktate tab (real dictations → review → training pairs) -->
         <div id="schmidi-pane-diktate" style="display:none;flex-direction:column;gap:6px;max-width:340px;">
-            <button id="schmidi-dikt-save-last" style="${BTN_PRIMARY}" disabled>💾 Letztes Diktat speichern</button>
+            <div style="display:flex;gap:6px;">
+                <button id="schmidi-dikt-save-last" style="${BTN_PRIMARY};flex:1;" disabled>💾 Letztes Diktat speichern</button>
+                <button id="schmidi-dikt-play-last" style="${BTN_CANCEL}" disabled title="Letztes Diktat anhören">▶ Anhören</button>
+            </div>
             <div id="schmidi-dikt-last-info" style="${LABEL_STYLE}">Kein Diktat in dieser Sitzung</div>
             <div id="schmidi-dikt-list" style="max-height:140px;overflow-y:auto;border:1px solid #333;border-radius:6px;">
                 <div style="padding:8px;color:#666;font-size:12px;">Lade…</div>
@@ -905,10 +969,6 @@ zeile löschen=delete_newline`;
             setEinstellungenStatus("Fehler: " + e.message, true);
         }
     }
-
-    // Commit-mode edit-log corrections are now auto-added to custom_words.txt
-    // server-side on every POST /log/edit (see CLAUDE.md — Edit-log mining) — no
-    // client-side suggestions review step; reload the tab to see them appear.
 
     // Parse a numeric input field. Returns undefined for empty/invalid input,
     // but preserves a legitimate 0 (which `value || undefined` would wrongly drop).
@@ -1823,9 +1883,12 @@ zeile löschen=delete_newline`;
 
     function updateLastDictationUi() {
         const saveBtn = configPanel.querySelector('#schmidi-dikt-save-last');
+        const playBtn = configPanel.querySelector('#schmidi-dikt-play-last');
         const info    = configPanel.querySelector('#schmidi-dikt-last-info');
         if (!saveBtn || !info) return;
-        if (!lastDictation || lastDictation.pcm.length === 0) {
+        const hasDictation = !!lastDictation && lastDictation.pcm.length > 0;
+        if (playBtn) playBtn.disabled = !hasDictation;
+        if (!hasDictation) {
             saveBtn.disabled = true;
             info.textContent = 'Kein Diktat in dieser Sitzung';
         } else {
@@ -2066,6 +2129,7 @@ zeile löschen=delete_newline`;
         const ok = await saveDictationAsReview(undefined, setDiktStatus);
         if (ok) await loadReviews();
     });
+    configPanel.querySelector('#schmidi-dikt-play-last').addEventListener('click', toggleDictationPlayback);
     configPanel.querySelector('#schmidi-dikt-transcribe-voxtral').addEventListener('click', () => transcribeReview('voxtral'));
     configPanel.querySelector('#schmidi-dikt-transcribe-qwen').addEventListener('click', () => transcribeReview('qwen'));
     configPanel.querySelector('#schmidi-dikt-accept').addEventListener('click', acceptReview);
@@ -2171,10 +2235,10 @@ zeile löschen=delete_newline`;
 
     // ---- Audio capture ----
     function startRecording() {
+        stopDictationPlayback();
         accumulatedText     = "";
         currentPartial      = "";
         pendingText         = "";
-        originalTranscribed = "";
         overlayUserEdited   = false;
         dictationPcmBuffers = [];
         dictationEvents     = [];
@@ -2261,10 +2325,9 @@ zeile löschen=delete_newline`;
         }
 
         if (isCommitMode()) {
-            // Add trailing partial to pending text; snapshot for edit-log
+            // Add trailing partial to pending text
             if (currentPartial) pendingText += currentPartial;
             currentPartial      = "";
-            originalTranscribed = pendingText;
             snapshotDictation(pendingText);
             overlayUserEdited   = false;
             overlayTextDiv.textContent = pendingText;
@@ -2285,7 +2348,7 @@ zeile löschen=delete_newline`;
     }
 
     // Keep the finished dictation (audio + transcript) so it can be saved as a
-    // training-pair candidate — via the overlay 💾 button or the Diktate tab.
+    // training-pair candidate — via the overlay ↵💾 button or the Diktate tab.
     function snapshotDictation(text) {
         if (dictationPcmBuffers.length > 0) {
             lastDictation = {

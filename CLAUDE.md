@@ -513,7 +513,12 @@ invisible to the trainer until accepted.
 - `DELETE /training/review/{id}` — discard candidate (WAV + JSONL entry)
 
 **Edit-log mining:**
-- `POST /log/edit` — `{"original","edited","timestamp"}` — appended to `edit_log.jsonl` by the userscript when a commit-mode dictation is edited before insertion. The handler then runs `word_diffs(original, edited)` (LCS word diff; changed runs ≤4 words paired as removed→inserted, punctuation-only changes skipped) and auto-adds each pair as a `wrong=correct` line straight into `custom_words.txt` via the same read-modify-write + corrector-rebuild path as `POST /words` (`apply_words_patch`) — no separate suggestions/review step. An unwanted auto-added pair is removed the same way any custom word is: delete the line in the Eigene Wörter tab; dictating the correction again re-derives it if still needed.
+**No longer called by the userscript (v0.1.29+):** an overlay edit can't distinguish a
+mishearing from a content change (`rechts` → `links` because you misspoke would become a
+`rechts=links` pair silently rewriting every future dictation). Word pairs are now added only
+deliberately via right-click → correct. The endpoints remain server-side, unused.
+
+- `POST /log/edit` — `{"original","edited","timestamp"}` — appended to `edit_log.jsonl` (formerly sent by the userscript when a commit-mode dictation was edited before insertion). The handler then runs `word_diffs(original, edited)` (LCS word diff; changed runs ≤4 words paired as removed→inserted, punctuation-only changes skipped) and auto-adds each pair as a `wrong=correct` line straight into `custom_words.txt` via the same read-modify-write + corrector-rebuild path as `POST /words` (`apply_words_patch`) — no separate suggestions/review step. An unwanted auto-added pair is removed the same way any custom word is: delete the line in the Eigene Wörter tab; dictating the correction again re-derives it if still needed.
 - `GET /edits/report` — `{"entries":N,"suggestions":[{"original","edited","count"},…]}` — aggregates the edit log into the most frequent word-level corrections, same `word_diffs` logic, top 30 by count. Diagnostic only now (no UI reads it) since corrections are auto-added on every edit.
 
 Training data stored in `~/.config/voicetserver/training/audio/*.wav` + `pairs.jsonl` (one
@@ -596,8 +601,8 @@ Default hotkey: `Ctrl+Shift+D` (configurable via right-click menu → Einstellun
 Text is inserted live at cursor on each `final`; trailing partial inserted on stop.
 Falls back to clipboard if no editable element was captured.
 
-Right-click → eight tabs: **Eigene Wörter** (server-side custom words — commit-mode edit-log
-corrections are auto-added here server-side, see Edit-log mining above; no in-tab review step),
+Right-click → eight tabs: **Eigene Wörter** (server-side custom words — added manually or via right-click → correct
+on overlay text; edits before insertion are no longer mined, see Edit-log mining above),
 **Hotwords** (client-side GM-stored list sent per session
 via `?hotwords=`; biasing only on Qwen3), **Steuerwörter** (client-side GM-stored control-word
 vocabulary, see Control words below), **Aufnehmen** (record calibration sentences),
@@ -639,8 +644,12 @@ headsets in use (Jabra Evolve 65 TE / Evolve2 65) level the mic themselves.
 
 **Diktate tab (real dictations → training pairs):** every dictation's 16 kHz PCM is kept
 client-side (`dictationPcmBuffers` → `lastDictation` snapshot on stop, together with the
-transcript — the edited overlay text in commit mode). Saving (overlay 💾 button in commit mode,
-or "💾 Letztes Diktat speichern" in the tab) POSTs it to `/training/review`. The tab lists all
+transcript — the edited overlay text in commit mode). Nothing is saved automatically: the commit-mode overlay has
+plain **↵** (insert only) and **↵💾** (insert + save, with the edited overlay text);
+"💾 Letztes Diktat speichern" in the tab saves without inserting. Saving POSTs to
+`/training/review`. A **▶** button (overlay toolbar, and "▶ Anhören" in the tab) plays the
+last dictation's PCM client-side (`toggleDictationPlayback()`) to check recording quality when
+a transcript comes out bad. The tab lists all
 candidates with ▶ playback and ✕ delete; selecting one opens a detail area with an editable
 transcript, "↻ Voxtral" / "↻ Qwen3" re-transcription (fetches the stored WAV, parses PCM16
 client-side, replays it through a normal WS session with the chosen `?model=` —
