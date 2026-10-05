@@ -7,9 +7,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_FILE="$HOME/.config/voicetserver/config.toml"
 DEFAULT_VENV="$HOME/.local/share/voicetserver-venv"
-DEFAULT_MODEL_DIR="$HOME/models/Voxtral-Mini-4B-Realtime"
+MODELS_ROOT="$HOME/models"   # replaced by <base>/models when a base dir is chosen
+DEFAULT_MODEL_DIR="$MODELS_ROOT/Voxtral-Mini-4B-Realtime"
 HF_BASE="https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602/resolve/main"
-DEFAULT_QWEN_DIR="$HOME/models/Qwen3-ASR-0.6B"
+DEFAULT_QWEN_DIR="$MODELS_ROOT/Qwen3-ASR-0.6B"
 HF_QWEN_BASE="https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/main"
 
 echo "=== voicetserver installer ==="
@@ -241,8 +242,171 @@ fi
 set_config_value "venv_path" "$VENV_PATH"
 echo "venv_path set in $CONFIG_FILE"
 
+# --- Base directory (optional): models + training data under one folder ---
+# Layout: <base>/models/<checkpoint dirs> + <base>/data (data_dir). One folder
+# means one ZFS dataset to snapshot/replicate (syncoid etc.). Not stored as a
+# config key — the server rewrites config.toml from its own struct and would
+# drop it; a re-run derives it from data_dir instead (<base>/data).
+read_config_value() {
+    grep -E "^[[:space:]]*$1[[:space:]]*=" "$CONFIG_FILE" 2>/dev/null \
+        | head -1 | sed 's/.*= *"\(.*\)"/\1/' || true   # no match ≠ error under pipefail
+}
+
+# Items that make up the training data in a data_dir — needed to move the
+# default data_dir (~/.config/voicetserver), which also holds config.toml,
+# logs, the PID file and tools/ that must stay put.
+DATA_ITEMS=(custom_words.txt training training_sentences.txt edit_log.jsonl
+            lora_adapter lora_adapter_qwen lora_adapter_qwen_alt)
+
+# Offer to create a ZFS dataset mounted at $1 (only when zfs is installed and
+# $1 isn't a mountpoint yet). Default name: the dataset holding the nearest
+# existing ancestor + "/<basename>"; the mountpoint is set explicitly, so the
+# dataset doesn't have to sit at the inherited path.
+offer_zfs_dataset() {
+    local dir="$1"
+    command -v zfs &>/dev/null || return 0
+    if findmnt -n -M "$dir" &>/dev/null; then
+        echo "$dir is already a mountpoint ($(findmnt -n -o SOURCE -M "$dir")) — no dataset needed."
+        return 0
+    fi
+    if [[ -d "$dir" ]] && [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+        echo "Note: $dir exists and is not empty — a ZFS dataset can't be mounted over it, skipping dataset creation." >&2
+        return 0
+    fi
+    printf "Create a ZFS dataset for %s (separate snapshots/replication)? [Y/n]: " "$dir"
+    local ans; read -r ans
+    [[ "${ans,,}" == "n" ]] && return 0
+    local anc="$dir"
+    while [[ ! -d "$anc" ]]; do anc="$(dirname "$anc")"; done
+    local def_name=""
+    if [[ "$(findmnt -n -o FSTYPE --target "$anc")" == "zfs" ]]; then
+        def_name="$(findmnt -n -o SOURCE --target "$anc")/$(basename "$dir")"
+    fi
+    local name
+    printf "Dataset name [%s]: " "${def_name:-pool/voicet}"
+    read -r name
+    name="${name:-${def_name:-pool/voicet}}"
+    local SUDO=""; [[ $EUID -ne 0 ]] && SUDO="sudo"
+    if $SUDO zfs create -o mountpoint="$dir" "$name"; then
+        $SUDO chown "$(id -u):$(id -g)" "$dir"
+        echo "Created dataset $name → $dir"
+    else
+        echo "Warning: zfs create failed — continuing with a plain directory." >&2
+    fi
+}
+
+# Move directory $1 to $2 (refuses to overwrite a non-empty target).
+move_dir() {
+    local src="$1" dst="$2"
+    if [[ -e "$dst" ]] && [[ -n "$(ls -A "$dst" 2>/dev/null)" ]]; then
+        echo "  Warning: $dst already exists and is not empty — not moving $src." >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$dst")"
+    [[ -d "$dst" ]] && rmdir "$dst"
+    echo "  Moving $src → $dst (may take a while across filesystems) ..."
+    mv "$src" "$dst"
+}
+
+# Normalised path (collapses // and trailing /) for comparisons.
+norm() { realpath -m "$1"; }
+
+BASE_DIR=""
+CUR_DATA_DIR=$(read_config_value data_dir)
+DEFAULT_BASE_DIR="$HOME/voicet"
+[[ -n "$CUR_DATA_DIR" && "$(basename "$(norm "$CUR_DATA_DIR")")" == "data" ]] \
+    && DEFAULT_BASE_DIR="$(dirname "$(norm "$CUR_DATA_DIR")")"
+echo ""
+printf "Keep models + training data together under one base directory (e.g. for ZFS replication)? [Y/n]: "
+read -r USE_BASE
+if [[ "${USE_BASE,,}" != "n" ]]; then
+    printf "Base directory [%s]: " "$DEFAULT_BASE_DIR"
+    read -r BASE_DIR
+    BASE_DIR="$(norm "${BASE_DIR:-$DEFAULT_BASE_DIR}")"
+    offer_zfs_dataset "$BASE_DIR"
+    mkdir -p "$BASE_DIR/models" "$BASE_DIR/data"
+
+    # Defaults for the per-location prompts below (fresh installs).
+    MODELS_ROOT="$BASE_DIR/models"
+    DEFAULT_MODEL_DIR="$MODELS_ROOT/Voxtral-Mini-4B-Realtime"
+    DEFAULT_QWEN_DIR="$MODELS_ROOT/Qwen3-ASR-0.6B"
+
+    # Existing install: offer to move configured locations into the base dir.
+    # The server must be stopped — it holds the model files open and writes
+    # training data.
+    NEEDS_MOVE=0
+    for key in model_dir qwen_model_dir qwen_model_dir_alt; do
+        v=$(read_config_value "$key")
+        [[ -n "$v" && "$(norm "$v")" != "$MODELS_ROOT/"* && -d "$v" ]] && NEEDS_MOVE=1
+    done
+    OLD_DATA_DIR="$(norm "${CUR_DATA_DIR:-$HOME/.config/voicetserver}")"
+    OLD_DATA_IS_DEFAULT=0
+    [[ "$OLD_DATA_DIR" == "$(norm "$HOME/.config/voicetserver")" ]] && OLD_DATA_IS_DEFAULT=1
+    if [[ "$OLD_DATA_DIR" != "$BASE_DIR/data" && -d "$OLD_DATA_DIR" ]]; then
+        if [[ "$OLD_DATA_IS_DEFAULT" -eq 1 ]]; then
+            # The default dir always exists (config.toml) — only real data counts.
+            for item in "${DATA_ITEMS[@]}"; do
+                [[ -e "$OLD_DATA_DIR/$item" ]] && NEEDS_MOVE=1
+            done
+        else
+            NEEDS_MOVE=1
+        fi
+    fi
+
+    if [[ "$NEEDS_MOVE" -eq 1 ]]; then
+        printf "Move the existing models + training data into %s? [Y/n]: " "$BASE_DIR"
+        read -r DO_MOVE
+        if [[ "${DO_MOVE,,}" != "n" ]]; then
+            if pgrep -x voicetserver &>/dev/null; then
+                echo "Error: voicetserver is running — stop it first (voicetserver --stop or systemctl --user stop voicetserver) and re-run." >&2
+                exit 1
+            fi
+            for key in model_dir qwen_model_dir qwen_model_dir_alt; do
+                v=$(read_config_value "$key")
+                [[ -z "$v" || ! -d "$v" ]] && continue
+                src="$(norm "$v")"
+                [[ "$src" == "$MODELS_ROOT/"* ]] && continue
+                dst="$MODELS_ROOT/$(basename "$src")"
+                move_dir "$src" "$dst" && set_config_value "$key" "$dst" \
+                    && echo "  $key = $dst"
+            done
+            if [[ "$OLD_DATA_DIR" != "$BASE_DIR/data" && -d "$OLD_DATA_DIR" ]]; then
+                if [[ "$OLD_DATA_IS_DEFAULT" -eq 1 ]]; then
+                    # Shared with config/logs/PID — move only the data items.
+                    for item in "${DATA_ITEMS[@]}"; do
+                        [[ -e "$OLD_DATA_DIR/$item" ]] || continue
+                        if [[ -e "$BASE_DIR/data/$item" ]]; then
+                            echo "  Warning: $BASE_DIR/data/$item already exists — not moving." >&2
+                        else
+                            echo "  Moving $OLD_DATA_DIR/$item → $BASE_DIR/data/"
+                            mv "$OLD_DATA_DIR/$item" "$BASE_DIR/data/"
+                        fi
+                    done
+                    set_config_value "data_dir" "$BASE_DIR/data"
+                elif move_dir "$OLD_DATA_DIR" "$BASE_DIR/data"; then
+                    set_config_value "data_dir" "$BASE_DIR/data"
+                fi
+                echo "  data_dir = $BASE_DIR/data"
+                # Explicit adapter paths pointing into the old data dir.
+                for key in lora_adapter lora_adapter_qwen lora_adapter_qwen_alt; do
+                    v=$(read_config_value "$key")
+                    [[ -z "$v" ]] && continue
+                    nv="$(norm "$v")"
+                    if [[ "$nv" == "$OLD_DATA_DIR/"* ]]; then
+                        set_config_value "$key" "$BASE_DIR/data/${nv#"$OLD_DATA_DIR"/}"
+                        echo "  $key = $BASE_DIR/data/${nv#"$OLD_DATA_DIR"/}"
+                    fi
+                done
+            fi
+        fi
+    elif [[ -z "$CUR_DATA_DIR" ]]; then
+        set_config_value "data_dir" "$BASE_DIR/data"
+    fi
+    DEFAULT_DATA_DIR="$BASE_DIR/data"
+fi
+
 # --- Data directory ---
-DEFAULT_DATA_DIR="$HOME/.config/voicetserver"
+DEFAULT_DATA_DIR="${DEFAULT_DATA_DIR:-$HOME/.config/voicetserver}"
 EXISTING_DATA_DIR=""
 if grep -qE '^[[:space:]]*data_dir[[:space:]]*=' "$CONFIG_FILE" 2>/dev/null; then
     EXISTING_DATA_DIR=$(grep -E '^[[:space:]]*data_dir[[:space:]]*=' "$CONFIG_FILE" \
@@ -433,7 +597,7 @@ if [[ -n "$QWEN_DIR" ]]; then
                 *) echo "Unknown size '$QWEN_ALT_SIZE' — skipping second slot." >&2 ;;
             esac
             if [[ -n "$ALT_HF_REPO" ]]; then
-                DEFAULT_QWEN_ALT_DIR="$HOME/models/Qwen3-ASR-${ALT_LABEL}"
+                DEFAULT_QWEN_ALT_DIR="$MODELS_ROOT/Qwen3-ASR-${ALT_LABEL}"
                 printf "Directory for %s [%s]: " "$ALT_LABEL" "$DEFAULT_QWEN_ALT_DIR"
                 read -r QWEN_ALT_DIR
                 QWEN_ALT_DIR="${QWEN_ALT_DIR:-$DEFAULT_QWEN_ALT_DIR}"

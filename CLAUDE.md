@@ -102,6 +102,19 @@ ensures `~/.local/bin` is on PATH, asks how the server should be reachable, and 
 defaults; existing model/venv/config are detected and skipped. Writes/updates
 `~/.config/voicetserver/config.toml`.
 
+**Base directory** (default yes): models and training data can live under one folder —
+`<base>/models/<checkpoint dirs>` + `<base>/data` (= `data_dir`) — so a single ZFS dataset
+covers everything worth replicating (the venv is throwaway and stays outside). If `zfs` is
+installed and the base dir isn't a mountpoint yet, the installer offers to `zfs create` a
+dataset for it (default name: the dataset of the nearest existing ancestor + `/<basename>`,
+explicit `mountpoint=`, via sudo, then chowned to the user). On an existing install it offers
+to **move** the configured `model_dir`/`qwen_model_dir`/`qwen_model_dir_alt`/`data_dir` into
+the base dir and rewrites those keys (plus `lora_adapter*` paths that pointed into the old data
+dir); it refuses while `voicetserver` is running. When the old data dir is the default
+`~/.config/voicetserver`, only the data items move (config, logs, PID, `tools/` stay). The base
+dir is not a config key (the server rewrites `config.toml` from its own struct and would drop
+it) — a re-run derives it from `data_dir` when that ends in `/data`.
+
 Exposure has two modes:
 - **Tailscale Service** (default) — `tailscale serve --service=svc:<name> --https=443` puts
   TLS on a per-service virtual IP proxying to loopback, so the server binds `127.0.0.1` and
@@ -650,7 +663,7 @@ plain **↵** (insert only) and **↵💾** (insert + save, with the edited over
 `/training/review`. A **▶** button (overlay toolbar, and "▶ Anhören" in the tab) plays the
 last dictation's PCM client-side (`toggleDictationPlayback()`) to check recording quality when
 a transcript comes out bad. The tab lists all
-candidates with ▶ playback and ✕ delete; selecting one opens a detail area with an editable
+candidates with ▶ playback, ⬇ WAV download (`downloadReviewAudio()`, authFetch + object URL) and ✕ delete; selecting one opens a detail area with an editable
 transcript, "↻ Voxtral" / "↻ Qwen3" re-transcription (fetches the stored WAV, parses PCM16
 client-side, replays it through a normal WS session with the chosen `?model=` —
 `transcribePcm()`), and "✓ Als Trainingspaar übernehmen" →

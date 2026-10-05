@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.29
+// @version      0.1.30
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -1939,14 +1939,17 @@ zeile löschen=delete_newline`;
                 <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#ccc;" title="${escapeHtml(t)}">${escapeHtml(short)}</span>
                 <span style="color:#888;font-size:10px;min-width:30px;">${(r.duration_s || 0).toFixed(1)}s</span>
                 <button class="sp-dikt-play" data-id="${r.id}" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">▶</button>
+                <button class="sp-dikt-dl"   data-id="${r.id}" title="WAV herunterladen" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">⬇</button>
                 <button class="sp-dikt-del"  data-id="${r.id}" style="background:#333;color:#c0392b;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">✕</button>
             </div>`;
         }).join('');
         listEl.onclick = async (e) => {
             const playBtn = e.target.closest('.sp-dikt-play');
+            const dlBtn   = e.target.closest('.sp-dikt-dl');
             const delBtn  = e.target.closest('.sp-dikt-del');
             const row     = e.target.closest('.sp-dikt-row');
             if (playBtn) { await playReviewAudio(playBtn); return; }
+            if (dlBtn)   { await downloadReviewAudio(dlBtn.dataset.id); return; }
             if (delBtn)  { await deleteReview(delBtn.dataset.id); return; }
             if (row) selectReview(row.dataset.id);
         };
@@ -1967,6 +1970,27 @@ zeile löschen=delete_newline`;
         const detail = configPanel.querySelector('#schmidi-dikt-detail');
         if (detail) detail.style.display = 'flex';
         setDiktStatus('', false);
+    }
+
+    // Save a candidate's WAV to disk exactly as stored on the server, e.g. to
+    // inspect it in an external player/editor. authFetch + object URL so the
+    // API key is sent (a plain <a href> download couldn't carry the header).
+    async function downloadReviewAudio(id) {
+        try {
+            const res = await authFetch(`${getHttpBase()}/training/review/audio/${id}`);
+            if (!res.ok) throw new Error(await res.text());
+            const url = URL.createObjectURL(await res.blob());
+            const a   = document.createElement('a');
+            a.href = url;
+            a.download = `diktat_${id}.wav`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            // Revoke after the click has handed the blob to the download manager.
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+        } catch (err) {
+            setDiktStatus('Download: ' + err.message, true);
+        }
     }
 
     async function playReviewAudio(playBtn) {
