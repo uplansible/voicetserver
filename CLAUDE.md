@@ -25,6 +25,12 @@ export CUDA_PATH=/usr/local/cuda && export PATH=$CUDA_PATH/bin:$PATH && CUDA_COM
 
 `cargo check` still works for fast syntax checking without full compile.
 
+**CUTLASS fetch (`cudaforge` ≥ 0.1.6):** the flash-attn build script clones CUTLASS from GitHub
+into `~/.cudaforge/git/checkouts/` (overridable via `CUDAFORGE_HOME`), so the first CUDA build
+needs network access. In a sandbox where `~/.cudaforge` is not writable the build fails with
+`GitOperationFailed("Failed to create lock file: Read-only file system")` — prefix the build
+command with `CUDAFORGE_HOME=$PWD/target/cudaforge`.
+
 ## Without CUDA (Docker / no GPU)
 
 ```bash
