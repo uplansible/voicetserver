@@ -4,8 +4,8 @@ One binary serving **both** ASR models on one port (8765), one TLS cert, one API
 config file, one data dir:
 
 - **Voxtral Mini 4B Realtime** (~8 GB VRAM, BF16) — primary engine, always loaded.
-- **Qwen3-ASR-0.6B** (~1.5 GB VRAM) via vendored `qwen3-asr-rs` — optional second engine,
-  ported from the schmidiscribe project; enabled by setting `qwen_model_dir` in config
+- **Qwen3-ASR-0.6B** (~1.5 GB VRAM) via vendored `qwen3-asr-rs` — optional second engine;
+  enabled by setting `qwen_model_dir` in config
   (unset = disabled, saves the VRAM).
 
 A WebSocket session picks its engine with `?model=voxtral|qwen` (absent/empty = voxtral). The
@@ -263,7 +263,7 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 - `src/main.rs` — sync `fn main()` → forks/daemonizes before tokio starts → `tokio::runtime::Builder::block_on(server::run(…))`; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers (`handle_socket` dispatches on `?model=` to `handle_asr_session` (voxtral) or `handle_qwen_session`); `api_key_auth` middleware (constant-time `ct_eq`) on a protected sub-router (`/health` is public); `pair_write_lock` serialises training-pair writes; detach/watchdog/PID/log helpers
 - `src/streaming.rs` — Voxtral `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
 - `src/qwen.rs` — `QwenEngine`: wraps vendored `qwen3_asr::AsrInference` behind the same `Mutex<Option<…>>` unload pattern; inner value is `Arc<AsrInference>` so sessions clone the handle, release the lock, and let AsrInference's own internal mutex serialise GPU work
-- `src/qwen_streaming.rs` — qwen `StreamingState` (ported from schmidiscribe): SilenceDetector with `has_speech()` gate (suppresses hallucinated partials during silence), silence reset carrying the last 200 chars as initial_text. **Hallucination guards** (Qwen invents fluent sentences on non-speech audio, 1.7B especially): (A) audio reaches the engine only while the detector is armed — unarmed 100 ms ticks wait in a pre-roll (`min_speech + PREROLL_EXTRA_TICKS`), trimmed on arming to `LEAD_IN_TICKS` (0.5 s) before the first loud tick, so pauses between segments are never fed; (B) `is_plausible()` drops any partial/final longer than `MAX_CHARS_PER_SPEECH_SEC` (35) × loud-tick seconds + `PLAUSIBLE_SLACK_CHARS` (15). A dropped final is preceded by an empty partial (and the stop path sends an empty partial instead of no final) because the userscript inserts `currentPartial` as fallback for an empty final / on stop
+- `src/qwen_streaming.rs` — qwen `StreamingState`: SilenceDetector with `has_speech()` gate (suppresses hallucinated partials during silence), silence reset carrying the last 200 chars as initial_text. **Hallucination guards** (Qwen invents fluent sentences on non-speech audio, 1.7B especially): (A) audio reaches the engine only while the detector is armed — unarmed 100 ms ticks wait in a pre-roll (`min_speech + PREROLL_EXTRA_TICKS`), trimmed on arming to `LEAD_IN_TICKS` (0.5 s) before the first loud tick, so pauses between segments are never fed; (B) `is_plausible()` drops any partial/final longer than `MAX_CHARS_PER_SPEECH_SEC` (35) × loud-tick seconds + `PLAUSIBLE_SLACK_CHARS` (15). A dropped final is preceded by an empty partial (and the stop path sends an empty partial instead of no final) because the userscript inserts `currentPartial` as fallback for an empty final / on stop
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
 - `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
 - `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`; `FuzzyMatcher`: Kölner-Phonetik + Levenshtein fuzzy snapping of transcribed words onto known plain-term hotwords; `AbbrevExpander`: German letter-name runs → acronym targets (Em Er I → MRI)
@@ -546,7 +546,7 @@ pool — it trains both models' LoRAs). Adapter output is per-model:
 `lora_adapter` / `lora_adapter_qwen` in config to load at startup.
 
 `tools/import_pairs.py` — one-time importer that appends another server's collected pairs
-(e.g. schmidiscribe's `~/.config/schmidiscribe/training/`) into the pool, re-IDing via the
+into the pool, re-IDing via the
 normal `max(id)+1` path. Run with voicetserver stopped (the `pair_write_lock` is in-process
 only); source WAVs are copied, not moved.
 
@@ -601,8 +601,7 @@ keep working; the qwen profile keys stay dormant. The Einstellungen tab is a sin
 driven by the union `GET /config`: qwen rows (`context_biasing`, language) are hidden when
 the server's `models` list lacks `"qwen"`, `delay`/`german_prime` rows appear only when the
 server reports those fields — so the script still degrades gracefully against an old
-single-model server. It replaced schmidiscribe's `schmididict.user.js` (disable that one to
-avoid duplicate mic buttons).
+single-model server.
 
 WebSocket sessions send `?api_key=` and `?model=` plus `?hotwords=` (Hotwords tab, GM-stored)
 and `?patient=` (read from `#schmidi-pat-info-patientendaten` if the host page has it) — used
@@ -711,15 +710,6 @@ Custom word correction is applied to the text returned by `take_text_buf()` befo
 - `tools/` — installer, prebuilt CUDA binary, trainer scripts (`train_lora_voxtral.py`, `train_lora_qwen.py`), `import_pairs.py`
 - `README.private.md` — private deploy notes (gitignored)
 - `releases/` — local versioned binary copies (gitignored)
-
-# Predecessor projects (deprecation)
-
-The qwen engine was ported from **schmidiscribe** (standalone Qwen3-ASR server, port 8767).
-After the unified server has burned in on production: stop/disable the schmidiscribe service,
-archive its repo with a pointer here, and optionally import its training pairs via
-`tools/import_pairs.py` first. The **schreibot** repo (failed whisper test) is unrelated and
-gets nuked independently. Until then schmidiscribe remains deployable standalone; the
-userscript degrades gracefully against it (field-presence gating in `GET /config`).
 
 # Versioning
 
