@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.30
+// @version      0.1.31
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -154,6 +154,9 @@ zeile löschen=delete_newline`;
     let discardOnStop = false;     // Insert clicked mid-recording: ignore the server's drained
                                    // tail instead of reopening the overlay with it
     let dictationPcmBuffers = [];  // 16 kHz PCM chunks of the running dictation
+    let unsentAudio = [];          // chunks captured while the WS is not open yet
+                                   // (connect / reconnect) — flushed once it is
+    const MAX_UNSENT_CHUNKS = 64;  // ~16 s at 4096 samples/chunk; oldest dropped beyond
     let dictationEvents = [];      // per-final {type:"text"|"control", text|action, t} log
     let dictationStartedAt = 0;    // Date.now() at session start, for dictationEvents' t
     let lastDictation = null;      // { pcm, text, events, saved } — last finished dictation
@@ -2265,6 +2268,7 @@ zeile löschen=delete_newline`;
         pendingText         = "";
         overlayUserEdited   = false;
         dictationPcmBuffers = [];
+        unsentAudio         = [];
         dictationEvents     = [];
         dictationStartedAt  = Date.now();
         navigator.mediaDevices
@@ -2273,11 +2277,14 @@ zeile löschen=delete_newline`;
                 micStream = stream;
                 recording = true;
                 reconnectAttempts = 0;
-                connectWS(() => {
-                    setupAudio(stream);
-                    setListening();
-                    updateOverlay();
-                });
+                // Capture starts right away, not on WS open: speech during the
+                // connect / TLS / session-prefill window is queued in unsentAudio
+                // and flushed once the socket is open. Starting capture only in
+                // the onopen callback silently dropped the first word.
+                setupAudio(stream);
+                setListening();
+                updateOverlay();
+                connectWS(null);
             })
             .catch((err) => {
                 showToast("SCHMIDIspeech: Mikrofon nicht erlaubt — " + err.message);
@@ -2301,12 +2308,20 @@ zeile löschen=delete_newline`;
 
         const ratio = audioContext.sampleRate / SAMPLE_RATE;
         scriptProcessor.onaudioprocess = (e) => {
-            if (!recording || !ws || ws.readyState !== WebSocket.OPEN) return;
+            if (!recording) return;
             const chunk = captureChunk(e.inputBuffer.getChannelData(0), ratio);
-            ws.send(chunk.buffer);
             // Keep a copy of exactly what the server heard, so the finished
             // dictation can be saved as a training-pair candidate.
             dictationPcmBuffers.push(chunk);
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                // Flush audio captured while (re)connecting before the new chunk.
+                for (const queued of unsentAudio) ws.send(queued.buffer);
+                unsentAudio = [];
+                ws.send(chunk.buffer);
+            } else {
+                unsentAudio.push(chunk);
+                if (unsentAudio.length > MAX_UNSENT_CHUNKS) unsentAudio.shift();
+            }
         };
     }
 
@@ -2318,13 +2333,25 @@ zeile löschen=delete_newline`;
         if (audioContext)    { audioContext.close(); audioContext = null; }
         if (micStream)       { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
 
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            // Send "stop" so the server flushes remaining text as a final before
-            // closing. finalizeStop() runs on ws.onclose (server closed after the
-            // flush) or after the 2s fallback timer.
+        // Send "stop" so the server flushes remaining text as a final before
+        // closing. finalizeStop() runs on ws.onclose (server closed after the
+        // flush) or after the 2s fallback timer.
+        const sendStop = () => {
+            for (const queued of unsentAudio) ws.send(queued.buffer);
+            unsentAudio = [];
             ws.send("stop");
+        };
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            sendStop();
             awaitingFinalFlush = true;
             stopFinalizeTimer = setTimeout(finalizeStop, 2000);
+        } else if (ws && ws.readyState === WebSocket.CONNECTING && unsentAudio.length) {
+            // Stopped before the socket opened: the queued audio is the whole
+            // dictation, so send it once connected instead of discarding it.
+            // The fallback is longer — the server transcribes the backlog first.
+            pendingOnReady = sendStop;
+            awaitingFinalFlush = true;
+            stopFinalizeTimer = setTimeout(finalizeStop, 10000);
         } else {
             finalizeStop();
         }
@@ -2334,6 +2361,7 @@ zeile löschen=delete_newline`;
     function finalizeStop() {
         if (stopFinalizeTimer) { clearTimeout(stopFinalizeTimer); stopFinalizeTimer = null; }
         awaitingFinalFlush = false;
+        unsentAudio = [];
         if (ws) { ws.close(); ws = null; }
 
         if (discardOnStop) {

@@ -121,6 +121,10 @@ impl SilenceDetector {
 const PREROLL_EXTRA_TICKS: usize = 30;
 /// Silent ticks kept before the first loud tick of the pre-roll (0.5 s lead-in).
 const LEAD_IN_TICKS: usize = 5;
+/// Loud pre-roll ticks needed to transcribe a segment that never armed the
+/// detector when the session stops (0.3 s): a short last utterance ("Ja.",
+/// a control word) is shorter than min_speech and would otherwise be lost.
+const MIN_LOUD_TICKS_ON_FINISH: usize = 3;
 /// Upper bound on transcript characters per second of loud audio. Normal German
 /// dictation is ~13-15 chars/s of wall time; loud ticks cover only part of
 /// real speech (gaps between words fall below threshold), hence the headroom.
@@ -217,6 +221,18 @@ impl StreamingState {
         }
     }
 
+    /// Feed the pre-roll from LEAD_IN_TICKS before its first loud tick, and clear it.
+    fn feed_preroll(&mut self, outputs: &mut Vec<ChunkOutput>) -> Result<()> {
+        let first_loud = self.preroll.iter().position(|(_, l)| *l)
+            .unwrap_or(self.preroll.len());
+        let start = first_loud.saturating_sub(LEAD_IN_TICKS);
+        let preroll: Vec<_> = self.preroll.drain(..).skip(start).collect();
+        for (t, l) in preroll {
+            self.feed_tick(&t, l, outputs)?;
+        }
+        Ok(())
+    }
+
     /// Process a block of 16kHz mono PCM samples. Returns ChunkOutput events.
     pub fn process_chunk(&mut self, pcm: &[f32], settings: &SharedSettings) -> Result<Vec<ChunkOutput>> {
         use std::sync::atomic::Ordering;
@@ -237,15 +253,8 @@ impl StreamingState {
                 // old session gets its trailing audio before finishing).
                 self.feed_tick(&tick, loud, &mut outputs)?;
             } else if self.silence.has_speech() {
-                // Just armed: feed the pre-roll from LEAD_IN_TICKS before its
-                // first loud tick, then this tick.
-                let first_loud = self.preroll.iter().position(|(_, l)| *l)
-                    .unwrap_or(self.preroll.len());
-                let start = first_loud.saturating_sub(LEAD_IN_TICKS);
-                let preroll: Vec<_> = self.preroll.drain(..).skip(start).collect();
-                for (t, l) in preroll {
-                    self.feed_tick(&t, l, &mut outputs)?;
-                }
+                // Just armed: feed the pre-roll, then this tick.
+                self.feed_preroll(&mut outputs)?;
                 self.feed_tick(&tick, loud, &mut outputs)?;
             } else {
                 // Not armed: hold back from the engine (guard A).
@@ -292,9 +301,19 @@ impl StreamingState {
     ///
     /// Skips finish_streaming() when no speech was detected in the current segment to
     /// avoid hallucinations from the model running on just the system prompt / context.
+    /// A segment too short to arm the detector is still transcribed from the pre-roll
+    /// when it holds at least MIN_LOUD_TICKS_ON_FINISH loud ticks (guard B applies).
     /// An empty return also means any partial the client still shows is stale.
     pub fn finish(&mut self) -> Result<String> {
-        if self.silence.has_speech() {
+        if !self.silence.has_speech()
+            && self.preroll.iter().filter(|(_, l)| *l).count() >= MIN_LOUD_TICKS_ON_FINISH
+        {
+            // Partials produced here are moot — the final follows immediately.
+            let mut discarded = Vec::new();
+            self.feed_preroll(&mut discarded)?;
+            let text = self.finish_segment()?;
+            self.text_buf.push_str(&text);
+        } else if self.silence.has_speech() {
             // Sub-tick remainder (<100 ms) belongs to the armed segment too.
             let rest = std::mem::take(&mut self.sample_buf_for_silence);
             if !rest.is_empty() {
