@@ -164,19 +164,27 @@ class RMSNorm(nn.Module):
 
 
 class LoRALinear(nn.Module):
-    """Linear layer with LoRA delta. base_weight is frozen; lora_a/lora_b are trained."""
+    """Linear layer with LoRA delta. base_weight is frozen; lora_a/lora_b are trained.
+
+    The frozen base runs in the model dtype (bf16 on CUDA), while lora_a/lora_b are
+    kept in fp32 so AdamW updates do not lose precision. The LoRA branch therefore
+    computes in fp32 and its delta is cast back to the base output dtype before adding
+    (same pattern as train_lora_qwen.py).
+    """
     def __init__(self, weight: torch.Tensor, rank: int, alpha: float):
         super().__init__()
         out_f, in_f = weight.shape
         self.base   = nn.Parameter(weight, requires_grad=False)
-        self.lora_a = nn.Parameter(torch.zeros(rank, in_f))
-        self.lora_b = nn.Parameter(torch.zeros(out_f, rank))
+        self.lora_a = nn.Parameter(torch.zeros(rank, in_f, dtype=torch.float32))
+        self.lora_b = nn.Parameter(torch.zeros(out_f, rank, dtype=torch.float32))
         self.scale  = alpha / rank
         # Kaiming uniform init for lora_a (standard PEFT init)
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.base) + F.linear(F.linear(x, self.lora_a), self.lora_b) * self.scale
+        base  = F.linear(x, self.base)
+        delta = F.linear(F.linear(x.to(self.lora_a.dtype), self.lora_a), self.lora_b) * self.scale
+        return base + delta.to(base.dtype)
 
 
 class Attention(nn.Module):
