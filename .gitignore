@@ -6,6 +6,7 @@
 !/.gitignore
 !/.gitattributes
 !/CLAUDE.md
+!/CLAUDE-reference.md
 !/README.md
 !/TASKS.md
 !/Cargo.toml
