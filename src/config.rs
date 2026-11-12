@@ -247,7 +247,7 @@ const CONFIG_TEMPLATE: &str = r#"# voicetserver configuration
 # delay = 6
 # silence_threshold = 0.006
 # silence_flush = 20
-# min_speech = 15
+# min_speech = 4
 # rms_ema = 0.3
 
 # Fuzzy phonetic hotword correction (snaps transcribed words onto plain terms
@@ -300,16 +300,41 @@ pub fn load_config_file() -> Result<ConfigFile> {
 }
 
 /// Serialize and write the config file to disk.
+///
+/// Atomic: the TOML goes to a temp file in the same directory, which is
+/// fsynced and then renamed over `config.toml`. A crash or power loss mid-save
+/// therefore leaves either the old or the new file, never an empty or partial
+/// one (an empty file would regenerate the API key on the next start).
 pub fn save_config_file(cfg: &ConfigFile) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = config_file_path();
     let toml_str = toml::to_string_pretty(cfg)
         .map_err(|e| anyhow::anyhow!("config serialize error: {}", e))?;
-    std::fs::write(&path, toml_str)
-        .map_err(|e| anyhow::anyhow!("config write error ({}): {}", path.display(), e))?;
-    // 0600 — the config file holds the API key.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| anyhow::anyhow!("config chmod error ({}): {}", path.display(), e))
+    let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    let write_tmp = || -> std::io::Result<()> {
+        // 0600 — the config file holds the API key.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).mode(0o600)
+            .open(&tmp_path)?;
+        // mode() only applies on creation — a leftover temp file keeps its own.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(toml_str.as_bytes())?;
+        f.sync_all()
+    };
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow::bail!("config write error ({}): {}", tmp_path.display(), e);
+    }
+    std::fs::rename(&tmp_path, &path)
+        .map_err(|e| anyhow::anyhow!("config rename error ({}): {}", path.display(), e))?;
+    // Persist the rename itself (best effort — the data is already safe).
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) { let _ = d.sync_all(); }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +418,7 @@ pub fn merge(cli: &crate::Cli, file: &ConfigFile) -> MergedConfig {
     let (delay, _)             = merge_val(&cli.delay,             &file.delay,             6usize);
     let (silence_threshold, _) = merge_val(&cli.silence_threshold, &file.silence_threshold, 0.006f32);
     let (silence_flush, _)     = merge_val(&cli.silence_flush,     &file.silence_flush,     20usize);
-    let (min_speech, _)        = merge_val(&cli.min_speech,        &file.min_speech,        15usize);
+    let (min_speech, _)        = merge_val(&cli.min_speech,        &file.min_speech,        4usize);
     let (rms_ema, _)           = merge_val(&cli.rms_ema,           &file.rms_ema,           0.3f32);
     // Fuzzy phonetic correction: config-file + runtime only (no CLI flag).
     let fuzzy_hotwords  = file.fuzzy_hotwords.unwrap_or(true);

@@ -3,8 +3,10 @@
 
 Unified-server migration (phase 5): voicetserver's pairs pool is canonical and
 trains both models' LoRAs. This appends another server's collected pairs
-(training/audio/*.wav + training/pairs.jsonl) into it, re-IDing each entry via
-the normal max(id)+1 append path so IDs never collide.
+(training/audio/*.wav + training/pairs.jsonl) into it, re-IDing each entry
+after max(highest id in pairs.jsonl, high-water counter training/pairs.last_id)
+— the server's own ID rule — and advancing that counter, so IDs never collide
+or get reused.
 
 Run it on the box holding both data dirs, with voicetserver STOPPED (the
 server's pair_write_lock is in-process only — a concurrent upload could
@@ -41,14 +43,19 @@ def load_pairs(jsonl_path: Path) -> list[dict]:
     return pairs
 
 
-def next_id(pairs: list[dict]) -> int:
-    """One past the highest numeric id (server semantics — never reuse after delete)."""
+def next_id(pairs: list[dict], counter_path: Path) -> int:
+    """Server semantics (allocate_id): one past max(highest numeric id, stored
+    high-water counter) — an ID is never reused, even after a delete."""
     max_id = 0
     for p in pairs:
         try:
             max_id = max(max_id, int(p.get("id", "")))
         except ValueError:
             pass
+    try:
+        max_id = max(max_id, int(counter_path.read_text().strip()))
+    except (FileNotFoundError, ValueError):
+        pass
     return max_id + 1
 
 
@@ -65,6 +72,7 @@ def main() -> None:
     dest_dir = Path(args.dest).expanduser()
     src_jsonl,  src_audio  = src_dir / "training/pairs.jsonl",  src_dir / "training/audio"
     dest_jsonl, dest_audio = dest_dir / "training/pairs.jsonl", dest_dir / "training/audio"
+    dest_counter = dest_dir / "training/pairs.last_id"   # server's ID high-water mark
 
     src_pairs = load_pairs(src_jsonl)
     if not src_pairs:
@@ -77,7 +85,7 @@ def main() -> None:
         sys.exit(f"PID file {pid_file} exists — stop voicetserver (voicetserver --stop) before importing.")
 
     dest_pairs = load_pairs(dest_jsonl)
-    new_id = next_id(dest_pairs)
+    new_id = next_id(dest_pairs, dest_counter)
     dest_texts = {p.get("text", "").strip() for p in dest_pairs}
 
     imported = skipped_dup = skipped_missing = 0
@@ -118,6 +126,8 @@ def main() -> None:
     with dest_jsonl.open("a") as f:
         for line in lines:
             f.write(line + "\n")
+    # Advance the server's high-water counter past the imported IDs.
+    dest_counter.write_text(f"{new_id - 1}\n")
     print("Done.")
 
 

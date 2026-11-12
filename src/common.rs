@@ -38,6 +38,12 @@ impl RmsNorm {
 
 // ---- Rotary Position Embedding ----
 
+/// Positions in the encoder/decoder RoPE tables. A streaming session advances
+/// the encoder 4 positions and the decoder 1 per 80 ms tick, so the encoder
+/// table runs out after ~44 min of continuous session audio — the Voxtral
+/// session handler rebuilds its state before that (see `streaming::ROPE_SOFT_LIMIT`).
+pub const ROPE_MAX_POSITIONS: usize = 131072;
+
 pub struct RotaryEmbedding {
     cos: Tensor,
     sin: Tensor,

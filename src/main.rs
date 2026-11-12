@@ -75,7 +75,8 @@ pub struct Cli {
     #[arg(long)]
     pub silence_flush: Option<usize>,
 
-    /// Minimum speech chunks before silence detection activates (each chunk = 80ms) [default: 15]
+    /// Minimum speech chunks (cumulative, not consecutive) before silence detection
+    /// activates (each chunk = 80ms) [default: 4]
     #[arg(long)]
     pub min_speech: Option<usize>,
 
@@ -332,6 +333,10 @@ fn run() -> Result<()> {
             }
             // Child: redirect stdin to /dev/null (server doesn't need it)
             redirect_stdin_to_null();
+            // The watchdog accepts 'd' right away, but the tokio SIGUSR1 handler
+            // only exists once server::run starts (after model loading) — and
+            // SIGUSR1's default action kills the process. Handle it from here on.
+            install_early_detach_handler(log_path.as_ref().unwrap());
             watchdog_active = true;
         }
         // Write PID file immediately after fork so --stop works during model loading
@@ -881,6 +886,38 @@ pub fn redirect_output_to_log(log_path: &std::path::Path) {
     nix::unistd::close(log_fd).ok();
 }
 
+/// Log fd pre-opened for the early SIGUSR1 handler (-1 = none).
+static EARLY_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// SIGUSR1 handler active from the fork until (and alongside) the tokio handler
+/// in server::run: dup2 the pre-opened log fd onto stdout/stderr. Only
+/// async-signal-safe calls (an atomic load and dup2).
+extern "C" fn early_detach_handler(_sig: nix::libc::c_int) {
+    let fd = EARLY_LOG_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe {
+            nix::libc::dup2(fd, 1);
+            nix::libc::dup2(fd, 2);
+        }
+    }
+}
+
+/// Install `early_detach_handler` in the watchdog child, before model loading,
+/// so a 'd' press during "Loading encoder…" detaches instead of terminating the
+/// server. The log fd stays open for the process lifetime (the handler cannot
+/// open files safely); the later tokio handler re-opens by path as before.
+fn install_early_detach_handler(log_path: &std::path::Path) {
+    use std::os::unix::io::IntoRawFd;
+    match std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        Ok(f) => EARLY_LOG_FD.store(f.into_raw_fd(), std::sync::atomic::Ordering::SeqCst),
+        Err(e) => eprintln!("Warning: cannot open log file for early detach ({}): {}",
+            log_path.display(), e),
+    }
+    // Installed even without a log fd: then it only prevents the default
+    // terminate action, and output stays on the terminal.
+    unsafe { signal(Signal::SIGUSR1, SigHandler::Handler(early_detach_handler)) }.ok();
+}
+
 /// Redirect stdin to /dev/null (server does not use stdin).
 fn redirect_stdin_to_null() {
     use std::os::unix::io::IntoRawFd;
@@ -1094,6 +1131,8 @@ mod server {
         ));
 
         // SIGUSR1: redirect stdout/stderr to log file (triggered by watchdog parent on 'd' press).
+        // A 'd' during model loading was already handled by early_detach_handler;
+        // this handler covers presses from here on.
         if watchdog_active {
             if let Ok(mut stream) = tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::user_defined1()
@@ -1181,6 +1220,8 @@ mod server {
             qwen_active_slot,
             api_key,
             pair_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            voxtral_session: Arc::new(tokio::sync::Mutex::new(())),
+            qwen_switch_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
 
         let cors = CorsLayer::new()
@@ -1346,6 +1387,13 @@ mod server {
         /// requests cannot collide on the same ID or rewrite pairs.jsonl mid-append)
         /// and sentence add/edit/delete (read-modify-write on training_sentences.txt).
         pair_write_lock:   Arc<tokio::sync::Mutex<()>>,
+        /// Held for the lifetime of a Voxtral WS session — only one at a time,
+        /// since the KV caches live in the shared ModelInner (see handle_asr_session).
+        voxtral_session:   Arc<tokio::sync::Mutex<()>>,
+        /// Serialises POST /qwen/switch calls (held for the whole switch) and is
+        /// taken by POST /training/run while it claims the Running status, so a
+        /// switch and a training unload/reload can never overlap.
+        qwen_switch_lock:  Arc<tokio::sync::Mutex<()>>,
     }
 
     // ---- /health ----
@@ -1467,63 +1515,156 @@ mod server {
         text.replace('ß', "ss")
     }
 
+    /// Error text for an ASR session while the engine is unloaded (LoRA training,
+    /// reload, qwen slot switch).
+    const ENGINE_UNLOADED_MSG: &str =
+        "Server is training a new voice model — please try again in a few minutes";
+
+    /// Build a fresh Voxtral `StreamingState` (startup prefill, resets the shared
+    /// KV caches). Called with the model lock held — no await inside.
+    fn new_voxtral_state(
+        model: &VoxtralModel,
+        inner: &mut ModelInner,
+        settings: &SharedSettings,
+    ) -> Result<crate::streaming::StreamingState> {
+        // Experimental german_prime flag: prime the prefill with German text
+        // tokens to bias the language prior. Read per-session so PATCH /config
+        // A/B toggling applies on the next connection.
+        let prime: &[u32] = if settings.german_prime.load(Ordering::Relaxed) {
+            &model.prime_ids
+        } else {
+            &[]
+        };
+        crate::streaming::StreamingState::new_sync(
+            &mut inner.enc,
+            &model.adapter,
+            &mut inner.dec,
+            prime,
+            &model.filters,
+            &model.device,
+            model.dtype,
+            settings,
+        )
+    }
+
+    /// How long a dictation socket may stay completely silent (no frame of any
+    /// kind) before the server treats the peer as gone. While recording, the
+    /// userscript sends a PCM frame every ~256 ms (4096-sample ScriptProcessor
+    /// callbacks, silence included) and the Diktate re-transcribe sends its
+    /// whole backlog up front, so 30 s of nothing only happens when the
+    /// connection died without a FIN/RST (Wi-Fi roam, laptop sleep, Tailscale
+    /// path change). Without it, `socket.recv()` waits forever and a Voxtral
+    /// session keeps the single-session lock until the server restarts.
+    const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// `socket.recv()` with `WS_IDLE_TIMEOUT`. A timeout is reported as `None`
+    /// (connection closed), so callers take their normal disconnect path.
+    async fn recv_with_idle_timeout(
+        socket: &mut WebSocket,
+    ) -> Option<std::result::Result<Message, axum::Error>> {
+        match tokio::time::timeout(WS_IDLE_TIMEOUT, socket.recv()).await {
+            Ok(msg) => msg,
+            Err(_) => {
+                eprintln!("WebSocket idle for {}s — treating peer as disconnected",
+                    WS_IDLE_TIMEOUT.as_secs());
+                None
+            }
+        }
+    }
+
     async fn handle_asr_session(socket: &mut WebSocket, state: &AppState) -> Result<()> {
         use crate::audio;
-        use crate::streaming::{ChunkOutput, StreamingState};
+        use crate::streaming::{ChunkOutput, ROPE_HARD_LIMIT, ROPE_SOFT_LIMIT};
 
         let model = &state.model;
         let settings = &state.settings;
 
+        // One Voxtral session at a time: the KV caches live in the shared
+        // ModelInner (encoder attention + decoder caches) and every session's
+        // prefill resets them, so two interleaved sessions corrupt each other.
+        // The guard is held for the whole session and released on every exit path.
+        let _session_guard = state.voxtral_session.try_lock().map_err(|_| anyhow::anyhow!(
+            "Voxtral wird bereits von einer anderen Sitzung verwendet — bitte warten"))?;
+
         // Startup prefill: acquire model lock, run synchronously, release before any await.
         let mut stream_state = {
             let mut guard = model.inner.lock().await;
-            let inner = guard.as_mut().ok_or_else(|| // None while model is unloaded for LoRA training
-                anyhow::anyhow!("Server is training a new voice model — please try again in a few minutes"))?;
-            // Experimental german_prime flag: prime the prefill with German text
-            // tokens to bias the language prior. Read per-session so PATCH /config
-            // A/B toggling applies on the next connection.
-            let prime: &[u32] = if settings.german_prime.load(Ordering::Relaxed) {
-                &model.prime_ids
-            } else {
-                &[]
-            };
-            StreamingState::new_sync(
-                &mut inner.enc,
-                &model.adapter,
-                &mut inner.dec,
-                prime,
-                &model.filters,
-                &model.device,
-                model.dtype,
-                settings,
-            )?
+            // None while model is unloaded for LoRA training
+            let inner = guard.as_mut().ok_or_else(|| anyhow::anyhow!(ENGINE_UNLOADED_MSG))?;
+            new_voxtral_state(model, inner, settings)?
             // guard dropped here — lock released before any network I/O
         };
 
         // `true` → flush remaining text as a final before returning;
         // `false` → transport error, nothing more to send.
+        // An idle timeout (see WS_IDLE_TIMEOUT) counts as a disconnect, so a peer
+        // that vanished without FIN/RST cannot hold `_session_guard` forever.
         let flush = loop {
-            match socket.recv().await {
+            match recv_with_idle_timeout(socket).await {
                 Some(Ok(Message::Binary(data))) => {
                     // Decode raw f32 LE PCM (Phase 1; Opus planned for Phase 3)
                     let pcm = audio::decode_pcm_f32(&data);
                     if pcm.is_empty() { continue; }
 
-                    // Process: acquire GPU lock, do all sync work, release before send
+                    // Process: acquire GPU lock, do all sync work, release before send.
+                    // None = engine unloaded mid-session (training started).
+                    let mut rebuild_err: Option<anyhow::Error> = None;
                     let outputs = {
                         let mut guard = model.inner.lock().await;
-                        let inner = guard.as_mut().ok_or_else(|| // None while model is unloaded for LoRA training
-                            anyhow::anyhow!("Server is training a new voice model — please try again in a few minutes"))?;
-                        stream_state.process_chunk_sync(
-                            &pcm,
-                            &mut inner.enc,
-                            &model.adapter,
-                            &mut inner.dec,
-                            &model.tok,
-                            &model.device,
-                            settings,
-                        )?
+                        match guard.as_mut() {
+                            None => None,
+                            Some(inner) => {
+                                let mut outputs = stream_state.process_chunk_sync(
+                                    &pcm,
+                                    &mut inner.enc,
+                                    &model.adapter,
+                                    &mut inner.dec,
+                                    &model.tok,
+                                    &model.device,
+                                    settings,
+                                )?;
+                                // RoPE tables end after ~44 min of session audio.
+                                // Rebuild the state via the normal prefill path at
+                                // the next silence final once past the soft limit,
+                                // or right away past the hard limit. The decoder
+                                // lag is drained first and everything decoded so
+                                // far goes out as one more final, so no text is lost.
+                                let pos = crate::streaming::rope_position(&inner.enc, &inner.dec);
+                                let at_final = outputs.iter().any(|o| matches!(o, ChunkOutput::Silence(_)));
+                                if pos >= ROPE_HARD_LIMIT || (pos >= ROPE_SOFT_LIMIT && at_final) {
+                                    eprintln!("Voxtral session at RoPE position {pos} — rebuilding stream state");
+                                    if let Err(e) = stream_state.drain_sync(
+                                        &mut inner.enc, &model.adapter, &mut inner.dec,
+                                        &model.tok, &model.device,
+                                    ) {
+                                        eprintln!("RoPE rebuild drain error: {}", e);
+                                    }
+                                    let raw = stream_state.take_text_buf();
+                                    if !raw.is_empty() {
+                                        outputs.push(ChunkOutput::Silence(raw));
+                                    }
+                                    // On failure the finals collected above still go
+                                    // out before the error ends the session.
+                                    match new_voxtral_state(model, inner, settings) {
+                                        Ok(s)  => stream_state = s,
+                                        Err(e) => rebuild_err = Some(e),
+                                    }
+                                }
+                                Some(outputs)
+                            }
+                        }
                         // guard dropped here
+                    };
+                    let Some(outputs) = outputs else {
+                        // Engine unloaded mid-session: hand out what was decoded so
+                        // far as a final before the error frame, or it is lost.
+                        let raw = stream_state.take_text_buf();
+                        if !raw.is_empty() {
+                            let final_text = finalize_text(state, &raw).await;
+                            let msg = json!({ "type": "final", "text": final_text }).to_string();
+                            let _ = socket.send(Message::Text(msg.into())).await;
+                        }
+                        anyhow::bail!(ENGINE_UNLOADED_MSG);
                     };
 
                     // Send results — no lock held
@@ -1541,6 +1682,9 @@ mod server {
                         if socket.send(Message::Text(msg.into())).await.is_err() {
                             return Ok(());
                         }
+                    }
+                    if let Some(e) = rebuild_err {
+                        return Err(e);
                     }
                 }
                 // Graceful stop (same protocol as schmidiscribe, shared frontend):
@@ -1583,7 +1727,11 @@ mod server {
             if !raw.is_empty() {
                 let corrected = finalize_text(state, &raw).await;
                 let msg = json!({ "type": "final", "text": corrected }).to_string();
-                let _ = socket.send(Message::Text(msg.into())).await;
+                // Bounded: after an idle timeout the peer is likely gone, and a
+                // send into a full, never-acked TCP buffer must not keep the
+                // session (and its lock) alive.
+                let _ = tokio::time::timeout(WS_IDLE_TIMEOUT,
+                    socket.send(Message::Text(msg.into()))).await;
             }
         }
 
@@ -1628,7 +1776,9 @@ mod server {
         let mut stream_state = StreamingState::new(engine, Some(language), context);
 
         loop {
-            match socket.recv().await {
+            // Idle timeout = disconnect (see WS_IDLE_TIMEOUT): ends the task and
+            // drops its engine handle when the peer vanished silently.
+            match recv_with_idle_timeout(socket).await {
                 Some(Ok(Message::Binary(data))) => {
                     let pcm = audio::decode_pcm_f32(&data);
                     if pcm.is_empty() { continue; }
@@ -1682,7 +1832,9 @@ mod server {
                     if !raw.is_empty() {
                         let final_text = finalize_text(state, &raw).await;
                         let msg = json!({ "type": "final", "text": final_text }).to_string();
-                        let _ = socket.send(Message::Text(msg.into())).await;
+                        // Bounded — the peer may be gone (idle timeout).
+                        let _ = tokio::time::timeout(WS_IDLE_TIMEOUT,
+                            socket.send(Message::Text(msg.into()))).await;
                     }
                     break;
                 }
@@ -1986,12 +2138,14 @@ mod server {
 
     // ---- Training data collection ----
 
-    // Stub written to disk on first request — points user to the sample file in the repo
+    // Stub written to disk on first request — points user to the sample file in the repo.
+    // Ends with a newline so the first appended sentence starts on its own line
+    // instead of being glued onto (and filtered out with) the last comment line.
     const DEFAULT_TRAINING_SENTENCES: &str = "\
 # SCHMIDIspeech — Kalibrierungssätze
 # Dies ist eine Stub-Datei. Beispielsätze findest du in:
 # assets/training_sentences.txt im GitHub-Repository
-# Füge eigene Sätze hier ein (einen pro Zeile, # für Kommentare).\
+# Füge eigene Sätze hier ein (einen pro Zeile, # für Kommentare).
 ";
 
     /// GET /training/sentences — returns calibration sentences annotated with recording status
@@ -2156,6 +2310,12 @@ mod server {
         if !path.exists() {
             let _ = tokio::fs::write(&path, DEFAULT_TRAINING_SENTENCES).await;
         }
+        // A file lacking a final newline (old stub, hand edit) would glue the
+        // new sentence onto its last line — start a fresh line first.
+        let needs_newline = match tokio::fs::read(&path).await {
+            Ok(bytes) => !bytes.is_empty() && !bytes.ends_with(b"\n"),
+            Err(_) => false,
+        };
         use tokio::io::AsyncWriteExt;
         let mut f = match tokio::fs::OpenOptions::new()
             .create(true).append(true).open(&path).await
@@ -2163,7 +2323,8 @@ mod server {
             Ok(f) => f,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
-        if let Err(e) = f.write_all(format!("{text}\n").as_bytes()).await {
+        let line = if needs_newline { format!("\n{text}\n") } else { format!("{text}\n") };
+        if let Err(e) = f.write_all(line.as_bytes()).await {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         Json(json!({ "added": true })).into_response()
@@ -2267,8 +2428,8 @@ mod server {
     }
 
     /// Save a PCM+text pair: WAV to `audio_dir/{id}.wav`, JSONL line appended to
-    /// `jsonl_path`. The ID is one past the highest existing ID (never reused after
-    /// a delete). Caller must hold `pair_write_lock`.
+    /// `jsonl_path`. The ID comes from `allocate_id` (never reused, even after the
+    /// newest entry was deleted). Caller must hold `pair_write_lock`.
     /// Returns `(id, duration_s, count_after)`.
     async fn save_pcm_pair(
         audio_dir: &std::path::Path,
@@ -2278,7 +2439,7 @@ mod server {
         events: Option<&str>,
     ) -> anyhow::Result<(String, f32, usize)> {
         tokio::fs::create_dir_all(audio_dir).await?;
-        let (count, next_id) = pairs_stats(jsonl_path).await;
+        let (count, next_id) = allocate_id(jsonl_path).await?;
         let id = format!("{:04}", next_id);
         let duration_s = pcm.len() as f32 / 16000.0;
         save_training_wav(&audio_dir.join(format!("{id}.wav")), pcm)?;
@@ -2337,8 +2498,9 @@ mod server {
     async fn training_delete_handler(State(state): State<Arc<AppState>>) -> Response {
         // Same lock as every other training-file mutation: without it a
         // concurrent POST /training/pair can write a WAV between the directory
-        // removal and its JSONL append, orphaning it under an ID that the next
-        // upload (numbering restarted at 1) would later overwrite.
+        // removal and its JSONL append, orphaning it once the JSONL is gone.
+        // The ID counter file (`pairs.last_id`) is deliberately kept, so numbering
+        // continues instead of restarting at 1.
         let _guard = state.pair_write_lock.lock().await;
 
         let audio_dir = &state.paths.training_audio_dir;
@@ -2421,7 +2583,13 @@ mod server {
 
         // Atomically check-and-set the running flag under a single lock so two
         // concurrent requests cannot both pass the check and double-spawn.
+        // Running covers the whole unload → train → reload window. The qwen
+        // switch lock is held while claiming it: a switch in progress makes
+        // this 409, and a switch that queues behind us sees Running and 409s.
         {
+            let Ok(_switch_guard) = state.qwen_switch_lock.try_lock() else {
+                return (StatusCode::CONFLICT, "Qwen model switch in progress").into_response();
+            };
             let mut ts = state.training_status.lock().await;
             if ts.status == TrainingStatusKind::Running {
                 return (StatusCode::CONFLICT, "Training already running").into_response();
@@ -2464,10 +2632,13 @@ mod server {
         let qwen_lora_path  = Arc::clone(&state.qwen_lora_path);
         let settings        = Arc::clone(&state.settings);
         tokio::spawn(async move {
-            run_training_subprocess(training_status, script, data_dir, model_dir, output_dir, venv_path).await;
+            let (outcome, outcome_msg) = run_training_subprocess(
+                Arc::clone(&training_status), script, data_dir, model_dir, output_dir, venv_path).await;
+            training_status.lock().await.log.push(format!("{outcome_msg} Reloading models…"));
 
             // Reload both engines regardless of training outcome, re-applying each
-            // model's active LoRA.
+            // model's active LoRA. Status stays Running until this is done, so a
+            // second training run (or a qwen switch) cannot start mid-reload.
             let lora = lora_path.read().await.clone();
             let m = Arc::clone(&model);
             let reloaded = tokio::task::spawn_blocking(move || {
@@ -2500,6 +2671,9 @@ mod server {
             if voxtral_ready {
                 settings.state.store(crate::settings::STATE_READY, Ordering::SeqCst);
             }
+            let mut ts = training_status.lock().await;
+            ts.log.push(if voxtral_ready { "Models reloaded." } else { "Model reload failed — see server log." }.to_string());
+            ts.status = outcome;
         });
 
         (StatusCode::ACCEPTED, "Training started").into_response()
@@ -2531,7 +2705,9 @@ mod server {
     /// checkpoint, re-applies that slot's own configured LoRA if any, and
     /// persists `qwen_active_slot` to config.toml so a restart resumes here.
     /// While switching (a few seconds), new `?model=qwen` sessions get the same
-    /// "engine not loaded" error already used during training unload.
+    /// "engine not loaded" error already used during training unload. 409 while
+    /// a training run (incl. its engine reload) is in progress; concurrent
+    /// switches are serialised behind `qwen_switch_lock`.
     async fn qwen_switch_handler(
         State(state): State<Arc<AppState>>,
         Query(q): Query<SwitchQuery>,
@@ -2548,8 +2724,23 @@ mod server {
                 Json(json!({"error": "Qwen engine not enabled — set qwen_model_dir in config.toml"}))).into_response();
         };
 
+        // One switch at a time, held to the end (load + slot/config persist),
+        // so two switches can neither load in parallel nor persist out of order.
+        let _switch_guard = state.qwen_switch_lock.lock().await;
+        // Training unloads both engines and reloads them afterwards (status
+        // stays Running until then); loading a checkpoint in between would
+        // collide with the trainer's VRAM and be overwritten by the reload.
+        if state.training_status.lock().await.status == TrainingStatusKind::Running {
+            return (StatusCode::CONFLICT, Json(json!({
+                "error": "Training in progress — switch the Qwen model after it has finished"
+            }))).into_response();
+        }
+
         let current = *state.qwen_active_slot.read().await;
-        if current == target {
+        // Already on the target slot *and* loaded → nothing to do. A failed
+        // switch leaves the slot unchanged but the engine unloaded, so switching
+        // "back" must fall through to the load path instead of answering ok.
+        if current == target && qwen.get().await.is_some() {
             let cfg = qwen_slot_config(&state, target);
             return Json(json!({
                 "status": "ok",
@@ -3070,15 +3261,21 @@ mod server {
             return (StatusCode::BAD_REQUEST, "Invalid id").into_response();
         }
         let wav_path = state.paths.review_dir.join(format!("{id}.wav"));
-        if !wav_path.exists() {
+        let _guard = state.pair_write_lock.lock().await;
+
+        // Same rule as training_pair_delete_handler: a missing WAV must not
+        // leave an undeletable JSONL entry behind; 404 only if neither existed.
+        let had_wav = wav_path.exists();
+        if had_wav {
+            if let Err(e) = tokio::fs::remove_file(&wav_path).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to remove WAV: {e}")).into_response();
+            }
+        }
+        let had_entry = remove_jsonl_entry(&state.paths.review_jsonl, &id).await;
+        if !had_wav && !had_entry {
             return StatusCode::NOT_FOUND.into_response();
         }
-        let _guard = state.pair_write_lock.lock().await;
-        if let Err(e) = tokio::fs::remove_file(&wav_path).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to remove WAV: {e}")).into_response();
-        }
-        remove_jsonl_entry(&state.paths.review_jsonl, &id).await;
         Json(json!({ "deleted": id })).into_response()
     }
 
@@ -3129,7 +3326,11 @@ mod server {
             return (StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to create training dir: {e}")).into_response();
         }
-        let (_, next_id) = pairs_stats(&state.paths.training_pairs).await;
+        let next_id = match allocate_id(&state.paths.training_pairs).await {
+            Ok((_, id)) => id,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ID counter error: {e}")).into_response(),
+        };
         let new_id = format!("{:04}", next_id);
         let dst_wav = state.paths.training_audio_dir.join(format!("{new_id}.wav"));
         if let Err(e) = tokio::fs::rename(&src_wav, &dst_wav).await {
@@ -3172,8 +3373,9 @@ mod server {
     // ---- Training helpers ----
 
     /// Scan pairs.jsonl once and return `(count, next_id)` where `count` is the number
-    /// of non-empty lines and `next_id` is one past the highest numeric `id` seen
-    /// (so IDs are never reused after a delete). Falls back to 1 for an empty file.
+    /// of non-empty lines and `next_id` is one past the highest numeric `id` seen.
+    /// Falls back to 1 for an empty file. ID assignment goes through
+    /// `allocate_id`, which also honours the persisted high-water counter.
     async fn pairs_stats(pairs_path: &std::path::Path) -> (usize, usize) {
         let content = tokio::fs::read_to_string(pairs_path).await.unwrap_or_default();
         let mut count = 0usize;
@@ -3187,6 +3389,34 @@ mod server {
             }
         }
         (count, max_id + 1)
+    }
+
+    /// High-water ID counter file of a pool: `pairs.jsonl` → `pairs.last_id`,
+    /// `review.jsonl` → `review.last_id` (both in the training dir). Holds the
+    /// highest ID ever assigned in that pool.
+    fn id_counter_path(jsonl_path: &std::path::Path) -> std::path::PathBuf {
+        jsonl_path.with_extension("last_id")
+    }
+
+    /// Assign the next ID of a pool and persist it as the new high-water mark.
+    /// `max(id)+1` over the JSONL alone reused the ID of a deleted newest entry
+    /// (a stale WAV / client reference could then point at a different
+    /// recording); the counter file remembers it. Starts from
+    /// max(highest JSONL id, stored counter) + 1, so a missing/older counter
+    /// (fresh install, tools/import_pairs.py) is self-healing.
+    /// Returns `(count, id)`. Caller must hold `pair_write_lock`.
+    async fn allocate_id(jsonl_path: &std::path::Path) -> anyhow::Result<(usize, usize)> {
+        let (count, next_from_jsonl) = pairs_stats(jsonl_path).await;
+        let counter = id_counter_path(jsonl_path);
+        let stored = tokio::fs::read_to_string(&counter).await.ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let id = next_from_jsonl.max(stored + 1);
+        if let Some(dir) = counter.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        tokio::fs::write(&counter, format!("{id}\n")).await?;
+        Ok((count, id))
     }
 
     fn save_training_wav(path: &std::path::Path, pcm: &[f32]) -> anyhow::Result<()> {
@@ -3252,6 +3482,10 @@ mod server {
         "python3".to_string()  // fall back to system python3
     }
 
+    /// Run the trainer script, streaming its output into the status log.
+    /// Returns the outcome (Done/Error) plus a closing log line instead of
+    /// setting the status itself: the caller keeps it Running until the engines
+    /// are reloaded.
     async fn run_training_subprocess(
         training_status: Arc<tokio::sync::Mutex<TrainingStatus>>,
         script: std::path::PathBuf,
@@ -3259,7 +3493,7 @@ mod server {
         model_dir: String,
         output_dir: std::path::PathBuf,
         venv_path: Option<String>,
-    ) {
+    ) -> (TrainingStatusKind, String) {
         use tokio::io::AsyncBufReadExt;
 
         let append_log = |ts: &mut TrainingStatus, line: String| {
@@ -3281,10 +3515,7 @@ mod server {
         {
             Ok(c) => c,
             Err(e) => {
-                let mut ts = training_status.lock().await;
-                ts.status = TrainingStatusKind::Error;
-                ts.log.push(format!("Failed to spawn {python}: {e}"));
-                return;
+                return (TrainingStatusKind::Error, format!("Failed to spawn {python}: {e}."));
             }
         };
 
@@ -3323,21 +3554,10 @@ mod server {
             if stdout_lines.is_none() && stderr_lines.is_none() { break; }
         }
 
-        let exit_status = child.wait().await;
-        let mut ts = training_status.lock().await;
-        match exit_status {
-            Ok(s) if s.success() => {
-                ts.status = TrainingStatusKind::Done;
-                ts.log.push("Training complete.".to_string());
-            }
-            Ok(s) => {
-                ts.status = TrainingStatusKind::Error;
-                ts.log.push(format!("Training exited with status: {s}"));
-            }
-            Err(e) => {
-                ts.status = TrainingStatusKind::Error;
-                ts.log.push(format!("Wait error: {e}"));
-            }
+        match child.wait().await {
+            Ok(s) if s.success() => (TrainingStatusKind::Done, "Training complete.".to_string()),
+            Ok(s) => (TrainingStatusKind::Error, format!("Training exited with status: {s}.")),
+            Err(e) => (TrainingStatusKind::Error, format!("Wait error: {e}.")),
         }
     }
 }

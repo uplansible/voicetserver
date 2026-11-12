@@ -326,7 +326,7 @@ impl TextDecoder {
 
 
         println!("  Creating decoder RoPE...");
-        let rope = RotaryEmbedding::new(131072, HEAD_DIM, ROPE_THETA, device, dtype)?;
+        let rope = RotaryEmbedding::new(crate::common::ROPE_MAX_POSITIONS, HEAD_DIM, ROPE_THETA, device, dtype)?;
 
         let caches: Vec<KvCache> = (0..NUM_LAYERS).map(|_| KvCache::new()).collect();
 
@@ -338,6 +338,11 @@ impl TextDecoder {
         for cache in &mut self.caches {
             cache.reset();
         }
+    }
+
+    /// Next RoPE position the decoder will use (absolute, survives cache trims).
+    pub fn position(&self) -> usize {
+        self.caches.first().map_or(0, |c| c.base_offset() + c.current_len())
     }
 
     /// Trim all decoder KV caches to the sliding window size.

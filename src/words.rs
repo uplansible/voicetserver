@@ -2,7 +2,8 @@
 //
 // File format (~/.config/voicetserver/custom_words.txt):
 //   # comment line           — ignored
-//   wrong=correct            — replacement pair: replaces every occurrence of "wrong" with "correct"
+//   wrong=correct            — replacement pair: replaces every whole-word occurrence of
+//                              "wrong" with "correct" (never inside a longer word)
 //   PlainTerm                — fuzzy phonetic target: transcribed words that sound like it
 //                              are snapped onto this canonical spelling (see FuzzyMatcher)
 //
@@ -19,7 +20,9 @@ use std::path::Path;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 
 pub struct WordsCorrector {
-    /// Compiled automaton over all replacement patterns. None if no replacement pairs defined.
+    /// Compiled automaton over all replacement patterns (`MatchKind::Standard`,
+    /// so overlapping matches can be enumerated — see `apply`). None if no
+    /// replacement pairs defined.
     automaton:    Option<AhoCorasick>,
     /// Replacement strings — index i corresponds to automaton pattern i.
     replacements: Vec<String>,
@@ -61,7 +64,7 @@ impl WordsCorrector {
             None
         } else {
             AhoCorasickBuilder::new()
-                .match_kind(MatchKind::LeftmostFirst)
+                .match_kind(MatchKind::Standard)
                 .build(&patterns)
                 .ok()
         };
@@ -105,12 +108,92 @@ impl WordsCorrector {
 
     /// Apply all replacement pairs to `text` and return the corrected string.
     /// Returns the input unchanged if no replacement pairs are defined.
+    ///
+    /// A lowercase replacement for a capitalised match at the start of a
+    /// sentence keeps the capital (see `keep_initial_capital`).
+    ///
+    /// Only **whole-word** occurrences are replaced: the character before a
+    /// match and the one after it must not be alphanumeric (Unicode-aware, so
+    /// ä/ö/ü/ß count as letters) — `Arm=Harn` fixes "Arm," but leaves "Warm"
+    /// alone. A plain leftmost-longest scan cannot do this on its own: when the
+    /// longest candidate at a position fails the boundary test, a shorter one at
+    /// the same position (or one starting inside it) may still be valid, and
+    /// the scan would already have skipped past both. So every overlapping
+    /// match is enumerated, boundary-filtered, and the survivors are picked
+    /// leftmost-longest, non-overlapping.
     pub fn apply(&self, text: &str) -> String {
-        match &self.automaton {
-            None     => text.to_string(),
-            Some(ac) => ac.replace_all(text, &self.replacements),
+        let ac = match &self.automaton {
+            None     => return text.to_string(),
+            Some(ac) => ac,
+        };
+        let mut cands: Vec<(usize, usize, usize)> = ac
+            .find_overlapping_iter(text)
+            .filter(|m| is_word_boundary(text, m.start(), m.end()))
+            .map(|m| (m.start(), m.end(), m.pattern().as_usize()))
+            .collect();
+        if cands.is_empty() {
+            return text.to_string();
         }
+        // Leftmost first; at the same start the longest wins; then file order.
+        cands.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+
+        let mut out = String::with_capacity(text.len());
+        let mut pos = 0;
+        for (start, end, pat) in cands {
+            if start < pos {
+                continue; // overlaps an already-applied replacement
+            }
+            out.push_str(&text[pos..start]);
+            let repl = keep_initial_capital(&text[start..end], &self.replacements[pat], &out);
+            out.push_str(&repl);
+            pos = end;
+        }
+        out.push_str(&text[pos..]);
+        out
     }
+}
+
+/// True if `prefix` (the text before a word) ends a sentence or segment:
+/// nothing but whitespace, or `.`/`!`/`?` / a line break before the word.
+fn at_sentence_start(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end();
+    trimmed.is_empty()
+        || trimmed.ends_with(['.', '!', '?'])
+        || prefix[trimmed.len()..].contains('\n')
+}
+
+/// The replacement for `original` (whose preceding text is `prefix`), with
+/// its first letter uppercased when `original` was capitalised at the start
+/// of a sentence/segment and the canonical spelling starts lowercase — a
+/// lowercase term ("zweizeitige") must not decapitalise a sentence. Char-wise,
+/// so umlauts are safe. Spellings whose casing is part of the term are left
+/// alone: mixed case ("pH", "eGFR", "mmHg") and dotted abbreviations ("i.v.").
+fn keep_initial_capital(original: &str, repl: &str, prefix: &str) -> String {
+    let orig_upper = original.chars().next().map_or(false, |c| c.is_uppercase());
+    let fixed_casing = repl.contains('.') || repl.chars().skip(1).any(|c| c.is_uppercase());
+    let mut chars = repl.chars();
+    match chars.next() {
+        Some(first)
+            if first.is_lowercase() && orig_upper && !fixed_casing && at_sentence_start(prefix) =>
+        {
+            first.to_uppercase().chain(chars).collect()
+        }
+        _ => repl.to_string(),
+    }
+}
+
+/// True if `text[start..end]` stands as a whole word: the chars directly
+/// before `start` and after `end` (if any) are not alphanumeric. A side is only
+/// checked when the match's own edge char there is alphanumeric, so a pattern
+/// that starts/ends with punctuation (`-Wert` in "PSA-Wert") still matches.
+fn is_word_boundary(text: &str, start: usize, end: usize) -> bool {
+    let m = &text[start..end];
+    let edge_alnum = |c: Option<char>| c.map_or(false, |c| c.is_alphanumeric());
+    let before_ok = !edge_alnum(m.chars().next())
+        || text[..start].chars().next_back().map_or(true, |c| !c.is_alphanumeric());
+    let after_ok = !edge_alnum(m.chars().next_back())
+        || text[end..].chars().next().map_or(true, |c| !c.is_alphanumeric());
+    before_ok && after_ok
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +318,8 @@ impl FuzzyMatcher {
     /// Snap phonetically-close words in `text` onto their canonical hotword
     /// spelling. `max_ratio` is the maximum normalized Levenshtein distance
     /// (distance / longer-stem-length) accepted as a match. Word separators
-    /// (spaces, punctuation) are preserved verbatim.
+    /// (spaces, punctuation) are preserved verbatim. A sentence-initial capital
+    /// survives a lowercase canonical term (see `keep_initial_capital`).
     pub fn correct(&self, text: &str, max_ratio: f32) -> String {
         if self.targets.is_empty() {
             return text.to_string();
@@ -247,14 +331,16 @@ impl FuzzyMatcher {
                 word.push(c);
             } else {
                 if !word.is_empty() {
-                    out.push_str(&self.snap(&word, max_ratio));
+                    let snapped = keep_initial_capital(&word, &self.snap(&word, max_ratio), &out);
+                    out.push_str(&snapped);
                     word.clear();
                 }
                 out.push(c);
             }
         }
         if !word.is_empty() {
-            out.push_str(&self.snap(&word, max_ratio));
+            let snapped = keep_initial_capital(&word, &self.snap(&word, max_ratio), &out);
+            out.push_str(&snapped);
         }
         out
     }
@@ -843,5 +929,88 @@ mod tests {
         // "u" extends the letter-name run (MRIU matches nothing) — the window
         // must shrink from the right and still find MRI.
         assert_eq!(a.expand("Em Er I u Schall."), "MRI u Schall.");
+    }
+
+    #[test]
+    fn fuzzy_keeps_sentence_initial_capital() {
+        let terms = vec!["zweizeitige".to_string()];
+        let m = FuzzyMatcher::new(&terms);
+        assert_eq!(m.correct("Zweiseitige Resektion.", 0.34), "Zweizeitige Resektion.");
+        assert_eq!(m.correct("Befund ok. Zweiseitige Resektion", 0.34),
+                   "Befund ok. Zweizeitige Resektion");
+        assert_eq!(m.correct("Befund ok\nZweiseitige Resektion", 0.34),
+                   "Befund ok\nZweizeitige Resektion");
+        // Mid-sentence the canonical lowercase spelling wins.
+        assert_eq!(m.correct("eine Zweiseitige Resektion", 0.34), "eine zweizeitige Resektion");
+        assert_eq!(m.correct("zweiseitige Resektion", 0.34), "zweizeitige Resektion");
+    }
+
+    #[test]
+    fn initial_capital_leaves_fixed_casing_terms_alone() {
+        assert_eq!(keep_initial_capital("Eh", "pH", ""), "pH");
+        assert_eq!(keep_initial_capital("Egfr", "eGFR", "Befund. "), "eGFR");
+        assert_eq!(keep_initial_capital("Iv", "i.v.", ""), "i.v.");
+        assert_eq!(keep_initial_capital("Zweiseitige", "zweizeitige", ""), "Zweizeitige");
+    }
+
+    #[test]
+    fn literal_pairs_keep_sentence_initial_capital() {
+        let c = WordsCorrector::from_str("Ubel=übel\nWarm=warm\n");
+        // Umlaut first letter is uppercased char-wise (no byte slicing).
+        assert_eq!(c.apply("Ubel ist ihm."), "Übel ist ihm.");
+        assert_eq!(c.apply("Gut? Ubel!"), "Gut? Übel!");
+        assert_eq!(c.apply("ihm ist Ubel"), "ihm ist übel");
+        assert_eq!(c.apply("Es ist Warm. Warm bleibt es."), "Es ist warm. Warm bleibt es.");
+    }
+
+    #[test]
+    fn literal_pairs_match_whole_words_only() {
+        let c = WordsCorrector::from_str("Arm=Harn\n");
+        assert_eq!(c.apply("Warm"), "Warm");
+        assert_eq!(c.apply("Armband"), "Armband");
+        assert_eq!(c.apply("Arm"), "Harn");
+        assert_eq!(c.apply("der Arm, links"), "der Harn, links");
+        assert_eq!(c.apply("(Arm)"), "(Harn)");
+        assert_eq!(c.apply("Ärmel Arm"), "Ärmel Harn");
+        // Umlaut neighbours count as letters.
+        assert_eq!(c.apply("Armä"), "Armä");
+        assert_eq!(c.apply("äArm"), "äArm");
+    }
+
+    #[test]
+    fn literal_pairs_prefer_longest_valid_match() {
+        let c = WordsCorrector::from_str("Ura=X\nUratstein=Y\n");
+        assert_eq!(c.apply("Uratstein"), "Y");
+        assert_eq!(c.apply("Ura"), "X");
+        assert_eq!(c.apply("Uratsteine"), "Uratsteine");
+        assert_eq!(c.apply("ein Uratstein."), "ein Y.");
+    }
+
+    #[test]
+    fn literal_pairs_fall_back_to_shorter_match_at_same_start() {
+        // The longest candidate "Arm links" fails the boundary test here,
+        // the shorter "Arm" at the same position must still apply.
+        let c = WordsCorrector::from_str("Arm links=L\nArm=Harn\n");
+        assert_eq!(c.apply("Arm linksseitig"), "Harn linksseitig");
+        assert_eq!(c.apply("Arm links."), "L.");
+    }
+
+    #[test]
+    fn literal_pairs_multiword_with_umlauts_at_edges() {
+        let c = WordsCorrector::from_str("größere Blase=Harnblase\nÖl=Oel\n");
+        assert_eq!(c.apply("größere Blase"), "Harnblase");
+        assert_eq!(c.apply("eine größere Blase: ja"), "eine Harnblase: ja");
+        assert_eq!(c.apply("vergrößere Blase"), "vergrößere Blase");
+        assert_eq!(c.apply("Öl"), "Oel");
+        assert_eq!(c.apply("Öl und Öl"), "Oel und Oel");
+        assert_eq!(c.apply("Ölung"), "Ölung");
+    }
+
+    #[test]
+    fn literal_pairs_punctuation_edge_skips_boundary_check() {
+        // Only alphanumeric pattern edges need a word boundary.
+        let c = WordsCorrector::from_str("-Wert=-Spiegel\n");
+        assert_eq!(c.apply("PSA-Wert erhöht"), "PSA-Spiegel erhöht");
+        assert_eq!(c.apply("PSA-Werte"), "PSA-Werte");
     }
 }

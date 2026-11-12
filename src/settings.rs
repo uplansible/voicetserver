@@ -115,7 +115,7 @@ impl Default for IniValues {
             silence_threshold: 0.006,
             silence_chunks: None,
             paragraph_delay_offset: 4,
-            min_speech_chunks: 15,
+            min_speech_chunks: 4,
             rms_ema_alpha: 0.3,
             fuzzy_hotwords: true,
             fuzzy_max_ratio: 0.34,

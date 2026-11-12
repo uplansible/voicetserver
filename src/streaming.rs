@@ -44,11 +44,16 @@ pub enum ChunkOutput {
 /// Two-stage silence detection and paragraph break state machine.
 ///
 /// Stage 1: count consecutive silent chunks. Once count reaches `silence_chunks`,
-///   silence is "detected". Only arms after sufficient speech has occurred.
+///   silence is "detected". Only arms after `min_speech` loud chunks
+///   (cumulative since the last event / full silence run, not consecutive).
 ///
-/// Stage 2: once silence detected, a paragraph-delay counter ticks each chunk.
-///   When it reaches `delay_tokens + offset`, a Silence event fires and both
-///   stages reset.
+/// Stage 2: once silence detected, a paragraph-delay counter ticks each quiet
+///   chunk. When it reaches `delay_tokens + offset`, a Silence event fires and
+///   both stages reset. If speech resumes first, the pause is over: the event
+///   fires on that loud chunk — before it is decoded, so the resumed words go
+///   to the next segment — provided the pause has lasted at least
+///   `delay_tokens + offset` chunks (enough for the decoder lag to have emitted
+///   everything spoken before it); a shorter pause is cancelled instead.
 pub struct SilenceDetector {
     silence_counter: usize,
     speech_counter: usize,
@@ -92,6 +97,7 @@ impl SilenceDetector {
         }
 
         // Silence counting
+        let mut resumed = false;
         if rms < sil_thresh {
             self.silence_counter += 1;
             if !self.silence_detected && !self.silence_emitted
@@ -102,20 +108,29 @@ impl SilenceDetector {
             }
         } else {
             self.silence_counter = 0;
+            // Speech resumed during the paragraph delay — handled below.
+            resumed = self.silence_detected;
         }
 
-        // Paragraph delay ticks unconditionally once triggered
-        if self.silence_detected {
+        // Paragraph delay ticks once triggered, for every quiet chunk
+        if self.silence_detected && !resumed {
             self.paragraph_delay_counter += 1;
         }
 
-        // Speech tracking — arms silence detection after enough speech
+        // Speech tracking — arms silence detection after enough speech. Loud
+        // ticks count *cumulatively* (not consecutively): a short utterance or
+        // control word with small dips between syllables must still arm, or it
+        // never becomes its own final. Only a full silence run while unarmed
+        // starts the count over, so isolated blips spread over a long pause do
+        // not add up to an arming.
         if self.smoothed_rms >= sil_thresh {
             self.speech_counter += 1;
             if self.speech_counter >= settings.min_speech_chunks.load(Ordering::Relaxed) {
                 self.silence_emitted = false;
             }
-        } else {
+        } else if self.silence_emitted
+            && self.silence_counter >= settings.silence_chunks.load(Ordering::Relaxed)
+        {
             self.speech_counter = 0;
         }
 
@@ -125,15 +140,46 @@ impl SilenceDetector {
                 use std::sync::atomic::Ordering;
                 delay_tokens + settings.paragraph_delay_offset.load(Ordering::Relaxed)
             };
-            if self.paragraph_delay_counter >= para_delay {
+            // Quiet chunks since the pause began: detection happened on the
+            // silence_chunks-th one, which already counted 1 in the delay.
+            let pause_len = settings.silence_chunks.load(Ordering::Relaxed)
+                + self.paragraph_delay_counter - 1;
+            let fire = self.paragraph_delay_counter >= para_delay
+                || (resumed && pause_len >= para_delay);
+            if fire {
                 self.silence_emitted = true;
                 self.silence_detected = false;
                 self.paragraph_delay_counter = 0;
+                // The next segment must earn its arming from scratch.
+                self.speech_counter = 0;
                 return true;
+            }
+            if resumed {
+                // Pause too short for the pre-pause text to be fully decoded:
+                // cancel it and keep one segment (still armed).
+                self.silence_detected = false;
+                self.paragraph_delay_counter = 0;
             }
         }
         false
     }
+}
+
+// ---- RoPE position limits ----
+
+/// Past this RoPE position (encoder or decoder, whichever is further) a session
+/// is rebuilt via the normal prefill path at its next silence final. The
+/// encoder advances 50 positions per second of audio, so this leaves ~9 min of
+/// continuous speech before the hard limit — a final always comes long before.
+pub const ROPE_SOFT_LIMIT: usize = common::ROPE_MAX_POSITIONS - 30_000;
+/// Past this position the session is rebuilt immediately, flushing its text as
+/// a final first, even mid-speech (~60 s of audio before the table ends — far
+/// more than one WebSocket frame plus the end-of-session drain can consume).
+pub const ROPE_HARD_LIMIT: usize = common::ROPE_MAX_POSITIONS - 3_000;
+
+/// Current RoPE position of a streaming session's shared encoder/decoder.
+pub fn rope_position(enc: &AudioEncoder, dec: &TextDecoder) -> usize {
+    enc.position().max(dec.position())
 }
 
 // ---- Startup ----
@@ -223,6 +269,9 @@ pub struct StreamingState {
     pub inc_mel: IncrementalMel,
     pub silence: SilenceDetector,
     pub sample_buf_for_silence: Vec<f32>,
+    /// Leading samples of `sample_buf_for_silence` already pushed to `inc_mel`
+    /// (an incomplete trailing tick is fed to the mel before its silence check).
+    pub mel_fed: usize,
     pub text_buf: String,
     /// Holds raw token bytes that do not yet form a complete UTF-8 sequence.
     /// Tekken is byte-level BPE, so a multi-byte char (umlauts, ß, …) can straddle
@@ -263,6 +312,7 @@ impl StreamingState {
             inc_mel: IncrementalMel::new(filters),
             silence: SilenceDetector::new(),
             sample_buf_for_silence: Vec::new(),
+            mel_fed: 0,
             text_buf: String::new(),
             pending_bytes: Vec::new(),
             delay_tokens,
@@ -273,6 +323,13 @@ impl StreamingState {
     /// Process a block of 16kHz mono PCM samples synchronously.
     /// Called while holding the model inner lock — no async, no await.
     /// Returns one ChunkOutput per 80ms tick completed.
+    ///
+    /// Silence detection and inference are interleaved per 80 ms tick: each
+    /// tick's silence check runs right before that tick's audio is decoded.
+    /// Checking the whole WebSocket frame first (3+ ticks live, ~12 for the
+    /// 1 s re-transcribe frames) let a final fire while the frame's resumed
+    /// speech was already decoded into it, moving the next sentence's first
+    /// word to the end of the previous final.
     pub fn process_chunk_sync(
         &mut self,
         pcm: &[f32],
@@ -283,17 +340,16 @@ impl StreamingState {
         device: &Device,
         settings: &SharedSettings,
     ) -> Result<Vec<ChunkOutput>> {
-        self.inc_mel.push_samples(pcm);
         self.sample_buf_for_silence.extend_from_slice(pcm);
-        self.mel_buffer.extend(self.inc_mel.drain_frames());
 
         let mut outputs = Vec::new();
+        let mut checked = 0; // samples of sample_buf_for_silence silence-checked
 
-        // Silence detection (runs per 80ms chunk of audio)
-        while self.sample_buf_for_silence.len() >= SAMPLES_PER_TOKEN {
-            let rms = (self.sample_buf_for_silence[..SAMPLES_PER_TOKEN]
+        while self.sample_buf_for_silence.len() - checked >= SAMPLES_PER_TOKEN {
+            let tick_end = checked + SAMPLES_PER_TOKEN;
+            // Silence detection for this 80 ms tick, before it is decoded
+            let rms = (self.sample_buf_for_silence[checked..tick_end]
                 .iter().map(|s| s * s).sum::<f32>() / SAMPLES_PER_TOKEN as f32).sqrt();
-            self.sample_buf_for_silence.drain(..SAMPLES_PER_TOKEN);
             if self.silence.process_chunk(rms, self.delay_tokens, settings) {
                 // Take + clear the buffer here (not in the caller) so tokens decoded
                 // later in this same chunk start fresh instead of being re-sent as
@@ -301,12 +357,30 @@ impl StreamingState {
                 let raw = self.take_text_buf();
                 outputs.push(ChunkOutput::Silence(raw));
             }
+            checked = tick_end;
+            // Then feed the tick to the mel and run the inference ticks it enables
+            self.feed_mel_up_to(checked);
+            self.infer_ticks(enc, adapter, dec, tok, device, &mut outputs)?;
         }
 
-        // Inference ticks (one per 80ms mel chunk)
+        // An incomplete trailing tick still goes to the mel right away (no added
+        // latency); its silence check runs once the tick is complete.
+        self.feed_mel_up_to(self.sample_buf_for_silence.len());
         self.infer_ticks(enc, adapter, dec, tok, device, &mut outputs)?;
 
+        self.sample_buf_for_silence.drain(..checked);
+        self.mel_fed -= checked;
+
         Ok(outputs)
+    }
+
+    /// Push `sample_buf_for_silence[mel_fed..end]` to the incremental mel.
+    fn feed_mel_up_to(&mut self, end: usize) {
+        if end > self.mel_fed {
+            self.inc_mel.push_samples(&self.sample_buf_for_silence[self.mel_fed..end]);
+            self.mel_fed = end;
+            self.mel_buffer.extend(self.inc_mel.drain_frames());
+        }
     }
 
     /// Flush the decoder lookahead at end of session by feeding silence.
@@ -390,15 +464,7 @@ impl StreamingState {
                 // this, a char split across two tokens (e.g. German umlauts) would be
                 // silently dropped.
                 self.pending_bytes.extend_from_slice(&bytes);
-                let valid_up_to = match std::str::from_utf8(&self.pending_bytes) {
-                    Ok(s)  => s.len(),
-                    Err(e) => e.valid_up_to(),
-                };
-                if valid_up_to > 0 {
-                    // valid_up_to bytes are guaranteed valid UTF-8 by construction.
-                    let s = std::str::from_utf8(&self.pending_bytes[..valid_up_to]).unwrap();
-                    self.text_buf.push_str(s);
-                    self.pending_bytes.drain(..valid_up_to);
+                if drain_valid_utf8(&mut self.pending_bytes, &mut self.text_buf) {
                     outputs.push(ChunkOutput::Token(self.text_buf.clone()));
                 }
             }
@@ -413,5 +479,143 @@ impl StreamingState {
     pub fn take_text_buf(&mut self) -> String {
         self.pending_bytes.clear();
         std::mem::take(&mut self.text_buf)
+    }
+}
+
+/// Move the decodable part of `pending` into `out`; returns true if `out` grew.
+///
+/// Only a genuinely incomplete trailing sequence (a valid prefix of a
+/// multi-byte char) stays in `pending` for the next token. Bytes that can
+/// never become valid (`error_len() == Some(_)`, e.g. a lead byte followed by
+/// a non-continuation byte) are replaced with U+FFFD and decoding continues —
+/// keeping them would block every later token of the segment.
+fn drain_valid_utf8(pending: &mut Vec<u8>, out: &mut String) -> bool {
+    let start_len = out.len();
+    let mut consumed = 0;
+    loop {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(s) => {
+                out.push_str(s);
+                consumed = pending.len();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // The first `valid` bytes are valid UTF-8 by construction.
+                out.push_str(std::str::from_utf8(&pending[consumed..consumed + valid]).unwrap());
+                consumed += valid;
+                match e.error_len() {
+                    Some(bad) => {
+                        out.push(char::REPLACEMENT_CHARACTER);
+                        consumed += bad;
+                    }
+                    None => break, // incomplete tail — wait for the next token
+                }
+            }
+        }
+    }
+    pending.drain(..consumed);
+    out.len() > start_len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_split_char_waits_for_completion() {
+        let (mut p, mut out) = (Vec::new(), String::new());
+        p.extend_from_slice(b"F\xC3");
+        assert!(drain_valid_utf8(&mut p, &mut out));
+        assert_eq!((out.as_str(), p.as_slice()), ("F", &b"\xC3"[..]));
+        p.extend_from_slice(b"\xBCr");
+        assert!(drain_valid_utf8(&mut p, &mut out));
+        assert_eq!(out, "Für");
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn utf8_invalid_byte_does_not_block_later_text() {
+        let (mut p, mut out) = (Vec::new(), String::new());
+        // Lead byte followed by a non-continuation byte: can never become valid.
+        p.extend_from_slice(b"a\xC3b");
+        assert!(drain_valid_utf8(&mut p, &mut out));
+        assert_eq!(out, "a\u{FFFD}b");
+        assert!(p.is_empty());
+        p.extend_from_slice(" weiter".as_bytes());
+        assert!(drain_valid_utf8(&mut p, &mut out));
+        assert_eq!(out, "a\u{FFFD}b weiter");
+    }
+
+    fn test_settings() -> SharedSettings {
+        // silence_threshold 0.006, min_speech 4, paragraph offset 4, no RMS
+        // smoothing; silence_flush 5.
+        let vals = crate::settings::IniValues { rms_ema_alpha: 1.0, ..Default::default() };
+        SharedSettings::new(vals, 5)
+    }
+
+    /// Feed `n` ticks of `rms`; true if any of them fired.
+    fn feed(d: &mut SilenceDetector, s: &SharedSettings, rms: f32, n: usize) -> bool {
+        (0..n).fold(false, |f, _| d.process_chunk(rms, 2, s) || f)
+    }
+
+    #[test]
+    fn short_choppy_utterance_arms_and_fires() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        // "Wort löschen": 4 loud ticks with dips in between, never 4 in a row.
+        for _ in 0..4 {
+            assert!(!feed(&mut d, &s, 0.1, 1));
+            assert!(!feed(&mut d, &s, 0.0, 1));
+        }
+        // silence_flush (5) + delay (2) + paragraph offset (4) quiet ticks.
+        assert!(feed(&mut d, &s, 0.0, 12), "cumulative arming must yield a final");
+    }
+
+    #[test]
+    fn blips_across_a_long_pause_do_not_arm() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        for _ in 0..6 {
+            feed(&mut d, &s, 0.1, 1);
+            assert!(!feed(&mut d, &s, 0.0, 10), "isolated blips must not add up");
+        }
+    }
+
+    #[test]
+    fn resumed_speech_fires_before_it_is_decoded() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        feed(&mut d, &s, 0.1, 4);
+        // 7 quiet ticks: detected (5), delay running, not yet fired (needs 10).
+        assert!(!feed(&mut d, &s, 0.0, 7));
+        // Speech resumes: pause (7) >= delay + offset (6) → fire on this tick.
+        assert!(feed(&mut d, &s, 0.1, 1), "resumed speech must cut the final now");
+        // Resumed speech must arm from scratch; nothing fires in its own pause.
+        assert!(!feed(&mut d, &s, 0.0, 12));
+    }
+
+    #[test]
+    fn short_pause_with_resumed_speech_is_cancelled() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        feed(&mut d, &s, 0.1, 4);
+        // Just detected (pause 5 < 6) — resuming cancels instead of firing.
+        assert!(!feed(&mut d, &s, 0.0, 5));
+        assert!(!feed(&mut d, &s, 0.1, 1));
+        // Still armed: the next full pause fires as usual (5 + 6 - 1 ticks).
+        assert!(!feed(&mut d, &s, 0.0, 9));
+        assert!(feed(&mut d, &s, 0.0, 1));
+    }
+
+    #[test]
+    fn next_segment_must_arm_from_scratch() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        feed(&mut d, &s, 0.1, 4);
+        assert!(feed(&mut d, &s, 0.0, 12));
+        // One blip after the final must not re-arm on leftover count.
+        feed(&mut d, &s, 0.1, 1);
+        assert!(!feed(&mut d, &s, 0.0, 12));
     }
 }

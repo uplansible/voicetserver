@@ -311,6 +311,35 @@ move_dir() {
 # Normalised path (collapses // and trailing /) for comparisons.
 norm() { realpath -m "$1"; }
 
+# Stops a running voicetserver after asking (it holds the model files open and
+# writes training data). The installed system unit has Restart=always, so a plain
+# SIGTERM / `voicetserver --stop` is undone by systemd 5 s later — stop the unit
+# first, then SIGTERM whatever is left (hand-started / detached instances).
+# Sets STOPPED_UNIT=1 when the unit was stopped, so it can be restarted at the end.
+STOPPED_UNIT=0
+ensure_server_stopped() {
+    pgrep -x voicetserver &>/dev/null || return 0
+    echo "voicetserver is running:"
+    ps -o pid=,user=,args= -p "$(pgrep -x -d, voicetserver)" | sed 's/^/  /'
+    printf "Stop it now? [Y/n]: "
+    read -r STOP_SRV
+    if [[ "${STOP_SRV,,}" == "n" ]]; then
+        echo "Error: voicetserver must be stopped to move its files — re-run when it is." >&2
+        exit 1
+    fi
+    if systemctl is-active --quiet voicetserver 2>/dev/null; then
+        sudo systemctl stop voicetserver && STOPPED_UNIT=1
+    fi
+    pkill -x voicetserver 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        pgrep -x voicetserver &>/dev/null || return 0
+        sleep 0.5
+    done
+    echo "Error: voicetserver is still running after 10 s:" >&2
+    ps -o pid=,user=,args= -p "$(pgrep -x -d, voicetserver)" | sed 's/^/  /' >&2
+    exit 1
+}
+
 BASE_DIR=""
 CUR_DATA_DIR=$(read_config_value data_dir)
 DEFAULT_BASE_DIR="$HOME/voicet"
@@ -357,10 +386,7 @@ if [[ "${USE_BASE,,}" != "n" ]]; then
         printf "Move the existing models + training data into %s? [Y/n]: " "$BASE_DIR"
         read -r DO_MOVE
         if [[ "${DO_MOVE,,}" != "n" ]]; then
-            if pgrep -x voicetserver &>/dev/null; then
-                echo "Error: voicetserver is running — stop it first (voicetserver --stop or systemctl --user stop voicetserver) and re-run." >&2
-                exit 1
-            fi
+            ensure_server_stopped
             for key in model_dir qwen_model_dir qwen_model_dir_alt; do
                 v=$(read_config_value "$key")
                 [[ -z "$v" || ! -d "$v" ]] && continue
@@ -965,6 +991,14 @@ else
     else
         echo "Skipped. The server then only runs for as long as you keep a shell open."
     fi
+fi
+
+# The unit was stopped for the move above — bring it back with the new paths.
+if [[ "$STOPPED_UNIT" -eq 1 ]]; then
+    echo ""
+    printf "Start voicetserver again (systemd unit)? [Y/n]: "
+    read -r START_SRV
+    [[ "${START_SRV,,}" != "n" ]] && sudo systemctl start voicetserver
 fi
 
 echo ""

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{Linear, VarBuilder};
 
-use crate::common::{deinterleave_qk, DeinterleaveIdx, KvCache, RmsNorm, RotaryEmbedding};
+use crate::common::{deinterleave_qk, DeinterleaveIdx, KvCache, RmsNorm, RotaryEmbedding, ROPE_MAX_POSITIONS};
 
 // Encoder hyperparameters from config.json
 pub const HIDDEN_SIZE: usize = 1280;
@@ -270,7 +270,7 @@ impl AudioEncoder {
         let final_norm = RmsNorm::load(vb, &format!("{PREFIX}.transformer.norm.weight"), HIDDEN_SIZE, RMS_NORM_EPS)?;
 
         println!("  Creating RoPE embeddings...");
-        let rope = RotaryEmbedding::new(131072, HEAD_DIM, ROPE_THETA, device, dtype)?;
+        let rope = RotaryEmbedding::new(ROPE_MAX_POSITIONS, HEAD_DIM, ROPE_THETA, device, dtype)?;
 
         Ok(Self { conv1, conv2, layers, final_norm, rope })
     }
@@ -281,6 +281,12 @@ impl AudioEncoder {
         for layer in self.layers.iter_mut() {
             layer.reset_cache();
         }
+    }
+
+    /// Next RoPE position the encoder will use (absolute, survives cache trims).
+    pub fn position(&self) -> usize {
+        self.layers.first()
+            .map_or(0, |l| l.attention.cache.base_offset() + l.attention.cache.current_len())
     }
 
     /// Trim all encoder KV caches to the sliding window size.

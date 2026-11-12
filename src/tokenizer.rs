@@ -80,12 +80,19 @@ impl Tokenizer {
     /// and the decoded concatenation equals the input text. Sufficient for prefill
     /// priming, where the tokens only need to *read* as the intended text — the
     /// exact segmentation the trained model would produce is not required.
+    ///
+    /// Only ranks the model actually has are used (`decoder::VOCAB_SIZE` minus the
+    /// specials): a tekken.json may list more vocab entries than the checkpoint's
+    /// embedding table, and greedy longest-match favours exactly those long,
+    /// high-rank entries — an ID past the table would index out of bounds.
     pub fn encode_greedy(&self, text: &str) -> Vec<u32> {
         use std::collections::HashMap;
-        let map: HashMap<&[u8], u32> = self.vocab.iter().enumerate()
+        let model_ranks = crate::decoder::VOCAB_SIZE - NUM_SPECIAL as usize;
+        let vocab = &self.vocab[..self.vocab.len().min(model_ranks)];
+        let map: HashMap<&[u8], u32> = vocab.iter().enumerate()
             .map(|(rank, bytes)| (bytes.as_slice(), rank as u32 + NUM_SPECIAL))
             .collect();
-        let max_len = self.vocab.iter().map(|b| b.len()).max().unwrap_or(1);
+        let max_len = vocab.iter().map(|b| b.len()).max().unwrap_or(1);
         let bytes = text.as_bytes();
         let mut ids = Vec::new();
         let mut i = 0;

@@ -180,7 +180,7 @@ secondary and is populated from `GET /config`'s `models`/`qwen_model_dir_alt` fi
 Fork happens **before** the tokio runtime starts (forking a multi-threaded process is unsafe).
 
 - **Parent (watchdog):** sets terminal input to raw-minus-OPOST mode (keeps `\n`→`\r\n` so child output renders correctly), spawns stdin-reading thread, watches for `d` / Ctrl+C. Exits when 'd' is pressed or Ctrl+C.
-- **Child (server):** runs normally; stdout/stderr go to the terminal. On SIGUSR1 (sent by parent on 'd') → `dup2` stdout/stderr to log file.
+- **Child (server):** runs normally; stdout/stderr go to the terminal. On SIGUSR1 (sent by parent on 'd') → `dup2` stdout/stderr to log file. A plain `sigaction` handler (`install_early_detach_handler`, pre-opened log fd) is installed right after the fork, so a 'd' during model loading detaches instead of killing the child (SIGUSR1's default action); the tokio handler in `server::run` covers later presses.
 
 Key: `OPOST` must NOT be cleared in the watchdog's termios setup. `cfmakeraw` clears it, which corrupts the child's output. Set `ICANON`, `ECHO`, `ISIG` flags manually.
 

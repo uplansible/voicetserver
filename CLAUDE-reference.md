@@ -110,7 +110,7 @@ Known special token IDs (all others in 0–999 are skipped as audio control toke
 - `src/main.rs` — sync `fn main()` → forks/daemonizes before tokio starts → `tokio::runtime::Builder::block_on(server::run(…))`; `VoxtralModel` (Arc-shared) + `ModelInner` (tokio::sync::Mutex); inline `server` module with all HTTP + WebSocket handlers (`handle_socket` dispatches on `?model=` to `handle_asr_session` (voxtral) or `handle_qwen_session`); `api_key_auth` middleware (constant-time `ct_eq`) on a protected sub-router (`/health` is public); `pair_write_lock` serialises training-pair writes; detach/watchdog/PID/log helpers
 - `src/streaming.rs` — Voxtral `StreamingState`: KV caches, SilenceDetector, mel buffer; `process_chunk_sync`
 - `src/qwen.rs` — `QwenEngine`: wraps vendored `qwen3_asr::AsrInference` behind the same `Mutex<Option<…>>` unload pattern; inner value is `Arc<AsrInference>` so sessions clone the handle, release the lock, and let AsrInference's own internal mutex serialise GPU work
-- `src/qwen_streaming.rs` — qwen `StreamingState`: SilenceDetector with `has_speech()` gate (suppresses hallucinated partials during silence), silence reset carrying the last 200 chars as initial_text. **Hallucination guards** (Qwen invents fluent sentences on non-speech audio, 1.7B especially): (A) audio reaches the engine only while the detector is armed — unarmed 100 ms ticks wait in a pre-roll (`min_speech + PREROLL_EXTRA_TICKS`, cut back to the lead-in whenever the detector is idle again so it never reaches past a full pause), trimmed on arming to `LEAD_IN_TICKS` (0.5 s) before the first loud tick, so pauses between segments are never fed; (B) `is_plausible()` drops any partial/final longer than `MAX_CHARS_PER_SPEECH_SEC` (35) × loud-tick seconds + `PLAUSIBLE_SLACK_CHARS` (15). A dropped final is preceded by an empty partial (and the stop path sends an empty partial instead of no final) because the userscript inserts `currentPartial` as fallback for an empty final / on stop
+- `src/qwen_streaming.rs` — qwen `StreamingState`: SilenceDetector with `has_speech()` gate (suppresses hallucinated partials during silence), silence reset carrying the last 200 chars as initial_text. **Hallucination guards** (Qwen invents fluent sentences on non-speech audio, 1.7B especially): (A) audio reaches the engine only while the detector is armed — unarmed 100 ms ticks wait in a pre-roll (capped at `min_speech + PREROLL_EXTRA_TICKS` in every state, and while idle also cut back to `LEAD_IN_TICKS` before the first loud tick, so it never reaches past a full pause — the cap also stops a single blip from pinning a growing pause), trimmed on arming to `LEAD_IN_TICKS` (0.5 s) before the first loud tick, so pauses between segments are never fed; (B) `is_plausible()` drops any partial/final longer than `MAX_CHARS_PER_SPEECH_SEC` (35) × loud-tick seconds + `PLAUSIBLE_SLACK_CHARS` (15). A dropped final is preceded by an empty partial (and the stop path sends an empty partial instead of no final) because the userscript inserts `currentPartial` as fallback for an empty final / on stop
 - `src/audio.rs` — raw f32 LE PCM decode from WebSocket binary frames
 - `src/config.rs` — config file loading (`~/.config/voicetserver/config.toml`), CLI+file merge, source-tagged error messages
 - `src/words.rs` — `WordsCorrector`: aho-corasick text replacement from `custom_words.txt`; `FuzzyMatcher`: Kölner-Phonetik + Levenshtein fuzzy snapping of transcribed words onto known plain-term hotwords; `AbbrevExpander`: German letter-name runs → acronym targets (Em Er I → MRI)
@@ -543,10 +543,19 @@ staying on the page after a failed connection.
 Each socket's handlers are bound to their own instance (`if (sock !== ws) return;`), so a
 stale socket (replaced by a reconnect, or already finalized) can never deliver a late final or
 call `finalizeStop()` on the current session. `startRecording()` ignores toggles while
-`starting` (getUserMedia pending — a second stream would leak the mic) and while
+`starting` (getUserMedia pending — a second stream would leak the mic), while
+`stoppingTail` (see below) and while
 `awaitingFinalFlush` (toast "Bitte warten — Diktat wird abgeschlossen"). A server
 `{"type":"error"}` frame is shown as a toast and stops the recording without reconnect
 retries (with `recording` false, the following onclose just finalizes).
+
+Stop keeps the audio graph alive until a ScriptProcessor callback arrives one buffer length
+(4096 samples ≈ 256 ms) after the keypress (`stoppingTail`, 1 s fallback timer), then
+`completeStop()` tears it down and sends "stop" — closing it synchronously dropped the partly
+filled buffer, i.e. the last syllable. The Aufnehmen / 2. Durchgang recorders have their own
+`starting` guards and are stopped by `closeConfig()`; the config panel only closes on an
+outside click whose mousedown also started outside (text selections released outside keep it
+open).
 
 ## Silence / final message behaviour
 
@@ -562,6 +571,23 @@ between syllables does not restart the count, so short utterances and control wo
 ("Wort löschen") arm and become their own final. The count restarts after a final and after a
 full `silence_flush` run while unarmed, so isolated blips spread over a long pause don't add
 up. Default `min_speech` = 4 (was 15 consecutive ≈ 1.2 s Voxtral / 1.5 s Qwen).
+
+Voxtral final timing: `process_chunk_sync` interleaves per 80 ms tick — silence check for a
+tick, then that tick's mel + inference — so a final never fires after the frame's later audio
+was already decoded. Once silence is detected the paragraph delay (`delay + 4` ticks) counts
+quiet ticks only; if speech resumes first, the final fires on that loud tick (before it is
+decoded, so the resumed words start the next final) when the pause has lasted ≥ `delay + 4`
+ticks, otherwise the pending final is cancelled (one segment, still armed).
+
+Dead connections: every WS `recv()` (both engines) has a 30 s idle timeout
+(`WS_IDLE_TIMEOUT`), treated like a disconnect (drain + final, bounded send). The client sends
+a PCM frame every ~256 ms while recording, so only a vanished peer hits it — without it a
+half-open socket held the Voxtral single-session lock until restart.
+
+Client joining: finals are appended with `segmentSeparator()` — one space between segments
+unless the previous text ends in whitespace / an opening bracket or quote or the segment
+starts with whitespace / closing punctuation (Qwen segments arrive trimmed; Voxtral's carry
+their own leading space). Nothing is added before the first segment of a dictation.
 
 # Folder structure
 

@@ -32,8 +32,9 @@ pub enum ChunkOutput {
 
 // ---- Silence Detector ----
 
-/// Two-stage silence detection: arms after sufficient speech, fires after
-/// consecutive silent 100ms ticks reach the threshold.
+/// Two-stage silence detection: arms after `min_speech` loud 100ms ticks
+/// (cumulative since the last reset), fires after consecutive silent 100ms
+/// ticks reach the threshold.
 ///
 /// Separate from the Voxtral `SilenceDetector` (src/streaming.rs): that one is
 /// tied to the Voxtral decoder's token-delay/paragraph machinery and has no
@@ -65,6 +66,12 @@ impl SilenceDetector {
         !self.silence_emitted
     }
 
+    /// True while unarmed with no loud tick counted since the last reset —
+    /// i.e. nothing in the pre-roll can belong to the coming segment.
+    fn is_idle(&self) -> bool {
+        self.silence_emitted && self.speech_counter == 0
+    }
+
     /// Process one 100ms chunk of audio. Returns true if a silence event should fire.
     pub fn process_chunk(&mut self, rms: f32, settings: &SharedSettings) -> bool {
         use std::sync::atomic::Ordering;
@@ -82,12 +89,19 @@ impl SilenceDetector {
             self.silence_counter = 0;
         }
 
+        // Arming counts loud ticks *cumulatively* (not consecutively): a short
+        // utterance or control word with small dips between syllables must
+        // still arm, or it never becomes its own final. Only a full silence
+        // run while unarmed starts the count over, so isolated blips spread
+        // over a long pause do not add up to an arming.
         if self.smoothed_rms >= sil_thresh {
             self.speech_counter += 1;
             if self.speech_counter >= settings.min_speech_chunks.load(Ordering::Relaxed) {
                 self.silence_emitted = false;
             }
-        } else {
+        } else if self.silence_emitted
+            && self.silence_counter >= settings.silence_chunks.load(Ordering::Relaxed)
+        {
             self.speech_counter = 0;
         }
 
@@ -116,14 +130,18 @@ impl SilenceDetector {
 //    the amount of speech in the segment (loud ticks) is dropped.
 
 /// Pre-roll capacity on top of `min_speech_chunks`: arming lags speech onset by
-/// at least min_speech ticks (more for choppy speech that resets the counter),
-/// so the buffer must reach back further than that.
+/// at least min_speech loud ticks, plus the quiet ticks between them for choppy
+/// speech (the count is cumulative), so the buffer must reach back further
+/// than that. Once the detector is idle again (a full silence run reset the
+/// count) the pre-roll is cut to the lead-in, so it never reaches back past
+/// such a reset. Loud ticks spread wider than the cap are isolated blips by
+/// construction; dropping the earliest of them is intended.
 const PREROLL_EXTRA_TICKS: usize = 30;
 /// Silent ticks kept before the first loud tick of the pre-roll (0.5 s lead-in).
 const LEAD_IN_TICKS: usize = 5;
 /// Loud pre-roll ticks needed to transcribe a segment that never armed the
 /// detector when the session stops (0.3 s): a short last utterance ("Ja.",
-/// a control word) is shorter than min_speech and would otherwise be lost.
+/// a control word) may be shorter than min_speech and would otherwise be lost.
 const MIN_LOUD_TICKS_ON_FINISH: usize = 3;
 /// Upper bound on transcript characters per second of loud audio. Normal German
 /// dictation is ~13-15 chars/s of wall time; loud ticks cover only part of
@@ -259,6 +277,21 @@ impl StreamingState {
             } else {
                 // Not armed: hold back from the engine (guard A).
                 self.preroll.push_back((tick, loud));
+                if self.silence.is_idle() {
+                    // Idle: keep only LEAD_IN_TICKS before the first raw-loud
+                    // tick (or the newest LEAD_IN_TICKS if none). Arming lags
+                    // raw onset by the RMS smoothing, so the onset ticks may
+                    // already be here while still idle — trimming to a flat
+                    // LEAD_IN_TICKS would cut the lead-in short.
+                    let first_loud = self.preroll.iter().position(|(_, l)| *l)
+                        .unwrap_or(self.preroll.len());
+                    let drop = first_loud.saturating_sub(LEAD_IN_TICKS);
+                    self.preroll.drain(..drop);
+                }
+                // The cap applies while idle too: a single raw-loud blip whose
+                // smoothed RMS never leaves idle pins `first_loud` above, and
+                // without the cap every later quiet tick would pile up behind
+                // it and be fed to the engine as one long pause on arming.
                 let cap = settings.min_speech_chunks.load(Ordering::Relaxed) + PREROLL_EXTRA_TICKS;
                 while self.preroll.len() > cap {
                     self.preroll.pop_front();
@@ -351,5 +384,47 @@ mod tests {
     #[test]
     fn short_word_always_plausible() {
         assert!(is_plausible("Ja.", 0));
+    }
+
+    fn test_settings() -> SharedSettings {
+        // silence_threshold 0.006, min_speech 4, no RMS smoothing; silence_flush 5.
+        let vals = crate::settings::IniValues { rms_ema_alpha: 1.0, ..Default::default() };
+        SharedSettings::new(vals, 5)
+    }
+
+    #[test]
+    fn arming_counts_loud_ticks_cumulatively() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        // Loud/quiet alternation (syllables with dips): never 4 in a row.
+        for _ in 0..3 {
+            d.process_chunk(0.1, &s);
+            d.process_chunk(0.0, &s);
+            assert!(!d.has_speech());
+        }
+        d.process_chunk(0.1, &s);
+        assert!(d.has_speech(), "4th cumulative loud tick must arm");
+    }
+
+    #[test]
+    fn arming_count_resets_after_full_silence_run() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        for _ in 0..3 { d.process_chunk(0.1, &s); }
+        // Long pause: well past silence_flush and the EMA decay.
+        for _ in 0..30 { d.process_chunk(0.0, &s); }
+        assert!(d.is_idle());
+        d.process_chunk(0.1, &s);
+        assert!(!d.has_speech(), "blips separated by a full pause must not add up");
+    }
+
+    #[test]
+    fn armed_detector_fires_after_silence_flush() {
+        let s = test_settings();
+        let mut d = SilenceDetector::new();
+        for _ in 0..4 { d.process_chunk(0.1, &s); }
+        assert!(d.has_speech());
+        let fired: Vec<bool> = (0..5).map(|_| d.process_chunk(0.0, &s)).collect();
+        assert_eq!(fired, vec![false, false, false, false, true]);
     }
 }

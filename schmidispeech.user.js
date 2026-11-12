@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SCHMIDIspeech
 // @namespace    https://github.com/local/schmidispeech
-// @version      0.1.31
+// @version      0.1.33
 // @description  Local GPU dictation — German medical (unified voicetserver: Voxtral + Qwen3)
 // @match        *://*/*
 // @grant        GM_getValue
@@ -137,11 +137,16 @@ zeile löschen=delete_newline`;
     let scriptProcessor = null;
     let micStream = null;
     let recording = false;
+    let starting = false;           // getUserMedia pending — toggles are ignored meanwhile
     let reconnectAttempts = 0;
     let reconnectTimer = null;
     let pendingOnReady = null;     // runs on whichever onopen fires first (survives retries)
     let awaitingFinalFlush = false; // "stop" sent — waiting for server final + close
     let stopFinalizeTimer = null;   // 2s fallback if the server never closes
+    let stoppingTail = false;       // stop pressed — still capturing the last
+                                    // ScriptProcessor buffer(s) before teardown
+    let tailEndTime = 0;            // audioContext.currentTime the tail must reach
+    let tailTimer = null;           // fallback if no further callback arrives
     let lastCfg = {};               // last GET /config response — drives per-backend UI
     const MAX_RECONNECT = 3;
     const SAMPLE_RATE = 16000;
@@ -712,7 +717,7 @@ zeile löschen=delete_newline`;
             <input id="schmidi-silence-threshold" type="number" step="0.001" min="0" style="${INPUT_STYLE}"/>
             <div style="${LABEL_STYLE}">Silence detection chunks (je 80ms)</div>
             <input id="schmidi-silence-flush" type="number" min="1" style="${INPUT_STYLE}"/>
-            <div style="${LABEL_STYLE}">Min speech chunks (je 80ms)</div>
+            <div style="${LABEL_STYLE}">Min speech chunks (kumulativ, je 80ms)</div>
             <input id="schmidi-min-speech" type="number" min="1" style="${INPUT_STYLE}"/>
             <div style="${LABEL_STYLE}">RMS EMA alpha (0.0–1.0)</div>
             <input id="schmidi-rms-ema" type="number" step="0.01" min="0" max="1" style="${INPUT_STYLE}"/>
@@ -776,7 +781,8 @@ zeile löschen=delete_newline`;
                 options.push({ value: "qwen:secondary", label: `${MODELS.qwen.label} ${lastCfg.qwen_model_size_alt || ""}`.trim() });
             }
         }
-        sel.innerHTML = options.map((o) => `<option value="${o.value}">${o.label}</option>`).join("");
+        // Labels carry server-supplied model sizes — escape before innerHTML.
+        sel.innerHTML = options.map((o) => `<option value="${o.value}">${escapeHtml(o.label)}</option>`).join("");
         const active = activeModel();
         const slot   = lastCfg.qwen_active_slot || "primary";
         sel.value = active === "qwen" ? `qwen:${slot}` : "voxtral";
@@ -1091,6 +1097,10 @@ zeile löschen=delete_newline`;
 
     function closeConfig() {
         configPanel.style.display = "none";
+        // Calibration recordings belong to the panel — don't keep the mic open
+        // (and recording) behind a closed panel.
+        if (trainingRecording) stopTrainingRecording();
+        if (sp2Recording) stopSp2Recording();
     }
 
     configPanel.querySelector("#schmidi-cancel-woerter").addEventListener("click", closeConfig);
@@ -1110,6 +1120,7 @@ zeile löschen=delete_newline`;
     let trainingSentences  = [];
     let trainingCurrentIdx = 0;
     let trainingRecording  = false;
+    let trainingStarting   = false;  // getUserMedia pending — a second click is ignored
     let trainingPcmBuffers = [];
     let trainingAudioCtx   = null;
     let trainingScriptProc = null;
@@ -1323,11 +1334,21 @@ zeile löschen=delete_newline`;
     configPanel.querySelector('#schmidi-training-save').addEventListener('click', saveTrainingPair);
 
     function startTrainingRecording() {
+        // A second click before getUserMedia resolves would open a second
+        // stream and leak the first (mic indicator stays on).
+        if (trainingStarting) return;
+        trainingStarting = true;
         if (trainingPreviewSrc) { try { trainingPreviewSrc.stop(); } catch(_) {} trainingPreviewSrc = null; }
         if (trainingPreviewCtx) { trainingPreviewCtx.close(); trainingPreviewCtx = null; }
         trainingPcmBuffers = [];
         navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS)
             .then((stream) => {
+                trainingStarting = false;
+                // Panel closed while the permission prompt was open — drop it.
+                if (configPanel.style.display === "none") {
+                    stream.getTracks().forEach(t => t.stop());
+                    return;
+                }
                 trainingMicStream = stream;
                 trainingRecording = true;
                 trainingAudioCtx = createCaptureContext();
@@ -1351,7 +1372,10 @@ zeile löschen=delete_newline`;
                 const recBtn = configPanel.querySelector('#schmidi-training-record');
                 if (recBtn) { recBtn.textContent = '⏹ Stop'; recBtn.style.background = '#c0392b'; }
             })
-            .catch((err) => setAufnehmenStatus('Mikrofon: ' + err.message, true));
+            .catch((err) => {
+                trainingStarting = false;
+                setAufnehmenStatus('Mikrofon: ' + err.message, true);
+            });
     }
 
     function stopTrainingRecording() {
@@ -1443,6 +1467,7 @@ zeile löschen=delete_newline`;
     let secondPassSentences = [];
     let sp2CurrentIdx       = 0;
     let sp2Recording        = false;
+    let sp2Starting         = false;  // getUserMedia pending — a second click is ignored
     let sp2PcmBuffers       = [];
     let sp2AudioCtx         = null;
     let sp2ScriptProc       = null;
@@ -1502,11 +1527,20 @@ zeile löschen=delete_newline`;
     configPanel.querySelector('#sp2-save').addEventListener('click', saveSp2Pair);
 
     function startSp2Recording() {
+        // Same re-entrancy guard as startTrainingRecording.
+        if (sp2Starting) return;
+        sp2Starting = true;
         if (sp2PreviewSrc) { try { sp2PreviewSrc.stop(); } catch(_) {} sp2PreviewSrc = null; }
         if (sp2PreviewCtx) { sp2PreviewCtx.close(); sp2PreviewCtx = null; }
         sp2PcmBuffers = [];
         navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS)
             .then((stream) => {
+                sp2Starting = false;
+                // Panel closed while the permission prompt was open — drop it.
+                if (configPanel.style.display === "none") {
+                    stream.getTracks().forEach(t => t.stop());
+                    return;
+                }
                 sp2MicStream = stream;
                 sp2Recording = true;
                 sp2AudioCtx  = createCaptureContext();
@@ -1527,7 +1561,10 @@ zeile löschen=delete_newline`;
                 const recBtn = configPanel.querySelector('#sp2-record');
                 if (recBtn) { recBtn.textContent = '⏹ Stop'; recBtn.style.background = '#c0392b'; }
             })
-            .catch((err) => setSp2Status('Mikrofon: ' + err.message, true));
+            .catch((err) => {
+                sp2Starting = false;
+                setSp2Status('Mikrofon: ' + err.message, true);
+            });
     }
 
     function stopSp2Recording() {
@@ -1696,12 +1733,13 @@ zeile löschen=delete_newline`;
                 const esc   = escapeHtml(short);   // displayed (HTML text content)
                 const safe  = escapeHtml(t);       // title attribute (quotes escaped too)
                 const dur   = (p.duration_s || 0).toFixed(1);
+                const id    = escapeHtml(String(p.id));  // server-supplied
                 return `<div style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid #2a2a2a;">
-                    <span style="color:#555;font-size:10px;min-width:28px;">${p.id}</span>
+                    <span style="color:#555;font-size:10px;min-width:28px;">${id}</span>
                     <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#ccc;" title="${safe}">${esc}</span>
                     <span style="color:#888;font-size:10px;min-width:30px;">${dur}s</span>
-                    <button class="sp-play" data-id="${p.id}" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">▶</button>
-                    <button class="sp-del"  data-id="${p.id}" style="background:#333;color:#c0392b;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">✕</button>
+                    <button class="sp-play" data-id="${id}" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">▶</button>
+                    <button class="sp-del"  data-id="${id}" style="background:#333;color:#c0392b;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">✕</button>
                 </div>`;
             }).join('');
             if (countEl) countEl.textContent = `${trainingPairs.length} Paar${trainingPairs.length !== 1 ? 'e' : ''} · ${totalDur.toFixed(1)}s gesamt`;
@@ -1937,13 +1975,14 @@ zeile löschen=delete_newline`;
             const t     = r.text || '';
             const short = t.length > 34 ? t.slice(0, 32) + '…' : t;
             const sel   = r.id === reviewSelectedId;
-            return `<div class="sp-dikt-row" data-id="${r.id}" style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid #2a2a2a;cursor:pointer;${sel ? 'background:#26364a;' : ''}">
-                <span style="color:#555;font-size:10px;min-width:28px;">${r.id}</span>
+            const id    = escapeHtml(String(r.id));  // server-supplied
+            return `<div class="sp-dikt-row" data-id="${id}" style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid #2a2a2a;cursor:pointer;${sel ? 'background:#26364a;' : ''}">
+                <span style="color:#555;font-size:10px;min-width:28px;">${id}</span>
                 <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#ccc;" title="${escapeHtml(t)}">${escapeHtml(short)}</span>
                 <span style="color:#888;font-size:10px;min-width:30px;">${(r.duration_s || 0).toFixed(1)}s</span>
-                <button class="sp-dikt-play" data-id="${r.id}" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">▶</button>
-                <button class="sp-dikt-dl"   data-id="${r.id}" title="WAV herunterladen" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">⬇</button>
-                <button class="sp-dikt-del"  data-id="${r.id}" style="background:#333;color:#c0392b;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">✕</button>
+                <button class="sp-dikt-play" data-id="${id}" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">▶</button>
+                <button class="sp-dikt-dl"   data-id="${id}" title="WAV herunterladen" style="background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">⬇</button>
+                <button class="sp-dikt-del"  data-id="${id}" style="background:#333;color:#c0392b;border:1px solid #555;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;">✕</button>
             </div>`;
         }).join('');
         listEl.onclick = async (e) => {
@@ -2175,8 +2214,17 @@ zeile löschen=delete_newline`;
         setWordsStatus("", false);
     });
 
+    // Close on an outside click — but only if the press *started* outside too.
+    // A click fires on the common ancestor of mousedown and mouseup, so a text
+    // selection started in a panel textarea and released outside would
+    // otherwise close the panel mid-selection.
+    const isOutsideConfig = (t) => !configPanel.contains(t) && t !== btn && !overlay.contains(t);
+    let pressedOutsideConfig = false;
+    document.addEventListener("mousedown", (e) => {
+        pressedOutsideConfig = isOutsideConfig(e.target);
+    }, true);
     document.addEventListener("click", (e) => {
-        if (!configPanel.contains(e.target) && e.target !== btn && !overlay.contains(e.target)) {
+        if (pressedOutsideConfig && isOutsideConfig(e.target)) {
             closeConfig();
         }
     });
@@ -2260,8 +2308,40 @@ zeile löschen=delete_newline`;
         setTimeout(() => toast.remove(), duration);
     }
 
+    // Fetch /config once (on the first dictation of the page) if the settings
+    // panel has not loaded it yet: otherwise lastCfg stays empty and
+    // compressSilences() falls back to the hard-coded 0.006 instead of the
+    // server's tuned silence_threshold. Lazy rather than at script start
+    // because the script runs on every page. Silent on failure; a later panel
+    // load wins.
+    let serverConfigRequested = false;
+    function ensureServerConfig() {
+        if (serverConfigRequested || Object.keys(lastCfg).length > 0) return;
+        serverConfigRequested = true;
+        authFetch(`${getHttpBase()}/config`)
+            .then((res) => (res.ok ? res.json() : null))
+            .then((cfg) => {
+                if (cfg && Object.keys(lastCfg).length === 0) lastCfg = cfg;
+            })
+            .catch(() => { serverConfigRequested = false; });
+    }
+
     // ---- Audio capture ----
     function startRecording() {
+        // A second toggle while the mic permission prompt / getUserMedia is
+        // still pending would open a second stream and leak the first one.
+        if (starting) return;
+        // Stop is still capturing the trailing audio (< 1 s) — ignore the toggle.
+        if (stoppingTail) return;
+        // The previous dictation is still waiting for the server's final flush:
+        // starting now would wipe its pendingText/PCM and let its late final
+        // land in the new session.
+        if (awaitingFinalFlush) {
+            showToast("Bitte warten — Diktat wird abgeschlossen");
+            return;
+        }
+        starting = true;
+        ensureServerConfig();
         stopDictationPlayback();
         accumulatedText     = "";
         currentPartial      = "";
@@ -2274,6 +2354,7 @@ zeile löschen=delete_newline`;
         navigator.mediaDevices
             .getUserMedia(MIC_CONSTRAINTS)
             .then((stream) => {
+                starting  = false;
                 micStream = stream;
                 recording = true;
                 reconnectAttempts = 0;
@@ -2287,6 +2368,7 @@ zeile löschen=delete_newline`;
                 connectWS(null);
             })
             .catch((err) => {
+                starting = false;
                 showToast("SCHMIDIspeech: Mikrofon nicht erlaubt — " + err.message);
             });
     }
@@ -2306,9 +2388,10 @@ zeile löschen=delete_newline`;
         scriptProcessor.connect(silentOut);
         silentOut.connect(audioContext.destination);
 
-        const ratio = audioContext.sampleRate / SAMPLE_RATE;
+        const ctx   = audioContext;
+        const ratio = ctx.sampleRate / SAMPLE_RATE;
         scriptProcessor.onaudioprocess = (e) => {
-            if (!recording) return;
+            if (!recording && !stoppingTail) return;
             const chunk = captureChunk(e.inputBuffer.getChannelData(0), ratio);
             // Keep a copy of exactly what the server heard, so the finished
             // dictation can be saved as a training-pair candidate.
@@ -2322,13 +2405,38 @@ zeile löschen=delete_newline`;
                 unsentAudio.push(chunk);
                 if (unsentAudio.length > MAX_UNSENT_CHUNKS) unsentAudio.shift();
             }
+            // Stop pressed: once a callback was dispatched a full buffer after
+            // the stop, every sample up to the keypress has been captured.
+            if (stoppingTail && ctx.currentTime >= tailEndTime) completeStop();
         };
     }
 
     function stopRecording() {
+        if (stoppingTail) return;
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         recording = false;
         pendingOnReady = null;
+        if (scriptProcessor && audioContext) {
+            // Closing the graph right away would discard the ScriptProcessor's
+            // partly filled buffer (up to 4096 samples = 256 ms) — the last
+            // syllable before the keypress. Keep capturing until a callback
+            // arrives one buffer length after the stop; completeStop() then
+            // tears down and sends "stop". The timer covers a callback that
+            // never comes (suspended context).
+            stoppingTail = true;
+            tailEndTime  = audioContext.currentTime +
+                scriptProcessor.bufferSize / audioContext.sampleRate;
+            tailTimer = setTimeout(completeStop, 1000);
+        } else {
+            completeStop();
+        }
+    }
+
+    // Second half of stopRecording(): tear the audio graph down, then hand the
+    // session to the server's final flush.
+    function completeStop() {
+        if (tailTimer) { clearTimeout(tailTimer); tailTimer = null; }
+        stoppingTail = false;
         if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
         if (audioContext)    { audioContext.close(); audioContext = null; }
         if (micStream)       { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
@@ -2361,6 +2469,7 @@ zeile löschen=delete_newline`;
     function finalizeStop() {
         if (stopFinalizeTimer) { clearTimeout(stopFinalizeTimer); stopFinalizeTimer = null; }
         awaitingFinalFlush = false;
+        pendingOnReady = null;   // a sendStop queued for a socket that never opened
         unsentAudio = [];
         if (ws) { ws.close(); ws = null; }
 
@@ -2378,7 +2487,7 @@ zeile löschen=delete_newline`;
 
         if (isCommitMode()) {
             // Add trailing partial to pending text
-            if (currentPartial) pendingText += currentPartial;
+            if (currentPartial) pendingText += segmentSeparator(pendingText, currentPartial) + currentPartial;
             currentPartial      = "";
             snapshotDictation(pendingText);
             overlayUserEdited   = false;
@@ -2387,7 +2496,10 @@ zeile löschen=delete_newline`;
             updateOverlay();
         } else {
             // Live mode: inject any trailing partial, briefly keep overlay
-            if (currentPartial) injectAtCursor(currentPartial);
+            if (currentPartial) {
+                currentPartial = segmentSeparator(accumulatedText, currentPartial) + currentPartial;
+                injectAtCursor(currentPartial);
+            }
             // Blur the field once, only if we actually inserted something this
             // session — so the host page saves without a manual click-away.
             if (accumulatedText.trim() || currentPartial.trim()) commitTarget();
@@ -2399,12 +2511,54 @@ zeile löschen=delete_newline`;
         }
     }
 
+    // Shorten long pauses in a finished dictation's PCM: silent runs (100 ms
+    // blocks with RMS below the server's silence_threshold) longer than 1.0 s
+    // become 0.5 s, keeping 0.25 s at each edge so word onsets and tails stay
+    // untouched. Dictation is pause-heavy, and minutes of silence make the ▶
+    // replay tedious and bloat saved review candidates (and the training audio
+    // they turn into). Only the snapshot is shortened — the live stream sent
+    // to the server is not. Event timestamps keep the original timeline.
+    function compressSilences(pcm) {
+        const BLOCK   = SAMPLE_RATE / 10; // 100 ms analysis blocks
+        const MAX_RUN = SAMPLE_RATE;      // compress silent runs longer than 1.0 s …
+        const EDGE    = SAMPLE_RATE / 4;  // … down to 0.25 s + 0.25 s
+        const thr = Number.isFinite(lastCfg.silence_threshold) ? lastCfg.silence_threshold : 0.006;
+        const keep = [];  // [start, end) sample ranges to keep
+        let pos = 0;      // start of the not-yet-kept audio
+        let runStart = -1;
+        const endRun = (runEnd) => {
+            if (runStart >= 0 && runEnd - runStart > MAX_RUN) {
+                keep.push([pos, runStart + EDGE]);
+                pos = runEnd - EDGE;
+            }
+            runStart = -1;
+        };
+        for (let i = 0; i < pcm.length; i += BLOCK) {
+            const end = Math.min(i + BLOCK, pcm.length);
+            let sum = 0;
+            for (let j = i; j < end; j++) sum += pcm[j] * pcm[j];
+            if (Math.sqrt(sum / (end - i)) < thr) {
+                if (runStart < 0) runStart = i;
+            } else {
+                endRun(i);
+            }
+        }
+        endRun(pcm.length);
+        if (keep.length === 0) return pcm;
+        keep.push([pos, pcm.length]);
+        const out = new Float32Array(keep.reduce((n, [a, b]) => n + b - a, 0));
+        let o = 0;
+        for (const [a, b] of keep) { out.set(pcm.subarray(a, b), o); o += b - a; }
+        return out;
+    }
+
     // Keep the finished dictation (audio + transcript) so it can be saved as a
     // training-pair candidate — via the overlay ↵💾 button or the Diktate tab.
+    // Long pauses are shortened (see compressSilences).
     function snapshotDictation(text) {
         if (dictationPcmBuffers.length > 0) {
             lastDictation = {
-                pcm:    concatPcm(dictationPcmBuffers),
+                pcm:    compressSilences(concatPcm(dictationPcmBuffers)),
                 text:   (text || "").trim(),
                 events: dictationEvents,
                 saved:  false,
@@ -2463,21 +2617,35 @@ zeile löschen=delete_newline`;
         const pat = getPatientName();
         if (pat) params.push("patient=" + encodeURIComponent(pat));
         if (params.length) url += (url.includes("?") ? "&" : "?") + params.join("&");
-        ws = new WebSocket(url);
-        ws.binaryType = "arraybuffer";
+        // Every handler is bound to its own socket and ignores events once that
+        // socket is no longer the current `ws` (finalizeStop nulled it, or a
+        // reconnect replaced it) — a stale socket's late final or onclose must
+        // never touch the current session.
+        const sock = new WebSocket(url);
+        ws = sock;
+        sock.binaryType = "arraybuffer";
 
-        ws.onopen = () => {
+        sock.onopen = () => {
+            if (sock !== ws) return;
             reconnectAttempts = 0;
             const cb = pendingOnReady;
             pendingOnReady = null;
             if (cb) cb();
         };
 
-        ws.onmessage = (e) => {
+        sock.onmessage = (e) => {
+            if (sock !== ws) return;
             let msg;
             try { msg = JSON.parse(e.data); } catch (_) { return; }
 
-            if (msg.type === "partial") {
+            if (msg.type === "error") {
+                // Server refused or aborted the session (engine busy / training,
+                // unknown model …) and closes the socket next. Stop instead of
+                // retrying: with recording already false, onclose finalizes the
+                // dictation without a reconnect or "Server nicht erreichbar".
+                showToast("SCHMIDIspeech: " + (msg.text || "Serverfehler"), 5000);
+                if (recording) stopRecording();
+            } else if (msg.type === "partial") {
                 currentPartial = msg.text || "";
                 updateOverlay();
             } else if (msg.type === "final") {
@@ -2485,13 +2653,14 @@ zeile löschen=delete_newline`;
                 const text = msg.text || currentPartial;
                 if (text && !discardOnStop && !tryControlWord(text)) {
                     if (isCommitMode()) {
-                        pendingText += text;
+                        pendingText += segmentSeparator(pendingText, text) + text;
                         if (!overlayUserEdited) {
                             overlayTextDiv.textContent = pendingText;
                         }
                     } else {
-                        injectAtCursor(text);
-                        accumulatedText += text;
+                        const seg = segmentSeparator(accumulatedText, text) + text;
+                        injectAtCursor(seg);
+                        accumulatedText += seg;
                     }
                     dictationEvents.push({ type: "text", text, t: Date.now() - dictationStartedAt });
                 }
@@ -2503,9 +2672,10 @@ zeile löschen=delete_newline`;
         // A failed connection fires onerror *and* onclose. Let onclose own the
         // retry so a single failure doesn't schedule two reconnects (which would
         // leak a timer and open parallel sockets). onerror is just a no-op.
-        ws.onerror = () => {};
+        sock.onerror = () => {};
 
-        ws.onclose = () => {
+        sock.onclose = () => {
+            if (sock !== ws) return;
             if (awaitingFinalFlush) {
                 // Server closed after flushing the final in response to "stop".
                 finalizeStop();
@@ -2668,6 +2838,20 @@ zeile löschen=delete_newline`;
                            : (CONTROL_WORD_EMPTY_MSG[action] || "Nichts zum Löschen gefunden"));
         dictationEvents.push({ type: "control", action, matched: text, t: Date.now() - dictationStartedAt });
         return true;
+    }
+
+    // Separator to put between `prev` (the text this dictation already
+    // inserted) and the next segment `seg`. Qwen segments arrive trimmed, so
+    // without it two finals glue together ("Befund.Der"). Voxtral segments
+    // usually carry their own leading space — no second one is added. Nothing
+    // is added before the first segment (prev empty), so an empty field never
+    // starts with a space; nor after whitespace / an opening bracket or quote,
+    // nor before closing punctuation.
+    function segmentSeparator(prev, seg) {
+        if (!prev || !seg) return "";
+        if (/[\s(\[{„«‚]$/.test(prev)) return "";
+        if (/^[\s.,;:!?)\]}“»…]/.test(seg)) return "";
+        return " ";
     }
 
     // ---- Text injection — insert at current cursor position in targetEl ----
